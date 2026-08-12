@@ -689,46 +689,152 @@ fn parseDecimal(buf: []const u8, pos: *usize) ?u32 {
 pub const InputClassifier = struct {
     parser: ghostty_vt.Parser = undefined,
     initialized: bool = false,
-    /// X10 mouse coordinates follow `CSI M` as three raw bytes.
+    mouse_prefix: MousePrefix = .none,
+    mouse_state: MouseState = .none,
     pending_mouse_bytes: u8 = 0,
+    mouse_ranges: std.ArrayList(MouseRange) = .empty,
+    quarantined: bool = false,
+
+    const MousePrefix = enum {
+        none,
+        esc,
+        csi,
+    };
+
+    const MouseState = enum {
+        none,
+        sgr,
+        x10,
+    };
+
+    pub const CarryKind = enum {
+        other,
+        mouse,
+    };
+
+    pub const MouseRange = struct {
+        start: usize,
+        end: usize,
+        from_carry: bool,
+    };
 
     pub const Class = struct {
         keyboard: bool = false,
         mouse: bool = false,
+        discarded: bool = false,
         /// Start of an escape sequence that is incomplete in this chunk.
         tail_start: ?usize = null,
+        tail_kind: ?CarryKind = null,
+        mouse_ranges: []const MouseRange = &.{},
     };
 
-    pub fn classify(self: *InputClassifier, payload: []const u8) Class {
+    pub fn deinit(self: *InputClassifier, alloc: std.mem.Allocator) void {
+        self.mouse_ranges.deinit(alloc);
+    }
+
+    fn resetState(self: *InputClassifier) void {
+        self.parser = ghostty_vt.Parser.init();
+        self.initialized = true;
+        self.mouse_prefix = .none;
+        self.mouse_state = .none;
+        self.pending_mouse_bytes = 0;
+        self.mouse_ranges.clearRetainingCapacity();
+    }
+
+    pub fn reset(self: *InputClassifier) void {
+        self.resetState();
+        self.quarantined = false;
+    }
+
+    pub fn quarantine(self: *InputClassifier) void {
+        self.resetState();
+        self.quarantined = true;
+    }
+
+    pub fn classify(self: *InputClassifier, alloc: std.mem.Allocator, payload: []const u8) !Class {
+        self.mouse_ranges.clearRetainingCapacity();
+        if (self.quarantined) {
+            self.quarantined = false;
+            self.resetState();
+            return .{ .discarded = true };
+        }
+
         if (!self.initialized) {
             self.parser = ghostty_vt.Parser.init();
             self.initialized = true;
         }
 
         var class = Class{};
-        var seq_start: ?usize = if (self.parser.state != .ground) 0 else null;
+        var seq_start: ?usize = if (self.parser.state != .ground or
+            self.mouse_state != .none or
+            self.mouse_prefix != .none) 0 else null;
+        var sequence_from_carry = seq_start != null;
+        var sequence_kind: CarryKind = .other;
+        if (self.mouse_state != .none) sequence_kind = .mouse;
         var i: usize = 0;
 
         while (i < payload.len) {
-            if (self.pending_mouse_bytes > 0) {
+            if (self.mouse_state == .x10 and self.pending_mouse_bytes > 0) {
                 self.pending_mouse_bytes -= 1;
-                class.mouse = true;
+                if (self.pending_mouse_bytes == 0) {
+                    try self.mouse_ranges.append(alloc, .{
+                        .start = seq_start orelse 0,
+                        .end = i + 1,
+                        .from_carry = sequence_from_carry,
+                    });
+                    self.mouse_state = .none;
+                    self.mouse_prefix = .none;
+                    seq_start = null;
+                    sequence_from_carry = false;
+                    sequence_kind = .other;
+                }
                 i += 1;
                 continue;
             }
 
-            if (payload[i] == 0x1b and i + 2 < payload.len and payload[i + 1] == '[') {
+            if (payload[i] == 0x1b and
+                self.mouse_state == .none and
+                i + 2 < payload.len and
+                payload[i + 1] == '[')
+            {
                 if (parseKittyCsiU(payload[i + 2 ..])) |kitty| {
                     if (kitty.event_type != 3) class.keyboard = true;
                     const end = i + 2 + kitty.consumed;
                     while (i < end) : (i += 1) _ = self.parser.next(payload[i]);
+                    self.mouse_prefix = .none;
                     seq_start = null;
+                    sequence_from_carry = false;
+                    sequence_kind = .other;
                     continue;
                 }
             }
 
             if (self.parser.state == .ground and payload[i] == 0x1b) {
                 seq_start = i;
+                sequence_from_carry = false;
+                sequence_kind = .other;
+                self.mouse_prefix = .esc;
+            } else switch (self.mouse_prefix) {
+                .none => {},
+                .esc => {
+                    self.mouse_prefix = if (payload[i] == '[') .csi else .none;
+                },
+                .csi => {
+                    switch (payload[i]) {
+                        '<' => {
+                            self.mouse_state = .sgr;
+                            self.mouse_prefix = .none;
+                            sequence_kind = .mouse;
+                        },
+                        'M' => {
+                            self.mouse_state = .x10;
+                            self.pending_mouse_bytes = 3;
+                            self.mouse_prefix = .none;
+                            sequence_kind = .mouse;
+                        },
+                        else => self.mouse_prefix = .none,
+                    }
+                },
             }
 
             const actions = self.parser.next(payload[i]);
@@ -741,11 +847,6 @@ pub const InputClassifier = struct {
                             class.keyboard = true;
                         } else if (csi.final >= 'A' and csi.final <= 'D' and csi.params.len > 1) {
                             class.keyboard = true;
-                        } else if (csi.final == 'M' or csi.final == 'm') {
-                            class.mouse = true;
-                            if (csi.final == 'M' and csi.params.len == 0) {
-                                self.pending_mouse_bytes = 3;
-                            }
                         }
                     },
                     .execute => |code| {
@@ -757,13 +858,32 @@ pub const InputClassifier = struct {
                 }
             }
 
-            if (self.parser.state == .ground) {
+            if (self.mouse_state == .sgr and (payload[i] == 'M' or payload[i] == 'm')) {
+                try self.mouse_ranges.append(alloc, .{
+                    .start = seq_start orelse 0,
+                    .end = i + 1,
+                    .from_carry = sequence_from_carry,
+                });
+                self.mouse_state = .none;
+                self.mouse_prefix = .none;
                 seq_start = null;
+                sequence_from_carry = false;
+                sequence_kind = .other;
+            } else if (self.mouse_state == .none and self.parser.state == .ground) {
+                self.mouse_prefix = .none;
+                seq_start = null;
+                sequence_from_carry = false;
+                sequence_kind = .other;
             }
             i += 1;
         }
 
-        class.tail_start = seq_start;
+        class.mouse_ranges = self.mouse_ranges.items;
+        class.mouse = class.mouse_ranges.len > 0;
+        if (seq_start) |start| {
+            class.tail_start = start;
+            class.tail_kind = sequence_kind;
+        }
         return class;
     }
 };
@@ -2255,47 +2375,61 @@ test "stripAnsi: only escape sequences" {
 }
 
 test "InputClassifier: complete SGR mouse report is not keyboard input" {
+    const alloc = testing.allocator;
     var classifier = InputClassifier{};
-    const class = classifier.classify("\x1b[<64;90;20M");
+    defer classifier.deinit(alloc);
+    const class = try classifier.classify(alloc, "\x1b[<64;90;20M");
     try testing.expect(class.mouse);
     try testing.expect(!class.keyboard);
     try testing.expect(class.tail_start == null);
+    try testing.expectEqual(@as(usize, 1), class.mouse_ranges.len);
 }
 
 test "InputClassifier: split SGR mouse report stays stateful" {
+    const alloc = testing.allocator;
     var classifier = InputClassifier{};
-    const first = classifier.classify("\x1b[<6");
+    defer classifier.deinit(alloc);
+    const first = try classifier.classify(alloc, "\x1b[<6");
     try testing.expect(!first.mouse);
     try testing.expect(!first.keyboard);
     try testing.expectEqual(@as(?usize, 0), first.tail_start);
 
-    const second = classifier.classify("5;90;20M");
+    const second = try classifier.classify(alloc, "5;90;20M");
     try testing.expect(second.mouse);
     try testing.expect(!second.keyboard);
     try testing.expect(second.tail_start == null);
+    try testing.expect(second.mouse_ranges[0].from_carry);
 }
 
 test "InputClassifier: split X10 coordinates are not keyboard input" {
+    const alloc = testing.allocator;
     var classifier = InputClassifier{};
-    const first = classifier.classify("\x1b[M ");
-    try testing.expect(first.mouse);
+    defer classifier.deinit(alloc);
+    const first = try classifier.classify(alloc, "\x1b[M ");
+    try testing.expect(!first.mouse);
     try testing.expect(!first.keyboard);
+    try testing.expectEqual(@as(?usize, 0), first.tail_start);
 
-    const second = classifier.classify("!!");
+    const second = try classifier.classify(alloc, "!!");
     try testing.expect(second.mouse);
     try testing.expect(!second.keyboard);
+    try testing.expect(second.mouse_ranges[0].from_carry);
 }
 
 test "InputClassifier: keyboard input claims leadership" {
+    const alloc = testing.allocator;
     var classifier = InputClassifier{};
-    const class = classifier.classify("x\r");
+    defer classifier.deinit(alloc);
+    const class = try classifier.classify(alloc, "x\r");
     try testing.expect(class.keyboard);
     try testing.expect(!class.mouse);
 }
 
 test "InputClassifier: focus events and terminal replies are neither input kind" {
+    const alloc = testing.allocator;
     var classifier = InputClassifier{};
-    const class = classifier.classify("\x1b[I\x1b[O\x1b[1;2R\x1b[?1;2c");
+    defer classifier.deinit(alloc);
+    const class = try classifier.classify(alloc, "\x1b[I\x1b[O\x1b[1;2R\x1b[?1;2c");
     try testing.expect(!class.keyboard);
     try testing.expect(!class.mouse);
     try testing.expect(class.tail_start == null);
