@@ -694,6 +694,10 @@ pub const InputClassifier = struct {
     pending_mouse_bytes: u8 = 0,
     ranges: std.ArrayList(Range) = .empty,
     quarantined: bool = false,
+    kitty_capture: [128]u8 = undefined,
+    kitty_capture_len: usize = 0,
+    kitty_capture_active: bool = false,
+    kitty_capture_overflow: bool = false,
 
     const MousePrefix = enum {
         none,
@@ -745,6 +749,9 @@ pub const InputClassifier = struct {
         self.mouse_state = .none;
         self.pending_mouse_bytes = 0;
         self.ranges.clearRetainingCapacity();
+        self.kitty_capture_len = 0;
+        self.kitty_capture_active = false;
+        self.kitty_capture_overflow = false;
     }
 
     pub fn reset(self: *InputClassifier) void {
@@ -771,6 +778,25 @@ pub const InputClassifier = struct {
             .from_carry = from_carry,
             .kind = kind,
         });
+    }
+
+    fn captureKittyByte(self: *InputClassifier, byte: u8) void {
+        if (!self.kitty_capture_active) return;
+        if (self.kitty_capture_len < self.kitty_capture.len) {
+            self.kitty_capture[self.kitty_capture_len] = byte;
+            self.kitty_capture_len += 1;
+        } else {
+            self.kitty_capture_overflow = true;
+        }
+    }
+
+    fn kittyEventType(self: *const InputClassifier) ?u32 {
+        if (!self.kitty_capture_active or self.kitty_capture_overflow or self.kitty_capture_len < 2) {
+            return null;
+        }
+        if (self.kitty_capture[0] != 0x1b or self.kitty_capture[1] != '[') return null;
+        const kitty = parseKittyCsiU(self.kitty_capture[2..self.kitty_capture_len]) orelse return null;
+        return kitty.event_type;
     }
 
     pub fn classify(self: *InputClassifier, alloc: std.mem.Allocator, payload: []const u8) !Class {
@@ -834,39 +860,53 @@ pub const InputClassifier = struct {
                     seq_start = null;
                     sequence_from_carry = false;
                     sequence_kind = .other;
+                    self.kitty_capture_active = false;
+                    self.kitty_capture_len = 0;
+                    self.kitty_capture_overflow = false;
                     continue;
                 }
             }
 
-            if (self.parser.state == .ground and payload[i] == 0x1b) {
+            const started_escape = self.parser.state == .ground and payload[i] == 0x1b;
+            if (started_escape) {
                 seq_start = i;
                 sequence_from_carry = false;
                 sequence_kind = .other;
                 self.mouse_prefix = .esc;
-            } else switch (self.mouse_prefix) {
-                .none => {},
-                .esc => {
-                    self.mouse_prefix = if (payload[i] == '[') .csi else .none;
-                },
-                .csi => {
-                    switch (payload[i]) {
-                        '<' => {
-                            self.mouse_state = .sgr;
-                            self.mouse_prefix = .none;
-                            sequence_kind = .mouse;
-                        },
-                        'M' => {
-                            self.mouse_state = .x10;
-                            self.pending_mouse_bytes = 3;
-                            self.mouse_prefix = .none;
-                            sequence_kind = .mouse;
-                        },
-                        else => self.mouse_prefix = .none,
-                    }
-                },
+                self.kitty_capture_active = true;
+                self.kitty_capture_len = 0;
+                self.kitty_capture_overflow = false;
+                self.captureKittyByte(payload[i]);
+            } else {
+                self.captureKittyByte(payload[i]);
+                switch (self.mouse_prefix) {
+                    .none => {},
+                    .esc => {
+                        self.mouse_prefix = if (payload[i] == '[') .csi else .none;
+                    },
+                    .csi => {
+                        switch (payload[i]) {
+                            '<' => {
+                                self.mouse_state = .sgr;
+                                self.mouse_prefix = .none;
+                                sequence_kind = .mouse;
+                                self.kitty_capture_active = false;
+                            },
+                            'M' => {
+                                self.mouse_state = .x10;
+                                self.pending_mouse_bytes = 3;
+                                self.mouse_prefix = .none;
+                                sequence_kind = .mouse;
+                                self.kitty_capture_active = false;
+                            },
+                            else => self.mouse_prefix = .none,
+                        }
+                    },
+                }
             }
 
             const actions = self.parser.next(payload[i]);
+            var kitty_dispatch_seen = false;
             for (actions) |action_opt| {
                 const action = action_opt orelse continue;
                 switch (action) {
@@ -875,9 +915,15 @@ pub const InputClassifier = struct {
                         try self.appendRange(alloc, i, i + 1, false, .keyboard);
                     },
                     .csi_dispatch => |csi| {
-                        const is_keyboard = csi.final == 'u' or
+                        var is_keyboard = csi.final == 'u' or
                             csi.final == '~' or
                             (csi.final >= 'A' and csi.final <= 'D' and csi.params.len > 1);
+                        if (csi.final == 'u') {
+                            kitty_dispatch_seen = true;
+                            if (self.kittyEventType()) |event_type| {
+                                is_keyboard = event_type != 3;
+                            }
+                        }
                         if (is_keyboard) {
                             class.keyboard = true;
                             try self.appendRange(
@@ -896,6 +942,21 @@ pub const InputClassifier = struct {
                         }
                     },
                     else => {},
+                }
+            }
+
+            if (!kitty_dispatch_seen and payload[i] == 'u') {
+                if (self.kittyEventType()) |event_type| {
+                    if (event_type != 3) {
+                        class.keyboard = true;
+                        try self.appendRange(
+                            alloc,
+                            seq_start orelse i,
+                            i + 1,
+                            sequence_from_carry,
+                            .keyboard,
+                        );
+                    }
                 }
             }
 
@@ -918,6 +979,9 @@ pub const InputClassifier = struct {
                 seq_start = null;
                 sequence_from_carry = false;
                 sequence_kind = .other;
+                self.kitty_capture_active = false;
+                self.kitty_capture_len = 0;
+                self.kitty_capture_overflow = false;
             }
             i += 1;
         }
@@ -2479,4 +2543,44 @@ test "InputClassifier: focus events and terminal replies are neither input kind"
     try testing.expect(!class.keyboard);
     try testing.expect(!class.mouse);
     try testing.expect(class.tail_start == null);
+}
+
+test "InputClassifier: split Kitty CSI-u releases stay non-keyboard" {
+    const alloc = testing.allocator;
+    var classifier = InputClassifier{};
+    defer classifier.deinit(alloc);
+
+    const first = try classifier.classify(alloc, "\x1b[102;1:");
+    try testing.expect(!first.keyboard);
+    try testing.expectEqual(@as(?usize, 0), first.tail_start);
+
+    const second = try classifier.classify(alloc, "3u");
+    try testing.expect(!second.keyboard);
+    try testing.expect(!second.mouse);
+    try testing.expect(second.ranges.len == 0);
+
+    const third = try classifier.classify(alloc, "\x1b[102;1:3");
+    try testing.expect(!third.keyboard);
+    try testing.expectEqual(@as(?usize, 0), third.tail_start);
+
+    const fourth = try classifier.classify(alloc, "u");
+    try testing.expect(!fourth.keyboard);
+    try testing.expect(!fourth.mouse);
+    try testing.expect(fourth.ranges.len == 0);
+}
+
+test "InputClassifier: split Kitty CSI-u presses stay keyboard input" {
+    const alloc = testing.allocator;
+    var classifier = InputClassifier{};
+    defer classifier.deinit(alloc);
+
+    const first = try classifier.classify(alloc, "\x1b[102;1:");
+    try testing.expect(!first.keyboard);
+    try testing.expectEqual(@as(?usize, 0), first.tail_start);
+
+    const second = try classifier.classify(alloc, "1u");
+    try testing.expect(second.keyboard);
+    try testing.expectEqual(@as(usize, 1), second.ranges.len);
+    try testing.expectEqual(InputClassifier.RangeKind.keyboard, second.ranges[0].kind);
+    try testing.expect(second.ranges[0].from_carry);
 }
