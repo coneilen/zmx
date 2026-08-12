@@ -683,6 +683,91 @@ fn parseDecimal(buf: []const u8, pos: *usize) ?u32 {
     return value;
 }
 
+/// Classify one client's input stream while preserving VT parser state across
+/// socket reads. Mouse reports do not claim leadership, but keyboard input
+/// does, matching `isUserInput`.
+pub const InputClassifier = struct {
+    parser: ghostty_vt.Parser = undefined,
+    initialized: bool = false,
+    /// X10 mouse coordinates follow `CSI M` as three raw bytes.
+    pending_mouse_bytes: u8 = 0,
+
+    pub const Class = struct {
+        keyboard: bool = false,
+        mouse: bool = false,
+        /// Start of an escape sequence that is incomplete in this chunk.
+        tail_start: ?usize = null,
+    };
+
+    pub fn classify(self: *InputClassifier, payload: []const u8) Class {
+        if (!self.initialized) {
+            self.parser = ghostty_vt.Parser.init();
+            self.initialized = true;
+        }
+
+        var class = Class{};
+        var seq_start: ?usize = if (self.parser.state != .ground) 0 else null;
+        var i: usize = 0;
+
+        while (i < payload.len) {
+            if (self.pending_mouse_bytes > 0) {
+                self.pending_mouse_bytes -= 1;
+                class.mouse = true;
+                i += 1;
+                continue;
+            }
+
+            if (payload[i] == 0x1b and i + 2 < payload.len and payload[i + 1] == '[') {
+                if (parseKittyCsiU(payload[i + 2 ..])) |kitty| {
+                    if (kitty.event_type != 3) class.keyboard = true;
+                    const end = i + 2 + kitty.consumed;
+                    while (i < end) : (i += 1) _ = self.parser.next(payload[i]);
+                    seq_start = null;
+                    continue;
+                }
+            }
+
+            if (self.parser.state == .ground and payload[i] == 0x1b) {
+                seq_start = i;
+            }
+
+            const actions = self.parser.next(payload[i]);
+            for (actions) |action_opt| {
+                const action = action_opt orelse continue;
+                switch (action) {
+                    .print => class.keyboard = true,
+                    .csi_dispatch => |csi| {
+                        if (csi.final == 'u' or csi.final == '~') {
+                            class.keyboard = true;
+                        } else if (csi.final >= 'A' and csi.final <= 'D' and csi.params.len > 1) {
+                            class.keyboard = true;
+                        } else if (csi.final == 'M' or csi.final == 'm') {
+                            class.mouse = true;
+                            if (csi.final == 'M' and csi.params.len == 0) {
+                                self.pending_mouse_bytes = 3;
+                            }
+                        }
+                    },
+                    .execute => |code| {
+                        if (code == 0x0D or code == 0x0A or code == 0x09 or code == 0x08) {
+                            class.keyboard = true;
+                        }
+                    },
+                    else => {},
+                }
+            }
+
+            if (self.parser.state == .ground) {
+                seq_start = null;
+            }
+            i += 1;
+        }
+
+        class.tail_start = seq_start;
+        return class;
+    }
+};
+
 /// Detect if the payload contains user input that should be printed to the screen or
 /// is a key combination like up-arrow, backspace, enter, ctrl+f, etc.
 pub fn isUserInput(payload: []const u8) bool {
@@ -2167,4 +2252,51 @@ test "stripAnsi: only escape sequences" {
     const result = try stripAnsi(alloc, "\x1b[31m\x1b[1m\x1b[0m");
     defer alloc.free(result);
     try testing.expectEqualStrings("", result);
+}
+
+test "InputClassifier: complete SGR mouse report is not keyboard input" {
+    var classifier = InputClassifier{};
+    const class = classifier.classify("\x1b[<64;90;20M");
+    try testing.expect(class.mouse);
+    try testing.expect(!class.keyboard);
+    try testing.expect(class.tail_start == null);
+}
+
+test "InputClassifier: split SGR mouse report stays stateful" {
+    var classifier = InputClassifier{};
+    const first = classifier.classify("\x1b[<6");
+    try testing.expect(!first.mouse);
+    try testing.expect(!first.keyboard);
+    try testing.expectEqual(@as(?usize, 0), first.tail_start);
+
+    const second = classifier.classify("5;90;20M");
+    try testing.expect(second.mouse);
+    try testing.expect(!second.keyboard);
+    try testing.expect(second.tail_start == null);
+}
+
+test "InputClassifier: split X10 coordinates are not keyboard input" {
+    var classifier = InputClassifier{};
+    const first = classifier.classify("\x1b[M ");
+    try testing.expect(first.mouse);
+    try testing.expect(!first.keyboard);
+
+    const second = classifier.classify("!!");
+    try testing.expect(second.mouse);
+    try testing.expect(!second.keyboard);
+}
+
+test "InputClassifier: keyboard input claims leadership" {
+    var classifier = InputClassifier{};
+    const class = classifier.classify("x\r");
+    try testing.expect(class.keyboard);
+    try testing.expect(!class.mouse);
+}
+
+test "InputClassifier: focus events and terminal replies are neither input kind" {
+    var classifier = InputClassifier{};
+    const class = classifier.classify("\x1b[I\x1b[O\x1b[1;2R\x1b[?1;2c");
+    try testing.expect(!class.keyboard);
+    try testing.expect(!class.mouse);
+    try testing.expect(class.tail_start == null);
 }

@@ -15,6 +15,7 @@ Use spec: https://common-changelog.org/
 - Clear screen when switching sessions to prevent term state corruption
 - Stray NUL byte in the OSC 7 sequence replayed on attach
 - The OSC 7 cwd is now decoded before the chdir, so a new session can start in a directory whose name needed percent-encoding
+- Non-leader SGR/X10 mouse reports are forwarded without changing keyboard leadership. This is a clean reimplementation of GraphCode patch `a8739f4f64f7b716f24cc51c4883938f4daaf284`, based on downstream SHA `93cd148d4bbdbc1fac6d78bcdc5397f57deaa346`, onto upstream SHA `bea5fe315ca5fcd67f393cef9c8c2b0a6903ebca`
 
 ### Changed
 
