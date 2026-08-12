@@ -865,14 +865,6 @@ pub const Daemon = struct {
             return;
         }
 
-        // Keyboard input claims leadership, as before.
-        if (class.keyboard) {
-            try self.setLeader(gpa, client);
-            client.input_carry.clearRetainingCapacity();
-            self.queuePtyInput(gpa, payload);
-            return;
-        }
-
         var carry_prefix_len: usize = 0;
         if (class.tail_start) |tail_index| {
             carry_prefix_len = if (tail_index == 0) client.input_carry.items.len else 0;
@@ -891,18 +883,24 @@ pub const Daemon = struct {
             };
         }
 
-        // Forward only complete mouse ranges. A range marked from_carry is
-        // emitted with its held-back prefix in one contiguous PTY append.
-        if (class.mouse_ranges.len > 0) {
-            var mouse_input = std.ArrayList(u8).empty;
-            defer mouse_input.deinit(gpa);
-            for (class.mouse_ranges) |range| {
+        // Keyboard input claims leadership, but still shares the filtered
+        // stream path so carried mouse prefixes and terminal events retain
+        // their correct ordering and filtering.
+        if (class.keyboard) try self.setLeader(gpa, client);
+
+        // Forward only complete mouse and keyboard ranges. A range marked
+        // from_carry is emitted with its held-back prefix in one contiguous
+        // PTY append.
+        if (class.ranges.len > 0) {
+            var input = std.ArrayList(u8).empty;
+            defer input.deinit(gpa);
+            for (class.ranges) |range| {
                 if (range.from_carry) {
-                    try mouse_input.appendSlice(gpa, client.input_carry.items);
+                    try input.appendSlice(gpa, client.input_carry.items);
                 }
-                try mouse_input.appendSlice(gpa, payload[range.start..range.end]);
+                try input.appendSlice(gpa, payload[range.start..range.end]);
             }
-            self.queuePtyInput(gpa, mouse_input.items);
+            self.queuePtyInput(gpa, input.items);
         }
 
         if (class.tail_start) |tail_index| {
@@ -1669,4 +1667,97 @@ test "input carry overflow resets classifier and suppresses its suffix" {
 
     try daemon.handleInput(alloc, &client, "\x1b[<64;10;10M");
     try std.testing.expectEqualStrings("\x1b[<64;10;10M", daemon.pty_write_buf.items);
+}
+
+test "split SGR mouse plus keyboard preserves order and filters terminal events" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "\x1b[<6");
+    try daemon.handleInput(alloc, &client, "5;90;20Mx\x1b[I\x1b[1;2R");
+
+    try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1b[<65;90;20Mx", daemon.pty_write_buf.items);
+}
+
+test "split X10 mouse plus keyboard preserves order and filters terminal events" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "\x1b[M");
+    try daemon.handleInput(alloc, &client, " !!x\x1b[O\x1b[1;2R");
+
+    try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1b[M !!x", daemon.pty_write_buf.items);
+}
+
+test "carried reply and focus plus keyboard suppresses terminal events" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "\x1b[1;2");
+    try daemon.handleInput(alloc, &client, "R\x1b[Ix\x1b[O\x1b[1;2R");
+
+    try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("x", daemon.pty_write_buf.items);
 }

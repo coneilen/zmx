@@ -692,7 +692,7 @@ pub const InputClassifier = struct {
     mouse_prefix: MousePrefix = .none,
     mouse_state: MouseState = .none,
     pending_mouse_bytes: u8 = 0,
-    mouse_ranges: std.ArrayList(MouseRange) = .empty,
+    ranges: std.ArrayList(Range) = .empty,
     quarantined: bool = false,
 
     const MousePrefix = enum {
@@ -712,10 +712,16 @@ pub const InputClassifier = struct {
         mouse,
     };
 
-    pub const MouseRange = struct {
+    pub const RangeKind = enum {
+        mouse,
+        keyboard,
+    };
+
+    pub const Range = struct {
         start: usize,
         end: usize,
         from_carry: bool,
+        kind: RangeKind,
     };
 
     pub const Class = struct {
@@ -725,11 +731,11 @@ pub const InputClassifier = struct {
         /// Start of an escape sequence that is incomplete in this chunk.
         tail_start: ?usize = null,
         tail_kind: ?CarryKind = null,
-        mouse_ranges: []const MouseRange = &.{},
+        ranges: []const Range = &.{},
     };
 
     pub fn deinit(self: *InputClassifier, alloc: std.mem.Allocator) void {
-        self.mouse_ranges.deinit(alloc);
+        self.ranges.deinit(alloc);
     }
 
     fn resetState(self: *InputClassifier) void {
@@ -738,7 +744,7 @@ pub const InputClassifier = struct {
         self.mouse_prefix = .none;
         self.mouse_state = .none;
         self.pending_mouse_bytes = 0;
-        self.mouse_ranges.clearRetainingCapacity();
+        self.ranges.clearRetainingCapacity();
     }
 
     pub fn reset(self: *InputClassifier) void {
@@ -751,8 +757,24 @@ pub const InputClassifier = struct {
         self.quarantined = true;
     }
 
+    fn appendRange(
+        self: *InputClassifier,
+        alloc: std.mem.Allocator,
+        start: usize,
+        end: usize,
+        from_carry: bool,
+        kind: RangeKind,
+    ) !void {
+        try self.ranges.append(alloc, .{
+            .start = start,
+            .end = end,
+            .from_carry = from_carry,
+            .kind = kind,
+        });
+    }
+
     pub fn classify(self: *InputClassifier, alloc: std.mem.Allocator, payload: []const u8) !Class {
-        self.mouse_ranges.clearRetainingCapacity();
+        self.ranges.clearRetainingCapacity();
         if (self.quarantined) {
             self.quarantined = false;
             self.resetState();
@@ -777,11 +799,14 @@ pub const InputClassifier = struct {
             if (self.mouse_state == .x10 and self.pending_mouse_bytes > 0) {
                 self.pending_mouse_bytes -= 1;
                 if (self.pending_mouse_bytes == 0) {
-                    try self.mouse_ranges.append(alloc, .{
-                        .start = seq_start orelse 0,
-                        .end = i + 1,
-                        .from_carry = sequence_from_carry,
-                    });
+                    try self.appendRange(
+                        alloc,
+                        seq_start orelse 0,
+                        i + 1,
+                        sequence_from_carry,
+                        .mouse,
+                    );
+                    class.mouse = true;
                     self.mouse_state = .none;
                     self.mouse_prefix = .none;
                     seq_start = null;
@@ -798,9 +823,13 @@ pub const InputClassifier = struct {
                 payload[i + 1] == '[')
             {
                 if (parseKittyCsiU(payload[i + 2 ..])) |kitty| {
-                    if (kitty.event_type != 3) class.keyboard = true;
+                    const start = i;
                     const end = i + 2 + kitty.consumed;
                     while (i < end) : (i += 1) _ = self.parser.next(payload[i]);
+                    if (kitty.event_type != 3) {
+                        class.keyboard = true;
+                        try self.appendRange(alloc, start, end, false, .keyboard);
+                    }
                     self.mouse_prefix = .none;
                     seq_start = null;
                     sequence_from_carry = false;
@@ -841,17 +870,29 @@ pub const InputClassifier = struct {
             for (actions) |action_opt| {
                 const action = action_opt orelse continue;
                 switch (action) {
-                    .print => class.keyboard = true,
+                    .print => {
+                        class.keyboard = true;
+                        try self.appendRange(alloc, i, i + 1, false, .keyboard);
+                    },
                     .csi_dispatch => |csi| {
-                        if (csi.final == 'u' or csi.final == '~') {
+                        const is_keyboard = csi.final == 'u' or
+                            csi.final == '~' or
+                            (csi.final >= 'A' and csi.final <= 'D' and csi.params.len > 1);
+                        if (is_keyboard) {
                             class.keyboard = true;
-                        } else if (csi.final >= 'A' and csi.final <= 'D' and csi.params.len > 1) {
-                            class.keyboard = true;
+                            try self.appendRange(
+                                alloc,
+                                seq_start orelse i,
+                                i + 1,
+                                sequence_from_carry,
+                                .keyboard,
+                            );
                         }
                     },
                     .execute => |code| {
                         if (code == 0x0D or code == 0x0A or code == 0x09 or code == 0x08) {
                             class.keyboard = true;
+                            try self.appendRange(alloc, i, i + 1, false, .keyboard);
                         }
                     },
                     else => {},
@@ -859,11 +900,14 @@ pub const InputClassifier = struct {
             }
 
             if (self.mouse_state == .sgr and (payload[i] == 'M' or payload[i] == 'm')) {
-                try self.mouse_ranges.append(alloc, .{
-                    .start = seq_start orelse 0,
-                    .end = i + 1,
-                    .from_carry = sequence_from_carry,
-                });
+                try self.appendRange(
+                    alloc,
+                    seq_start orelse 0,
+                    i + 1,
+                    sequence_from_carry,
+                    .mouse,
+                );
+                class.mouse = true;
                 self.mouse_state = .none;
                 self.mouse_prefix = .none;
                 seq_start = null;
@@ -878,8 +922,7 @@ pub const InputClassifier = struct {
             i += 1;
         }
 
-        class.mouse_ranges = self.mouse_ranges.items;
-        class.mouse = class.mouse_ranges.len > 0;
+        class.ranges = self.ranges.items;
         if (seq_start) |start| {
             class.tail_start = start;
             class.tail_kind = sequence_kind;
@@ -2382,7 +2425,8 @@ test "InputClassifier: complete SGR mouse report is not keyboard input" {
     try testing.expect(class.mouse);
     try testing.expect(!class.keyboard);
     try testing.expect(class.tail_start == null);
-    try testing.expectEqual(@as(usize, 1), class.mouse_ranges.len);
+    try testing.expectEqual(@as(usize, 1), class.ranges.len);
+    try testing.expect(class.ranges[0].kind == .mouse);
 }
 
 test "InputClassifier: split SGR mouse report stays stateful" {
@@ -2398,7 +2442,8 @@ test "InputClassifier: split SGR mouse report stays stateful" {
     try testing.expect(second.mouse);
     try testing.expect(!second.keyboard);
     try testing.expect(second.tail_start == null);
-    try testing.expect(second.mouse_ranges[0].from_carry);
+    try testing.expect(second.ranges[0].from_carry);
+    try testing.expect(second.ranges[0].kind == .mouse);
 }
 
 test "InputClassifier: split X10 coordinates are not keyboard input" {
@@ -2413,7 +2458,8 @@ test "InputClassifier: split X10 coordinates are not keyboard input" {
     const second = try classifier.classify(alloc, "!!");
     try testing.expect(second.mouse);
     try testing.expect(!second.keyboard);
-    try testing.expect(second.mouse_ranges[0].from_carry);
+    try testing.expect(second.ranges[0].from_carry);
+    try testing.expect(second.ranges[0].kind == .mouse);
 }
 
 test "InputClassifier: keyboard input claims leadership" {
