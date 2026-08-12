@@ -858,8 +858,13 @@ pub const Daemon = struct {
         const class = try client.classifier.classify(gpa, payload);
         if (class.discarded) return;
 
-        // client is leader, send entire payload (ansi escape codes + text)
-        if (self.leader_client_fd == client.socket_fd and client.input_carry.items.len == 0) {
+        // A leader normally sends the entire payload (ANSI escape codes + text),
+        // but an incomplete sequence must take the filtered path so its prefix
+        // can be held back until the report is complete.
+        if (self.leader_client_fd == client.socket_fd and
+            client.input_carry.items.len == 0 and
+            class.tail_start == null)
+        {
             self.queuePtyInput(gpa, payload);
             return;
         }
@@ -1885,4 +1890,140 @@ test "split Kitty CSI-u release remains suppressed" {
 
     try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
     try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+}
+
+test "leader split SGR mouse stays atomic across takeover" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer leader.write_buf.deinit(alloc);
+    defer leader.classifier.deinit(alloc);
+    defer leader.input_carry.deinit(alloc);
+
+    var follower = Client{
+        .alloc = alloc,
+        .socket_fd = 8,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer follower.write_buf.deinit(alloc);
+    defer follower.classifier.deinit(alloc);
+    defer follower.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &leader, "\x1b[<6");
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+
+    try daemon.handleInput(alloc, &follower, "x");
+    try std.testing.expectEqualStrings("x", daemon.pty_write_buf.items);
+    try std.testing.expectEqual(@as(?i32, 8), daemon.leader_client_fd);
+
+    try daemon.handleInput(alloc, &leader, "5;90;20M");
+    try std.testing.expectEqualStrings("x\x1b[<65;90;20M", daemon.pty_write_buf.items);
+}
+
+test "leader split X10 mouse stays atomic across takeover" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer leader.write_buf.deinit(alloc);
+    defer leader.classifier.deinit(alloc);
+    defer leader.input_carry.deinit(alloc);
+
+    var follower = Client{
+        .alloc = alloc,
+        .socket_fd = 8,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer follower.write_buf.deinit(alloc);
+    defer follower.classifier.deinit(alloc);
+    defer follower.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &leader, "\x1b[M");
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+
+    try daemon.handleInput(alloc, &follower, "x");
+    try std.testing.expectEqualStrings("x", daemon.pty_write_buf.items);
+    try std.testing.expectEqual(@as(?i32, 8), daemon.leader_client_fd);
+
+    try daemon.handleInput(alloc, &leader, " !!");
+    try std.testing.expectEqualStrings("x\x1b[M !!", daemon.pty_write_buf.items);
+}
+
+test "leader split reply and focus stay suppressed across takeover" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer leader.write_buf.deinit(alloc);
+    defer leader.classifier.deinit(alloc);
+    defer leader.input_carry.deinit(alloc);
+
+    var follower = Client{
+        .alloc = alloc,
+        .socket_fd = 8,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer follower.write_buf.deinit(alloc);
+    defer follower.classifier.deinit(alloc);
+    defer follower.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &leader, "\x1b[1;2");
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+
+    try daemon.handleInput(alloc, &follower, "x");
+    try std.testing.expectEqualStrings("x", daemon.pty_write_buf.items);
+    try std.testing.expectEqual(@as(?i32, 8), daemon.leader_client_fd);
+
+    try daemon.handleInput(alloc, &leader, "R\x1b[");
+    try daemon.handleInput(alloc, &leader, "I");
+    try std.testing.expectEqualStrings("x", daemon.pty_write_buf.items);
 }
