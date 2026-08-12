@@ -692,6 +692,7 @@ pub const InputClassifier = struct {
     mouse_prefix: MousePrefix = .none,
     mouse_state: MouseState = .none,
     pending_mouse_bytes: u8 = 0,
+    ss3_pending: bool = false,
     ranges: std.ArrayList(Range) = .empty,
     quarantined: bool = false,
     kitty_capture: [128]u8 = undefined,
@@ -735,6 +736,8 @@ pub const InputClassifier = struct {
         /// Start of an escape sequence that is incomplete in this chunk.
         tail_start: ?usize = null,
         tail_kind: ?CarryKind = null,
+        /// End of the first carried sequence completed in this chunk.
+        completed_carry_end: ?usize = null,
         ranges: []const Range = &.{},
     };
 
@@ -748,6 +751,7 @@ pub const InputClassifier = struct {
         self.mouse_prefix = .none;
         self.mouse_state = .none;
         self.pending_mouse_bytes = 0;
+        self.ss3_pending = false;
         self.ranges.clearRetainingCapacity();
         self.kitty_capture_len = 0;
         self.kitty_capture_active = false;
@@ -815,13 +819,15 @@ pub const InputClassifier = struct {
         var class = Class{};
         var seq_start: ?usize = if (self.parser.state != .ground or
             self.mouse_state != .none or
-            self.mouse_prefix != .none) 0 else null;
+            self.mouse_prefix != .none or
+            self.ss3_pending) 0 else null;
         var sequence_from_carry = seq_start != null;
         var sequence_kind: CarryKind = .other;
         if (self.mouse_state != .none) sequence_kind = .mouse;
         var i: usize = 0;
 
         while (i < payload.len) {
+            var ss3_complete = false;
             if (self.mouse_state == .x10 and self.pending_mouse_bytes > 0) {
                 self.pending_mouse_bytes -= 1;
                 if (self.pending_mouse_bytes == 0) {
@@ -833,6 +839,9 @@ pub const InputClassifier = struct {
                         .mouse,
                     );
                     class.mouse = true;
+                    if (sequence_from_carry and class.completed_carry_end == null) {
+                        class.completed_carry_end = i + 1;
+                    }
                     self.mouse_state = .none;
                     self.mouse_prefix = .none;
                     seq_start = null;
@@ -841,6 +850,25 @@ pub const InputClassifier = struct {
                 }
                 i += 1;
                 continue;
+            }
+
+            if (self.ss3_pending) {
+                try self.appendRange(
+                    alloc,
+                    seq_start orelse 0,
+                    i + 1,
+                    sequence_from_carry,
+                    .keyboard,
+                );
+                class.keyboard = true;
+                if (sequence_from_carry and class.completed_carry_end == null) {
+                    class.completed_carry_end = i + 1;
+                }
+                self.ss3_pending = false;
+                ss3_complete = true;
+                seq_start = null;
+                sequence_from_carry = false;
+                sequence_kind = .other;
             }
 
             if (payload[i] == 0x1b and
@@ -882,6 +910,7 @@ pub const InputClassifier = struct {
                 switch (self.mouse_prefix) {
                     .none => {},
                     .esc => {
+                        if (payload[i] == 'O') self.ss3_pending = true;
                         self.mouse_prefix = if (payload[i] == '[') .csi else .none;
                     },
                     .csi => {
@@ -911,8 +940,10 @@ pub const InputClassifier = struct {
                 const action = action_opt orelse continue;
                 switch (action) {
                     .print => {
-                        class.keyboard = true;
-                        try self.appendRange(alloc, i, i + 1, false, .keyboard);
+                        if (!ss3_complete) {
+                            class.keyboard = true;
+                            try self.appendRange(alloc, i, i + 1, false, .keyboard);
+                        }
                     },
                     .csi_dispatch => |csi| {
                         var is_keyboard = csi.final == 'u' or
@@ -969,12 +1000,21 @@ pub const InputClassifier = struct {
                     .mouse,
                 );
                 class.mouse = true;
+                if (sequence_from_carry and class.completed_carry_end == null) {
+                    class.completed_carry_end = i + 1;
+                }
                 self.mouse_state = .none;
                 self.mouse_prefix = .none;
                 seq_start = null;
                 sequence_from_carry = false;
                 sequence_kind = .other;
-            } else if (self.mouse_state == .none and self.parser.state == .ground) {
+            } else if (self.mouse_state == .none and
+                self.parser.state == .ground and
+                !self.ss3_pending)
+            {
+                if (sequence_from_carry and class.completed_carry_end == null) {
+                    class.completed_carry_end = i + 1;
+                }
                 self.mouse_prefix = .none;
                 seq_start = null;
                 sequence_from_carry = false;

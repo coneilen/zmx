@@ -853,6 +853,8 @@ pub const Daemon = struct {
         // NOTE: for local dev only
         // std.log.debug("buffering pty input data={x}", .{payload});
 
+        const was_leader = self.leader_client_fd == client.socket_fd;
+
         // Classify every chunk, including the leader's, so the parser remains
         // synchronized with each client's input stream.
         const class = try client.classifier.classify(gpa, payload);
@@ -861,7 +863,7 @@ pub const Daemon = struct {
         // A leader normally sends the entire payload (ANSI escape codes + text),
         // but an incomplete sequence must take the filtered path so its prefix
         // can be held back until the report is complete.
-        if (self.leader_client_fd == client.socket_fd and
+        if (was_leader and
             client.input_carry.items.len == 0 and
             class.tail_start == null)
         {
@@ -885,6 +887,30 @@ pub const Daemon = struct {
                 client.classifier.quarantine();
                 return;
             };
+        }
+
+        // A sequence that started while this client was leader retains the
+        // leader's raw-input semantics if it completes before leadership
+        // changes. Once another client takes over, the filtered range path
+        // below suppresses replies and focus events as usual.
+        if (was_leader and client.input_carry.items.len > 0) {
+            if (class.completed_carry_end != null) {
+                const raw_end = if (class.tail_start) |tail_index| tail_index else payload.len;
+                if (raw_end > 0) {
+                    var input = std.ArrayList(u8).empty;
+                    defer input.deinit(gpa);
+                    try input.appendSlice(gpa, client.input_carry.items);
+                    try input.appendSlice(gpa, payload[0..raw_end]);
+                    self.queuePtyInput(gpa, input.items);
+                    client.input_carry.clearRetainingCapacity();
+                    if (class.tail_start) |tail_index| {
+                        if (tail_index > 0) {
+                            try client.input_carry.appendSlice(gpa, payload[tail_index..]);
+                        }
+                    }
+                    return;
+                }
+            }
         }
 
         // Keyboard input claims leadership, but still shares the filtered
@@ -1794,9 +1820,8 @@ test "new leader continues a carried SGR mouse after keyboard input" {
 
     try daemon.handleInput(alloc, &client, "x\x1b[<6");
     try daemon.handleInput(alloc, &client, "5;90;20M\x1b[I");
-
     try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
-    try std.testing.expectEqualStrings("x\x1b[<65;90;20M", daemon.pty_write_buf.items);
+    try std.testing.expectEqualStrings("x\x1b[<65;90;20M\x1b[I", daemon.pty_write_buf.items);
 }
 
 test "new leader continues a carried X10 mouse after keyboard input" {
@@ -1825,12 +1850,11 @@ test "new leader continues a carried X10 mouse after keyboard input" {
 
     try daemon.handleInput(alloc, &client, "x\x1b[M");
     try daemon.handleInput(alloc, &client, " !!\x1b[O");
-
     try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
-    try std.testing.expectEqualStrings("x\x1b[M !!", daemon.pty_write_buf.items);
+    try std.testing.expectEqualStrings("x\x1b[M !!\x1b[O", daemon.pty_write_buf.items);
 }
 
-test "new leader suppresses a carried reply and focus after keyboard input" {
+test "new leader forwards a carried reply and filters coalesced focus" {
     const alloc = std.testing.allocator;
     var daemon = Daemon{
         .cfg = undefined,
@@ -1856,9 +1880,8 @@ test "new leader suppresses a carried reply and focus after keyboard input" {
 
     try daemon.handleInput(alloc, &client, "x\x1b[1;2");
     try daemon.handleInput(alloc, &client, "R\x1b[I");
-
     try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
-    try std.testing.expectEqualStrings("x", daemon.pty_write_buf.items);
+    try std.testing.expectEqualStrings("x\x1b[1;2R\x1b[I", daemon.pty_write_buf.items);
 }
 
 test "split Kitty CSI-u release remains suppressed" {
@@ -2026,4 +2049,101 @@ test "leader split reply and focus stay suppressed across takeover" {
     try daemon.handleInput(alloc, &leader, "R\x1b[");
     try daemon.handleInput(alloc, &leader, "I");
     try std.testing.expectEqualStrings("x", daemon.pty_write_buf.items);
+}
+
+test "leader split reply and focus forward while leadership is unchanged" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer leader.write_buf.deinit(alloc);
+    defer leader.classifier.deinit(alloc);
+    defer leader.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &leader, "\x1b[1;2");
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+    try daemon.handleInput(alloc, &leader, "R");
+    try std.testing.expectEqualStrings("\x1b[1;2R", daemon.pty_write_buf.items);
+    try daemon.handleInput(alloc, &leader, "\x1b[");
+    try std.testing.expectEqualStrings("\x1b[1;2R", daemon.pty_write_buf.items);
+    try daemon.handleInput(alloc, &leader, "I");
+    try std.testing.expectEqualStrings("\x1b[1;2R\x1b[I", daemon.pty_write_buf.items);
+}
+
+test "non-leader complete SS3 key forwards its full sequence" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "\x1bOA");
+
+    try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1bOA", daemon.pty_write_buf.items);
+}
+
+test "non-leader split SS3 key forwards its full sequence" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "\x1bO");
+    try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+
+    try daemon.handleInput(alloc, &client, "A");
+    try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1bOA", daemon.pty_write_buf.items);
 }
