@@ -700,6 +700,8 @@ pub const InputClassifier = struct {
     kitty_capture_len: usize = 0,
     kitty_capture_active: bool = false,
     kitty_capture_overflow: bool = false,
+    kitty_event_type: u32 = 1,
+    kitty_event_type_known: bool = false,
 
     const MousePrefix = enum {
         none,
@@ -741,6 +743,8 @@ pub const InputClassifier = struct {
         tail_kind: ?CarryKind = null,
         /// End of the first carried sequence completed in this chunk.
         completed_carry_end: ?usize = null,
+        /// Permit a larger bounded carry for Kitty text-codepoint fields.
+        allow_large_carry: bool = false,
         ranges: []const Range = &.{},
     };
 
@@ -760,6 +764,8 @@ pub const InputClassifier = struct {
         self.kitty_capture_len = 0;
         self.kitty_capture_active = false;
         self.kitty_capture_overflow = false;
+        self.kitty_event_type = 1;
+        self.kitty_event_type_known = false;
     }
 
     pub fn reset(self: *InputClassifier) void {
@@ -794,23 +800,48 @@ pub const InputClassifier = struct {
         self.emitted_prefix = true;
     }
 
+    fn parseKittyEventHeader(buf: []const u8) ?u32 {
+        var pos: usize = 0;
+        _ = parseDecimal(buf, &pos) orelse return null;
+        while (pos < buf.len and buf[pos] == ':') {
+            pos += 1;
+            _ = parseDecimal(buf, &pos);
+        }
+        if (pos >= buf.len or buf[pos] != ';') return null;
+        pos += 1;
+        _ = parseDecimal(buf, &pos) orelse return null;
+        if (pos >= buf.len) return null;
+        if (buf[pos] == ';' or buf[pos] == 'u') return 1;
+        if (buf[pos] != ':') return null;
+        pos += 1;
+        const event_type = parseDecimal(buf, &pos) orelse return null;
+        if (pos >= buf.len or (buf[pos] != ';' and buf[pos] != 'u')) return null;
+        return event_type;
+    }
+
     fn captureKittyByte(self: *InputClassifier, byte: u8) void {
-        if (!self.kitty_capture_active) return;
+        if (!self.kitty_capture_active or self.kitty_event_type_known) return;
         if (self.kitty_capture_len < self.kitty_capture.len) {
             self.kitty_capture[self.kitty_capture_len] = byte;
             self.kitty_capture_len += 1;
+            if (self.kitty_capture_len >= 2 and
+                self.kitty_capture[0] == 0x1b and
+                self.kitty_capture[1] == '[')
+            {
+                if (parseKittyEventHeader(self.kitty_capture[2..self.kitty_capture_len])) |event_type| {
+                    self.kitty_event_type = event_type;
+                    self.kitty_event_type_known = true;
+                }
+            }
         } else {
             self.kitty_capture_overflow = true;
         }
     }
 
     fn kittyEventType(self: *const InputClassifier) ?u32 {
-        if (!self.kitty_capture_active or self.kitty_capture_overflow or self.kitty_capture_len < 2) {
-            return null;
-        }
-        if (self.kitty_capture[0] != 0x1b or self.kitty_capture[1] != '[') return null;
-        const kitty = parseKittyCsiU(self.kitty_capture[2..self.kitty_capture_len]) orelse return null;
-        return kitty.event_type;
+        if (!self.kitty_capture_active or self.kitty_capture_overflow) return null;
+        if (self.kitty_event_type_known) return self.kitty_event_type;
+        return null;
     }
 
     pub fn classify(self: *InputClassifier, alloc: std.mem.Allocator, payload: []const u8) !Class {
@@ -909,6 +940,8 @@ pub const InputClassifier = struct {
                     self.kitty_capture_active = false;
                     self.kitty_capture_len = 0;
                     self.kitty_capture_overflow = false;
+                    self.kitty_event_type = 1;
+                    self.kitty_event_type_known = false;
                     continue;
                 }
             }
@@ -922,6 +955,8 @@ pub const InputClassifier = struct {
                 self.kitty_capture_active = true;
                 self.kitty_capture_len = 0;
                 self.kitty_capture_overflow = false;
+                self.kitty_event_type = 1;
+                self.kitty_event_type_known = false;
                 self.captureKittyByte(payload[i]);
             } else {
                 self.captureKittyByte(payload[i]);
@@ -979,6 +1014,8 @@ pub const InputClassifier = struct {
                             kitty_dispatch_seen = true;
                             if (self.kittyEventType()) |event_type| {
                                 is_keyboard = event_type != 3;
+                            } else if (self.kitty_capture_overflow) {
+                                is_keyboard = false;
                             }
                         }
                         if (is_keyboard) {
@@ -1065,10 +1102,13 @@ pub const InputClassifier = struct {
                 self.kitty_capture_active = false;
                 self.kitty_capture_len = 0;
                 self.kitty_capture_overflow = false;
+                self.kitty_event_type = 1;
+                self.kitty_event_type_known = false;
             }
             i += 1;
         }
 
+        class.allow_large_carry = self.kitty_capture_active and self.kitty_event_type_known;
         class.ranges = self.ranges.items;
         if (seq_start) |start| {
             class.tail_start = start;

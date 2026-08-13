@@ -848,6 +848,7 @@ pub const Daemon = struct {
     }
 
     const MAX_INPUT_CARRY = 128;
+    const MAX_KITTY_CARRY = 64 * 1024;
 
     pub fn handleInput(self: *Daemon, gpa: std.mem.Allocator, client: *Client, payload: []const u8) !void {
         // NOTE: for local dev only
@@ -887,8 +888,9 @@ pub const Daemon = struct {
         if (class.tail_start) |tail_index| {
             carry_prefix_len = if (tail_index == 0) client.input_carry.items.len else 0;
             const partial_len = payload.len - tail_index;
-            if (partial_len > MAX_INPUT_CARRY or
-                carry_prefix_len > MAX_INPUT_CARRY - partial_len)
+            const carry_limit: usize = if (class.allow_large_carry) MAX_KITTY_CARRY else MAX_INPUT_CARRY;
+            if (partial_len > carry_limit or
+                carry_prefix_len > carry_limit - partial_len)
             {
                 client.input_carry.clearRetainingCapacity();
                 client.classifier.quarantine();
@@ -2467,4 +2469,122 @@ test "emitted leader ESC preserves SS3 continuation classification" {
 
     try std.testing.expectEqual(@as(?i32, 8), daemon.leader_client_fd);
     try std.testing.expectEqualStrings("\x1bx", daemon.pty_write_buf.items);
+}
+
+fn makeLongKittySequence(alloc: std.mem.Allocator, event_type: u8, text_len: usize) ![]u8 {
+    var sequence = std.ArrayList(u8).empty;
+    errdefer sequence.deinit(alloc);
+    try sequence.appendSlice(alloc, "\x1b[65;1:");
+    try sequence.append(alloc, event_type);
+    try sequence.append(alloc, ';');
+    var i: usize = 0;
+    while (i < text_len) : (i += 1) {
+        try sequence.append(alloc, '1');
+    }
+    try sequence.append(alloc, 'u');
+    return sequence.toOwnedSlice(alloc);
+}
+
+test "split Kitty press with exactly 128 text bytes forwards full range" {
+    const alloc = std.testing.allocator;
+    const sequence = try makeLongKittySequence(alloc, '1', 128);
+    defer alloc.free(sequence);
+
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, sequence[0..128]);
+    try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+
+    try daemon.handleInput(alloc, &client, sequence[128..]);
+    try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
+    try std.testing.expectEqualSlices(u8, sequence, daemon.pty_write_buf.items);
+}
+
+test "split Kitty press over 128 capture bytes forwards full range" {
+    const alloc = std.testing.allocator;
+    const sequence = try makeLongKittySequence(alloc, '1', 129);
+    defer alloc.free(sequence);
+
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, sequence[0..128]);
+    try daemon.handleInput(alloc, &client, sequence[128..]);
+
+    try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
+    try std.testing.expectEqualSlices(u8, sequence, daemon.pty_write_buf.items);
+}
+
+test "split long Kitty release stays suppressed after capture limit" {
+    const alloc = std.testing.allocator;
+    const sequence = try makeLongKittySequence(alloc, '3', 129);
+    defer alloc.free(sequence);
+
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, sequence[0..128]);
+    try daemon.handleInput(alloc, &client, sequence[128..]);
+
+    try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
 }
