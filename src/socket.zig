@@ -7,6 +7,7 @@ else
 
 pub const getSeshPrefix = selected.getSeshPrefix;
 pub const getSeshNameFromEnv = selected.getSeshNameFromEnv;
+pub const getSeshNameFromEnvAlloc = selected.getSeshNameFromEnvAlloc;
 pub const getSeshName = selected.getSeshName;
 pub const resolveSessionOrEnv = selected.resolveSessionOrEnv;
 pub const SessionMatch = selected.SessionMatch;

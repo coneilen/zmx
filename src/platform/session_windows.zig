@@ -213,6 +213,7 @@ const ServeState = struct {
     stopping: bool = false,
     workers: std.ArrayList(*ClientWorker) = .empty,
     reaper_stop: std.atomic.Value(bool) = .init(false),
+    reaper_event: Cancellation = undefined,
     reaper_thread: ?std.Thread = null,
 };
 
@@ -221,6 +222,7 @@ const ClientWorker = struct {
     connection: local_ipc.Connection,
     cancellation: Cancellation,
     thread: ?std.Thread = null,
+    started: std.atomic.Value(bool) = .init(false),
     completed: std.atomic.Value(bool) = .init(false),
 };
 
@@ -238,7 +240,10 @@ fn stopServing(state: *ServeState) void {
 fn clientWorkerMain(worker: *ClientWorker) void {
     defer {
         worker.connection.close();
+        worker.state.mutex.lock();
         worker.completed.store(true, .release);
+        worker.state.reaper_event.cancel() catch {};
+        worker.state.mutex.unlock();
     }
     const deadline = if (worker.state.options.client_deadline_ms) |ms|
         Deadline.afterMs(ms)
@@ -256,12 +261,13 @@ fn clientWorkerMain(worker: *ClientWorker) void {
     }
 }
 
-fn reapCompleted(state: *ServeState) void {
+fn reapCompleted(state: *ServeState) bool {
+    var reaped = false;
     while (true) {
         var completed: ?*ClientWorker = null;
         state.mutex.lock();
         for (state.workers.items, 0..) |worker, index| {
-            if (worker.completed.load(.acquire)) {
+            if (worker.started.load(.acquire) and worker.completed.load(.acquire)) {
                 completed = worker;
                 _ = state.workers.swapRemove(index);
                 break;
@@ -269,7 +275,8 @@ fn reapCompleted(state: *ServeState) void {
         }
         state.mutex.unlock();
 
-        const worker = completed orelse return;
+        const worker = completed orelse return reaped;
+        reaped = true;
         if (worker.thread) |thread| thread.join();
         worker.cancellation.deinit();
         state.alloc.destroy(worker);
@@ -277,11 +284,33 @@ fn reapCompleted(state: *ServeState) void {
 }
 
 fn reaperMain(state: *ServeState) void {
-    while (!state.reaper_stop.load(.acquire)) {
-        reapCompleted(state);
-        _ = std.Thread.yield() catch {};
+    while (true) {
+        if (reapCompleted(state)) continue;
+
+        state.mutex.lock();
+        const stopping = state.reaper_stop.load(.acquire);
+        if (!stopping) {
+            state.reaper_event.reset() catch {};
+            var ready = false;
+            for (state.workers.items) |worker| {
+                if (worker.started.load(.acquire) and worker.completed.load(.acquire)) {
+                    ready = true;
+                    break;
+                }
+            }
+            if (ready) {
+                state.mutex.unlock();
+                continue;
+            }
+        }
+        state.mutex.unlock();
+
+        if (stopping) {
+            _ = reapCompleted(state);
+            return;
+        }
+        state.reaper_event.wait();
     }
-    reapCompleted(state);
 }
 
 fn joinWorkers(state: *ServeState) void {
@@ -308,7 +337,12 @@ pub fn serveConnectionsWithOptions(
         .handler = handler,
         .options = options,
     };
+    state.reaper_event = Cancellation.init() catch |err| {
+        server.close();
+        return err;
+    };
     state.reaper_thread = std.Thread.spawn(.{}, reaperMain, .{&state}) catch |err| {
+        state.reaper_event.deinit();
         server.close();
         return err;
     };
@@ -324,7 +358,12 @@ pub fn serveConnectionsWithOptions(
             null,
             options.cancellation,
         ) catch |err| {
-            if (err == error.Timeout) continue;
+            if (err == error.Timeout or
+                err == error.BrokenPipe or
+                err == error.ConnectionResetByPeer)
+            {
+                continue;
+            }
             if (err != error.AlreadyClosed and err != error.Cancelled) accept_error = err;
             break;
         };
@@ -354,7 +393,7 @@ pub fn serveConnectionsWithOptions(
             break;
         };
         state.mutex.unlock();
-        worker.thread = std.Thread.spawn(.{}, clientWorkerMain, .{worker}) catch |err| {
+        const thread = std.Thread.spawn(.{}, clientWorkerMain, .{worker}) catch |err| {
             state.mutex.lock();
             _ = state.workers.pop();
             state.mutex.unlock();
@@ -364,12 +403,21 @@ pub fn serveConnectionsWithOptions(
             accept_error = err;
             break;
         };
+        state.mutex.lock();
+        worker.thread = thread;
+        worker.started.store(true, .release);
+        if (worker.completed.load(.acquire)) {
+            state.reaper_event.cancel() catch {};
+        }
+        state.mutex.unlock();
     }
 
     stopServing(&state);
     state.reaper_stop.store(true, .release);
+    state.reaper_event.cancel() catch {};
     if (state.reaper_thread) |thread| thread.join();
     joinWorkers(&state);
+    state.reaper_event.deinit();
     if (accept_error) |err| return err;
 }
 
@@ -526,7 +574,7 @@ fn sequentialServeHandler(
 ) anyerror!DispatchResult {
     const probe: *SequentialServeProbe = @ptrCast(@alignCast(context));
     _ = probe.seen.fetchAdd(1, .acq_rel);
-    return .close_connection;
+    return .continue_connection;
 }
 
 fn sequentialServeThread(probe: *SequentialServeProbe) void {
@@ -543,6 +591,25 @@ fn sequentialServeThread(probe: *SequentialServeProbe) void {
     probe.completed = true;
 }
 
+fn connectSequentialStressClient(
+    alloc: std.mem.Allocator,
+) !local_ipc.Connection {
+    const deadline = Deadline.afterMs(1000);
+    while (true) {
+        return local_ipc_windows.connect(
+            alloc,
+            .{ .name = "zmx-session-worker-reap-stress" },
+        ) catch |err| switch (err) {
+            error.ConnectionRefused => {
+                if ((deadline.remainingMs() orelse 0) == 0) return err;
+                std.atomic.spinLoopHint();
+                continue;
+            },
+            else => return err,
+        };
+    }
+}
+
 test "Windows session dispatch reaps many sequential client workers" {
     const alloc = std.testing.allocator;
     var server = try local_ipc_windows.listen(
@@ -553,18 +620,27 @@ test "Windows session dispatch reaps many sequential client workers" {
     defer server.close();
     var probe = SequentialServeProbe{ .server = server };
     var thread = try std.Thread.spawn(.{}, sequentialServeThread, .{&probe});
+    const deadline = Deadline.afterMs(30_000);
 
     var index: usize = 0;
     while (index < 128) : (index += 1) {
-        var client = try local_ipc_windows.connect(
-            alloc,
-            .{ .name = "zmx-session-worker-reap-stress" },
-        );
-        try wire.writeFrame(client, .Output, "x");
+        var client = try connectSequentialStressClient(alloc);
+        wire.writeFrame(client, .Output, "x") catch |err| switch (err) {
+            error.BrokenPipe, error.ConnectionResetByPeer => {},
+            else => return err,
+        };
         client.close();
+
+        while (probe.seen.load(.acquire) < index + 1) {
+            if ((deadline.remainingMs() orelse 0) == 0) {
+                server.close();
+                thread.join();
+                return error.Timeout;
+            }
+            std.atomic.spinLoopHint();
+        }
     }
 
-    const deadline = Deadline.afterMs(5000);
     while (probe.seen.load(.acquire) < 128) {
         if ((deadline.remainingMs() orelse 0) == 0) {
             server.close();

@@ -15,6 +15,15 @@ pub fn getSeshNameFromEnv() []const u8 {
     return "";
 }
 
+pub fn getSeshNameFromEnvAlloc(alloc: std.mem.Allocator) !?[]u8 {
+    const value = try (std.process.Environ{ .block = .global }).getAlloc(alloc, "ZMX_SESSION");
+    if (value.len == 0) {
+        alloc.free(value);
+        return null;
+    }
+    return value;
+}
+
 pub fn getSeshName(alloc: std.mem.Allocator, sesh: []const u8) ![]const u8 {
     if (sesh.len == 0) return error.SessionNameRequired;
     try runtime_windows.validateSessionName(sesh);

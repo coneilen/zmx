@@ -517,6 +517,14 @@ fn attachSession(
     );
 }
 
+fn resolveCurrentSession(alloc: std.mem.Allocator) ![]u8 {
+    const session_name = try socket.getSeshNameFromEnvAlloc(alloc) orelse
+        return error.SessionNameRequired;
+    errdefer alloc.free(session_name);
+    try runtime_windows.validateSessionName(session_name);
+    return session_name;
+}
+
 /// Windows production entry point. Session creation and attach use the
 /// frozen IPC server/client contract and the sibling-owned ConPTY provider
 /// boundary. Commands that do not need a PTY still use the same wire tags.
@@ -571,6 +579,20 @@ pub fn main(init: std.process.Init) !void {
         defer parts.deinit(gpa);
         while (args.next()) |part| try parts.append(gpa, part);
         return listSessions(io, gpa, &cfg, parts.items);
+    }
+
+    if (std.mem.eql(u8, command, "detach") or
+        std.mem.eql(u8, command, "d") or
+        std.mem.eql(u8, command, "detach-all") or
+        std.mem.eql(u8, command, "da"))
+    {
+        const session_name = if (args.next()) |explicit| blk: {
+            try runtime_windows.validateSessionName(explicit);
+            break :blk try gpa.dupe(u8, explicit);
+        } else try resolveCurrentSession(gpa);
+        defer gpa.free(session_name);
+        if (args.next() != null) return error.UnsupportedCommand;
+        return sendCommand(io, gpa, &cfg, session_name, .DetachAll, &.{});
     }
 
     if (std.mem.eql(u8, command, "wait") or std.mem.eql(u8, command, "w")) {

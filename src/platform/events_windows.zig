@@ -94,6 +94,10 @@ pub const Cancellation = struct {
         return WaitForSingleObject(self.handle, 0) == wait_object_0;
     }
 
+    pub fn wait(self: Cancellation) void {
+        _ = WaitForSingleObject(self.handle, infinite);
+    }
+
     pub fn contract(self: *Cancellation) events.Cancellation {
         return .{
             .context = self,

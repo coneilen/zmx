@@ -42,8 +42,9 @@ Windows file lock and is reusable after a crashed owner. Session endpoints use
 a random nonce published in an owner-profile rendezvous record, allowing
 recovery when a predictable legacy pipe name was pre-created. Clients verify
 the connected server token SID before using a published endpoint. Pipe objects
-disappear when their last handle closes, so stale endpoint files do not need
-deletion.
+disappear when their last handle closes; a server removes its owned endpoint
+record before releasing the session lease, while replacement records are
+preserved by an ownership comparison.
 `events_windows.zig` waits on overlapped completion events plus a manual-reset
 cancellation event and applies one cumulative deadline to an operation.
 `local_ipc.Connection.writeAll` is the bounded backpressure primitive for
@@ -53,7 +54,9 @@ truncates a large frame to a fixed queue size.
 dispatches each client on an independent worker. A client deadline is
 cumulative across its frames, and listener shutdown cancels and joins all
 active reads so a stalled peer cannot block another client or retain a
-handle.
+handle. Worker publication sets the thread handle before marking a worker
+reapable, and completion signals a blocking reaper event rather than polling
+or yielding on an idle CPU.
 `session_windows.zig` exposes the same connection/server handles, deadline and
 cancellation types, bounded read/write functions, host/attach lifecycle, and
 all frozen wire-tag dispatch to the sibling ConPTY provider. Until that

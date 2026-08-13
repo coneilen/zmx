@@ -709,6 +709,24 @@ pub fn cleanupRendezvous(
     std.Io.Dir.deleteFileAbsolute(io, record_path) catch {};
 }
 
+/// Remove a rendezvous record only when it still names the endpoint owned by
+/// this server. The comparison prevents a late close from deleting a newer
+/// replacement record.
+pub fn cleanupRendezvousIfOwned(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    session_name: []const u8,
+    endpoint: []const u8,
+) void {
+    const current = resolveEndpointPath(io, alloc, session_name) catch return;
+    defer alloc.free(current);
+    if (!std.mem.eql(u8, current, endpoint)) return;
+
+    const record_path = rendezvousRecordPath(alloc, session_name) catch return;
+    defer alloc.free(record_path);
+    std.Io.Dir.deleteFileAbsolute(io, record_path) catch {};
+}
+
 pub fn hasRendezvous(
     io: std.Io,
     alloc: std.mem.Allocator,
@@ -979,6 +997,41 @@ test "Windows rendezvous rejects oversized endpoint records" {
         error.InvalidRecord,
         resolveEndpointPath(std.testing.io, alloc, session_name),
     );
+}
+
+test "Windows rendezvous cleanup preserves a replacement endpoint" {
+    const alloc = std.testing.allocator;
+    const session_name = "rendezvous-cleanup-owner";
+    defer cleanupRendezvous(std.testing.io, alloc, session_name);
+
+    const owned = "\\\\.\\pipe\\zmx\\owned";
+    const replacement = "\\\\.\\pipe\\zmx\\replacement";
+    try publishEndpoint(std.testing.io, alloc, session_name, owned);
+    cleanupRendezvousIfOwned(
+        std.testing.io,
+        alloc,
+        session_name,
+        replacement,
+    );
+    const still_published = try resolveEndpointPath(
+        std.testing.io,
+        alloc,
+        session_name,
+    );
+    defer alloc.free(still_published);
+    try std.testing.expectEqualStrings(owned, still_published);
+
+    cleanupRendezvousIfOwned(
+        std.testing.io,
+        alloc,
+        session_name,
+        owned,
+    );
+    try std.testing.expect(!(try hasRendezvous(
+        std.testing.io,
+        alloc,
+        session_name,
+    )));
 }
 
 test "Windows fallback log paths are filesystem paths" {
