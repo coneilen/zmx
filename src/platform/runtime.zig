@@ -26,8 +26,10 @@ pub const PathError = error{
     NameTooLong,
 };
 
-/// Session names are path components, never paths.  This is shared by every
-/// local endpoint implementation, including future named-pipe names.
+/// Strict session-name validation for endpoint implementations whose naming
+/// rules treat both slash styles as separators, including Windows named pipes.
+/// POSIX Unix-socket callers use `runtime_posix.validateSessionName` so legacy
+/// backslash-containing session names remain compatible.
 pub fn validateSessionName(name: []const u8) PathError!void {
     if (name.len == 0 or
         std.mem.indexOfScalar(u8, name, '/') != null or

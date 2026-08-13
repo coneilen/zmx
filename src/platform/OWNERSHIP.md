@@ -11,7 +11,8 @@ duplicating zmx's CLI, session, or IPC wire semantics.
 | `platform/local_ipc_posix.zig` | POSIX fd adaptation for local IPC | Existing Unix-domain socket adapter |
 | `platform/events.zig` | Wait readiness and cancellation vocabulary | `poll`/self-pipe and IOCP adapters |
 | `platform/resize.zig` | Window dimensions and control-event vocabulary | ConPTY resize/control adapter |
-| `platform/runtime.zig` | Session-component validation, endpoint path safety, permissions | Windows runtime-directory policy |
+| `platform/runtime.zig` | Strict endpoint-name validation, endpoint path safety, permissions | Windows runtime-directory policy |
+| `platform/runtime_posix.zig` | POSIX runtime directories and Unix-socket-compatible name validation | Existing POSIX runtime adapter |
 | `platform/daemon.zig` | Daemon lifetime state and process-role outcomes | POSIX double-fork and Windows lifetime adapter |
 | `platform/shell.zig` | Interactive/task shell selection and task marker shape | ConPTY task-shell adapter |
 

@@ -1,7 +1,9 @@
 const std = @import("std");
 const lib_posix = @import("posix.zig");
+const cross = @import("cross.zig");
 const local_ipc_posix = @import("platform/local_ipc_posix.zig");
 const runtime = @import("platform/runtime.zig");
+const runtime_posix = @import("platform/runtime_posix.zig");
 
 pub fn getSeshPrefix() []const u8 {
     return lib_posix.getenv("ZMX_SESSION_PREFIX") orelse "";
@@ -17,10 +19,10 @@ pub fn getSeshName(alloc: std.mem.Allocator, sesh: []const u8) ![]const u8 {
         return error.SessionNameRequired;
     }
     const full = try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, sesh });
-    // Session names become filenames under socket_dir. Rejecting path
-    // separators and dot-dot prevents socket creation and stale-socket
-    // deletion from operating outside that directory.
-    runtime.validateSessionName(full) catch {
+    // Session names become filenames under socket_dir. Rejecting the POSIX
+    // separator and dot-dot prevents socket creation and stale-socket deletion
+    // from operating outside that directory; backslash is a valid POSIX byte.
+    runtime_posix.validateSessionName(full) catch {
         alloc.free(full);
         return error.InvalidSessionName;
     };
@@ -209,4 +211,45 @@ test "getSocketPath boundary: name fills exactly to limit" {
     @memset(name_over_limit, 'b');
 
     try std.testing.expectError(error.NameTooLong, getSocketPath(alloc, dir, name_over_limit));
+}
+
+test "POSIX CLI, environment, and socket paths preserve backslashes" {
+    const alloc = std.testing.allocator;
+
+    const old_session = if (lib_posix.getenv("ZMX_SESSION")) |value|
+        try alloc.dupeZ(u8, value)
+    else
+        null;
+    const old_prefix = if (lib_posix.getenv("ZMX_SESSION_PREFIX")) |value|
+        try alloc.dupeZ(u8, value)
+    else
+        null;
+    defer {
+        _ = cross.c.unsetenv("ZMX_SESSION");
+        _ = cross.c.unsetenv("ZMX_SESSION_PREFIX");
+        if (old_session) |value| {
+            _ = cross.c.setenv("ZMX_SESSION", value.ptr, 1);
+            alloc.free(value);
+        }
+        if (old_prefix) |value| {
+            _ = cross.c.setenv("ZMX_SESSION_PREFIX", value.ptr, 1);
+            alloc.free(value);
+        }
+    }
+
+    _ = cross.c.unsetenv("ZMX_SESSION");
+    _ = cross.c.unsetenv("ZMX_SESSION_PREFIX");
+
+    const cli_name = try getSeshName(alloc, "legacy\\cli");
+    defer alloc.free(cli_name);
+    try std.testing.expectEqualStrings("legacy\\cli", cli_name);
+
+    _ = cross.c.setenv("ZMX_SESSION", "legacy\\env", 1);
+    const env_name = try resolveSessionOrEnv(alloc, std.testing.io, null);
+    defer alloc.free(env_name);
+    try std.testing.expectEqualStrings("legacy\\env", env_name);
+
+    const socket_path = try getSocketPath(alloc, "/tmp/zmx", "legacy\\socket");
+    defer alloc.free(socket_path);
+    try std.testing.expectEqualStrings("/tmp/zmx/legacy\\socket", socket_path);
 }
