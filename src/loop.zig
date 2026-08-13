@@ -903,6 +903,19 @@ pub const Daemon = struct {
             };
         }
 
+        // A trailing ESC is also a standalone leader byte even when ordinary
+        // input precedes it. Flush the whole payload and retain its parser
+        // provenance for a possible continuation in a later chunk.
+        if (was_leader and client.input_carry.items.len == 0) {
+            if (class.tail_start) |tail_index| {
+                if (payload.len - tail_index == 1 and payload[tail_index] == 0x1b) {
+                    self.queuePtyInput(gpa, payload);
+                    client.classifier.markEmittedPrefix();
+                    return;
+                }
+            }
+        }
+
         // Preserve raw leader behavior for complete bytes before a trailing
         // partial sequence, while carrying only that unfinished suffix.
         if (was_leader and client.input_carry.items.len == 0) {
@@ -2571,6 +2584,150 @@ test "emitted leader ESC Kitty continuation cannot retake leadership" {
 
     try std.testing.expectEqual(@as(?i32, 8), daemon.leader_client_fd);
     try std.testing.expectEqualStrings("\x1bx", daemon.pty_write_buf.items);
+}
+
+test "leader payload trailing ESC flushes immediately" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer leader.write_buf.deinit(alloc);
+    defer leader.classifier.deinit(alloc);
+    defer leader.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &leader, "x\x1b");
+
+    try std.testing.expectEqualStrings("x\x1b", daemon.pty_write_buf.items);
+    try std.testing.expectEqual(@as(usize, 0), leader.input_carry.items.len);
+}
+
+test "leader trailing ESC continues same-leader focus raw" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer leader.write_buf.deinit(alloc);
+    defer leader.classifier.deinit(alloc);
+    defer leader.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &leader, "x\x1b");
+    try daemon.handleInput(alloc, &leader, "[I");
+
+    try std.testing.expectEqualStrings("x\x1b[I", daemon.pty_write_buf.items);
+}
+
+test "former leader trailing ESC focus suffix stays filtered" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var former_leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer former_leader.write_buf.deinit(alloc);
+    defer former_leader.classifier.deinit(alloc);
+    defer former_leader.input_carry.deinit(alloc);
+
+    var follower = Client{
+        .alloc = alloc,
+        .socket_fd = 8,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer follower.write_buf.deinit(alloc);
+    defer follower.classifier.deinit(alloc);
+    defer follower.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &former_leader, "x\x1b");
+    try daemon.handleInput(alloc, &follower, "y");
+    try daemon.handleInput(alloc, &former_leader, "[I");
+
+    try std.testing.expectEqual(@as(?i32, 8), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("x\x1by", daemon.pty_write_buf.items);
+}
+
+test "former leader trailing ESC reply suffix stays filtered" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var former_leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer former_leader.write_buf.deinit(alloc);
+    defer former_leader.classifier.deinit(alloc);
+    defer former_leader.input_carry.deinit(alloc);
+
+    var follower = Client{
+        .alloc = alloc,
+        .socket_fd = 8,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer follower.write_buf.deinit(alloc);
+    defer follower.classifier.deinit(alloc);
+    defer follower.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &former_leader, "x\x1b");
+    try daemon.handleInput(alloc, &follower, "y");
+    try daemon.handleInput(alloc, &former_leader, "[1;2R");
+
+    try std.testing.expectEqual(@as(?i32, 8), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("x\x1by", daemon.pty_write_buf.items);
 }
 
 fn makeLongKittySequence(alloc: std.mem.Allocator, event_type: u8, text_len: usize) ![]u8 {
