@@ -52,9 +52,10 @@ pub const MAX_CMD_LEN = 256;
 pub const MAX_CWD_LEN = 256;
 /// A peer may stream a frame in arbitrarily small writes, but a daemon must
 /// not grow a receive buffer without bound when the length field is hostile.
-/// This is large enough for history and file-transfer messages while keeping
-/// malformed peers bounded.
-pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+/// This is large enough for large file-transfer messages while keeping
+/// malformed peers bounded. Write handling below streams the file into
+/// bounded PTY commands rather than creating an unbounded command buffer.
+pub const MAX_FRAME_LEN: usize = 256 * 1024 * 1024;
 
 /// Frozen wire shape. Do NOT add fields! New stats go in new `Tag` values
 /// so old daemons (whose `_` arm ignores unknown tags) stay reachable.
@@ -384,4 +385,23 @@ test "SocketBuffer preserves partial frames and rejects oversized headers" {
     var header = Header{ .tag = .Output, .len = @intCast(MAX_FRAME_LEN + 1) };
     try buffer.buf.appendSlice(buffer.alloc, std.mem.asBytes(&header));
     try std.testing.expectError(error.FrameTooLarge, buffer.nextChecked());
+}
+
+test "large Write frames remain bounded and round-trip above 64 MiB" {
+    const payload_len = 64 * 1024 * 1024 + 1;
+    const payload = try std.testing.allocator.alloc(u8, payload_len);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 0x5a);
+
+    var buffer = try SocketBuffer.init(std.testing.allocator);
+    defer buffer.deinit();
+    try buffer.buf.ensureTotalCapacity(buffer.alloc, @sizeOf(Header) + payload.len);
+    const header = Header{ .tag = .Write, .len = @intCast(payload.len) };
+    buffer.buf.appendSliceAssumeCapacity(std.mem.asBytes(&header));
+    buffer.buf.appendSliceAssumeCapacity(payload);
+
+    const message = (try buffer.nextChecked()).?;
+    try std.testing.expectEqual(Tag.Write, message.header.tag);
+    try std.testing.expectEqual(payload.len, message.payload.len);
+    try std.testing.expectEqual(@as(u8, 0x5a), message.payload[message.payload.len - 1]);
 }

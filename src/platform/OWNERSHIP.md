@@ -27,7 +27,10 @@ classification, terminal replay, and task completion state.
 server instance is created with `FILE_FLAG_FIRST_PIPE_INSTANCE`, so a second
 daemon cannot replace a live session. Each pipe uses an owner-only DACL
 (`D:P(A;;GA;;;OW)(A;;GA;;;SY)`) and rejects remote clients; the pipe name is
-also scoped below the current Windows account name. Pipe objects disappear
-when their last handle closes, so stale endpoint files do not need deletion.
+also scoped below the current token's user SID. Clients compare the connected
+server process token SID with their own before accepting a connection. Server
+close cancels overlapped accepts and waits for all in-flight accept state before
+releasing the pipe/listener state. Pipe objects disappear when their last
+handle closes, so stale endpoint files do not need deletion.
 `events_windows.zig` waits on overlapped completion events plus a manual-reset
 cancellation event and applies one cumulative deadline to an operation.
