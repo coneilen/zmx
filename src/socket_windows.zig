@@ -63,7 +63,15 @@ pub fn createSocket(endpoint: []const u8) !Server {
     );
 }
 
+pub fn createSessionSocket(io: std.Io, alloc: std.mem.Allocator, session_name: []const u8) !Server {
+    return local_ipc_windows.listenSession(io, alloc, session_name, .{});
+}
+
 pub fn cleanupStaleSocket(_: []const u8) void {}
+
+pub fn cleanupStaleSocketWithIo(io: std.Io, alloc: std.mem.Allocator, session_name: []const u8) void {
+    runtime_windows.cleanupRendezvous(io, alloc, session_name);
+}
 
 pub fn sessionExists(_: std.Io, _: std.Io.Dir, _: []const u8) !bool {
     return false;
@@ -75,6 +83,18 @@ pub fn getSocketPath(
     session_name: []const u8,
 ) ![]const u8 {
     return runtime_windows.endpointPath(alloc, session_name);
+}
+
+/// Resolve the owner-published nonce endpoint when a newer daemon has
+/// recovered from a pre-created deterministic pipe. The io-aware form is
+/// additive so the existing frozen path API remains usable by old callers.
+pub fn getSocketPathWithIo(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    _: []const u8,
+    session_name: []const u8,
+) ![]const u8 {
+    return runtime_windows.resolveEndpointPath(io, alloc, session_name);
 }
 
 pub fn printSessionNameTooLong(

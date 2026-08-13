@@ -176,6 +176,7 @@ fn utf16Endpoint(alloc: std.mem.Allocator, endpoint: []const u8) Error![:0]u16 {
             error.InvalidSessionName => return error.InvalidEndpoint,
             error.NameTooLong => return error.NameTooLong,
             error.AccessDenied => return error.AccessDenied,
+            error.InvalidRecord => return error.InvalidEndpoint,
             error.OutOfMemory => return error.OutOfMemory,
             error.Unexpected => return error.Unexpected,
         };
@@ -273,6 +274,13 @@ const ServerState = struct {
     }
 };
 
+/// A copied `local_ipc.Server` value cannot participate in reference
+/// counting. Keep the small control record as a tombstone after close so a
+/// late accept through such a copy observes `AlreadyClosed` instead of
+/// dereferencing freed memory. All kernel handles are still released by
+/// `closeServerThunk`; only this process-lifetime control record remains.
+const server_state_allocator = std.heap.page_allocator;
+
 pub const Factory = struct {
     allocator: std.mem.Allocator,
 
@@ -298,17 +306,18 @@ pub fn listen(
     endpoint: local_ipc.Endpoint,
     policy: local_ipc.AccessPolicy,
 ) Error!local_ipc.Server {
-    const name = try utf16Endpoint(alloc, endpoint.name);
-    errdefer alloc.free(name);
-    const pipe = try createPipe(alloc, name, policy, true);
+    _ = alloc;
+    const name = try utf16Endpoint(server_state_allocator, endpoint.name);
+    errdefer server_state_allocator.free(name);
+    const pipe = try createPipe(server_state_allocator, name, policy, true);
     errdefer windows.CloseHandle(pipe);
     const close_event = try completionEvent();
     errdefer windows.CloseHandle(close_event);
 
-    const state = try alloc.create(ServerState);
-    errdefer alloc.destroy(state);
+    const state = try server_state_allocator.create(ServerState);
+    errdefer server_state_allocator.destroy(state);
     state.* = .{
-        .allocator = alloc,
+        .allocator = server_state_allocator,
         .name = name,
         .policy = policy,
         .pipe = pipe,
@@ -318,6 +327,69 @@ pub fn listen(
         .handle = @intFromPtr(state),
         .accept_fn = acceptThunk,
         .close_fn = closeServerThunk,
+    };
+}
+
+/// Start a session listener on a fresh nonce endpoint and publish its
+/// owner-created rendezvous record. A pre-created deterministic pipe can no
+/// longer permanently deny service, and clients can resolve the published
+/// endpoint through `socket.getSocketPathWithIo`.
+pub fn listenSession(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    session_name: []const u8,
+    policy: local_ipc.AccessPolicy,
+) Error!local_ipc.Server {
+    if (runtime_windows.hasRendezvous(io, alloc, session_name) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidSessionName => return error.InvalidEndpoint,
+        else => return error.AccessDenied,
+    }) {
+        const existing = runtime_windows.resolveEndpointPath(io, alloc, session_name) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.AccessDenied,
+        };
+        defer alloc.free(existing);
+        if (try endpointIsLive(alloc, existing)) return error.AccessDenied;
+        runtime_windows.cleanupRendezvous(io, alloc, session_name);
+    }
+
+    var attempt: usize = 0;
+    while (attempt < 8) : (attempt += 1) {
+        const endpoint = runtime_windows.nonceEndpointPath(alloc, session_name) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidSessionName => return error.InvalidEndpoint,
+            error.NameTooLong => return error.NameTooLong,
+            else => return error.Unexpected,
+        };
+        defer alloc.free(endpoint);
+
+        var server = listen(alloc, .{ .name = endpoint }, policy) catch |err| {
+            if (err == error.AccessDenied or err == error.SystemResources) continue;
+            return err;
+        };
+        runtime_windows.replaceEndpoint(io, alloc, session_name, endpoint) catch |err| {
+            server.close();
+            if (err == error.AccessDenied) continue;
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.Unexpected,
+            };
+        };
+        return server;
+    }
+
+    return error.AccessDenied;
+}
+
+fn endpointIsLive(alloc: std.mem.Allocator, endpoint: []const u8) Error!bool {
+    const name = try utf16Endpoint(alloc, endpoint);
+    defer alloc.free(name);
+    if (WaitNamedPipeW(name.ptr, 0) != 0) return true;
+    return switch (windows.GetLastError()) {
+        .FILE_NOT_FOUND, .SEM_TIMEOUT => false,
+        .PIPE_BUSY => true,
+        else => error.AccessDenied,
     };
 }
 
@@ -395,6 +467,8 @@ pub fn connectWithDeadline(
             return .{
                 .handle = handleValue(pipe),
                 .close_fn = closeHandle,
+                .read_fn = readHandle,
+                .write_fn = writeHandle,
             };
         }
 
@@ -498,6 +572,8 @@ fn acceptWithDeadline(
     return .{
         .handle = handleValue(pipe),
         .close_fn = closeHandle,
+        .read_fn = readHandle,
+        .write_fn = writeHandle,
     };
 }
 
@@ -695,6 +771,14 @@ fn closeHandle(value: local_ipc.Handle) void {
     windows.CloseHandle(handle);
 }
 
+fn readHandle(value: local_ipc.Handle, buffer: []u8) anyerror!usize {
+    return readWithDeadline(value, buffer, null, null);
+}
+
+fn writeHandle(value: local_ipc.Handle, bytes: []const u8) anyerror!usize {
+    return writeWithDeadline(value, bytes, null, null);
+}
+
 fn closeServerThunk(value: local_ipc.Handle) void {
     const state: *ServerState = @ptrFromInt(value);
     state.lock();
@@ -719,8 +803,6 @@ fn closeServerThunk(value: local_ipc.Handle) void {
         windows.CloseHandle(handle);
     }
     windows.CloseHandle(state.close_event);
-    state.allocator.free(state.name);
-    state.allocator.destroy(state);
 }
 
 test "Windows IPC keeps endpoint validation separate from wire framing" {
@@ -772,4 +854,39 @@ test "Windows named pipe accept is cancellable before a client connects" {
     defer client.close();
     var accepted = try server.accept();
     defer accepted.close();
+}
+
+test "Windows named pipe late accept after close observes closed state" {
+    const alloc = std.testing.allocator;
+    var server = try listen(alloc, .{ .name = "zmx-ipc-late-close-\u{1F600}" }, .{});
+    const stale_copy = server;
+    server.close();
+    try std.testing.expectError(error.AlreadyClosed, stale_copy.accept());
+}
+
+test "Windows session listener publishes a recoverable endpoint" {
+    const alloc = std.testing.allocator;
+    const session_name = "zmx-rendezvous-\u{1F600}";
+    defer runtime_windows.cleanupRendezvous(std.testing.io, alloc, session_name);
+    var server = try listenSession(std.testing.io, alloc, session_name, .{});
+    defer server.close();
+
+    const endpoint = try runtime_windows.resolveEndpointPath(
+        std.testing.io,
+        alloc,
+        session_name,
+    );
+    defer alloc.free(endpoint);
+    try std.testing.expectError(
+        error.AccessDenied,
+        listenSession(std.testing.io, alloc, session_name, .{}),
+    );
+    var client = try connect(alloc, .{ .name = endpoint });
+    defer client.close();
+    var accepted = try server.accept();
+    defer accepted.close();
+    try writeAll(client, "published", null, null);
+    var received: [9]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 9), try read(accepted, &received));
+    try std.testing.expectEqualStrings("published", &received);
 }

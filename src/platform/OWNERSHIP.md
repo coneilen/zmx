@@ -30,7 +30,16 @@ daemon cannot replace a live session. Each pipe uses an owner-only DACL
 also scoped below the current token's user SID. Clients compare the connected
 server process token SID with their own before accepting a connection. Server
 close cancels overlapped accepts and waits for all in-flight accept state before
-releasing the pipe/listener state. Pipe objects disappear when their last
-handle closes, so stale endpoint files do not need deletion.
+releasing the pipe/listener state. The small copied-server control tombstone
+is retained after close so a late copied handle cannot become a use-after-free;
+all kernel handles are released. New session listeners use a random nonce
+endpoint published in an owner-profile rendezvous record, allowing recovery
+when a predictable legacy pipe name was pre-created. Clients verify the
+connected server token SID before using a published endpoint. Pipe objects
+disappear when their last handle closes, so stale endpoint files do not need
+deletion.
 `events_windows.zig` waits on overlapped completion events plus a manual-reset
 cancellation event and applies one cumulative deadline to an operation.
+`local_ipc.Connection.writeAll` is the bounded backpressure primitive for
+ConPTY/session adapters; it loops on partial transport writes and never
+truncates a large frame to a fixed queue size.

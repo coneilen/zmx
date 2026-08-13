@@ -32,6 +32,10 @@ extern "advapi32" fn ConvertSidToStringSidW(
     sid: *anyopaque,
     string_sid: *?[*:0]u16,
 ) callconv(.winapi) c_int;
+extern "advapi32" fn SystemFunction036(
+    buffer: *anyopaque,
+    length: windows.ULONG,
+) callconv(.winapi) c_int;
 extern "kernel32" fn OpenProcess(
     desired_access: windows.DWORD,
     inherit_handle: windows.BOOL,
@@ -46,6 +50,7 @@ extern "kernel32" fn LocalFree(memory: ?*anyopaque) callconv(.winapi) ?*anyopaqu
 
 pub const Error = runtime.PathError || error{
     AccessDenied,
+    InvalidRecord,
     Unexpected,
 } || std.mem.Allocator.Error;
 
@@ -162,6 +167,192 @@ pub fn endpointPath(
 /// unnecessary and unsafe on Windows.
 pub fn cleanupStaleEndpoint(_: []const u8) void {}
 
+fn hexEncode(alloc: std.mem.Allocator, bytes: []const u8) Error![]u8 {
+    const digits = "0123456789abcdef";
+    const result = try alloc.alloc(u8, bytes.len * 2);
+    for (bytes, 0..) |byte, index| {
+        result[index * 2] = digits[byte >> 4];
+        result[index * 2 + 1] = digits[byte & 0x0f];
+    }
+    return result;
+}
+
+fn rendezvousBase(alloc: std.mem.Allocator) Error![]u8 {
+    if ((std.process.Environ{ .block = .global }).getAlloc(alloc, "LOCALAPPDATA")) |base| {
+        defer alloc.free(base);
+        return std.fmt.allocPrint(alloc, "{s}\\zmx\\ipc", .{base}) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+        };
+    } else |_| {}
+    if ((std.process.Environ{ .block = .global }).getAlloc(alloc, "TEMP")) |base| {
+        defer alloc.free(base);
+        return std.fmt.allocPrint(alloc, "{s}\\zmx-ipc", .{base}) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+        };
+    } else |_| {}
+    return alloc.dupe(u8, "C:\\Windows\\Temp\\zmx-ipc");
+}
+
+fn rendezvousDirectory(
+    alloc: std.mem.Allocator,
+    session_name: []const u8,
+) Error![]u8 {
+    try validateSessionName(session_name);
+    const sid = try currentUserSid(alloc);
+    defer alloc.free(sid);
+    const base = try rendezvousBase(alloc);
+    defer alloc.free(base);
+    return std.fmt.allocPrint(alloc, "{s}\\{s}", .{ base, sid });
+}
+
+fn rendezvousRecordPath(
+    alloc: std.mem.Allocator,
+    session_name: []const u8,
+) Error![]u8 {
+    const directory = try rendezvousDirectory(alloc, session_name);
+    defer alloc.free(directory);
+    const encoded = try hexEncode(alloc, session_name);
+    defer alloc.free(encoded);
+    return std.fmt.allocPrint(alloc, "{s}\\{s}.endpoint", .{ directory, encoded });
+}
+
+fn mkdirAll(io: std.Io, path_name: []const u8) !void {
+    var it = std.fs.path.componentIterator(path_name);
+    var component = it.last() orelse return error.BadPathName;
+    while (true) {
+        std.Io.Dir.createDirAbsolute(io, component.path, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            error.FileNotFound => {
+                component = it.previous() orelse return err;
+                continue;
+            },
+            else => return err,
+        };
+        component = it.next() orelse return;
+    }
+}
+
+/// Publish an owner-created rendezvous record. The directory is under the
+/// current user's profile and inherits the user's ACL; the record is created
+/// exclusively so a pre-created file cannot be silently replaced.
+pub fn publishEndpoint(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    session_name: []const u8,
+    endpoint: []const u8,
+) Error!void {
+    try validateSessionName(session_name);
+    const record_path = try rendezvousRecordPath(alloc, session_name);
+    defer alloc.free(record_path);
+    mkdirAll(io, std.fs.path.dirname(record_path) orelse return error.Unexpected) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return error.AccessDenied,
+    };
+    var record = std.Io.Dir.createFileAbsolute(io, record_path, .{
+        .read = true,
+        .exclusive = true,
+        .permissions = .default_file,
+    }) catch |err| switch (err) {
+        error.PathAlreadyExists => return error.AccessDenied,
+        else => return error.AccessDenied,
+    };
+    defer record.close(io);
+    record.writeStreamingAll(io, endpoint) catch return error.AccessDenied;
+}
+
+/// Replace a stale rendezvous record after a server has selected a fresh
+/// random pipe name. This is used only after the server successfully owns the
+/// new pipe, so a deterministic endpoint collision cannot deny service.
+pub fn replaceEndpoint(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    session_name: []const u8,
+    endpoint: []const u8,
+) Error!void {
+    const record_path = try rendezvousRecordPath(alloc, session_name);
+    defer alloc.free(record_path);
+    std.Io.Dir.deleteFileAbsolute(io, record_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return error.AccessDenied,
+    };
+    return publishEndpoint(io, alloc, session_name, endpoint);
+}
+
+pub fn cleanupRendezvous(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    session_name: []const u8,
+) void {
+    const record_path = rendezvousRecordPath(alloc, session_name) catch return;
+    defer alloc.free(record_path);
+    std.Io.Dir.deleteFileAbsolute(io, record_path) catch {};
+}
+
+pub fn hasRendezvous(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    session_name: []const u8,
+) Error!bool {
+    const record_path = try rendezvousRecordPath(alloc, session_name);
+    defer alloc.free(record_path);
+    var record = std.Io.Dir.openFileAbsolute(io, record_path, .{ .mode = .read_only }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return error.AccessDenied,
+    };
+    record.close(io);
+    return true;
+}
+
+/// Resolve the current owner-published endpoint. A missing or malformed
+/// record falls back to the deterministic SID-scoped name for compatibility
+/// with older daemons.
+pub fn resolveEndpointPath(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    session_name: []const u8,
+) Error![]u8 {
+    const record_path = rendezvousRecordPath(alloc, session_name) catch return endpointPath(alloc, session_name);
+    defer alloc.free(record_path);
+    var record = std.Io.Dir.openFileAbsolute(io, record_path, .{ .mode = .read_only }) catch |err| switch (err) {
+        error.FileNotFound => return endpointPath(alloc, session_name),
+        else => return endpointPath(alloc, session_name),
+    };
+    defer record.close(io);
+
+    var bytes: [max_pipe_name_utf16]u8 = undefined;
+    const len = record.readPositionalAll(io, &bytes, 0) catch return endpointPath(alloc, session_name);
+    const endpoint = std.mem.trim(u8, bytes[0..len], " \t\r\n");
+    if (!std.mem.startsWith(u8, endpoint, pipe_prefix) or
+        !std.unicode.utf8ValidateSlice(endpoint))
+    {
+        return endpointPath(alloc, session_name);
+    }
+    return alloc.dupe(u8, endpoint);
+}
+
+pub fn nonceEndpointPath(
+    alloc: std.mem.Allocator,
+    session_name: []const u8,
+) Error![]u8 {
+    try validateSessionName(session_name);
+    const sid = try currentUserSid(alloc);
+    defer alloc.free(sid);
+    const directory = try socketDirForSid(alloc, sid);
+    defer alloc.free(directory);
+    var nonce: [16]u8 = undefined;
+    if (SystemFunction036(&nonce, @intCast(nonce.len)) == 0) {
+        return error.Unexpected;
+    }
+    const encoded = try hexEncode(alloc, &nonce);
+    defer alloc.free(encoded);
+    const nonce_name = try std.fmt.allocPrint(alloc, "{s}-{s}", .{
+        session_name,
+        encoded,
+    });
+    defer alloc.free(nonce_name);
+    return joinEndpointPath(alloc, directory, nonce_name, max_pipe_name_utf16);
+}
+
 pub fn verifyPipeServerIdentity(
     alloc: std.mem.Allocator,
     pipe: windows.HANDLE,
@@ -260,4 +451,15 @@ test "Windows pipe namespaces distinguish users with the same username" {
     const second = try socketDirForSid(alloc, "S-1-5-21-200");
     defer alloc.free(second);
     try std.testing.expect(!std.mem.eql(u8, first, second));
+}
+
+test "Windows session endpoints recover with a fresh nonce" {
+    const alloc = std.testing.allocator;
+    const first = try nonceEndpointPath(alloc, "nonce-recovery");
+    defer alloc.free(first);
+    const second = try nonceEndpointPath(alloc, "nonce-recovery");
+    defer alloc.free(second);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+    try std.testing.expect(std.mem.startsWith(u8, first, pipe_prefix));
+    try std.testing.expect(std.mem.startsWith(u8, second, pipe_prefix));
 }
