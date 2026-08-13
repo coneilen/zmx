@@ -125,6 +125,11 @@ const acl_information_basic: windows.DWORD = 2;
 const access_allowed_ace_type: u8 = 0;
 const file_all_access: windows.DWORD = 0x001f_01ff;
 const system_sid = "S-1-5-18";
+/// Rendezvous records store the UTF-8 spelling of a pipe name. A valid
+/// endpoint is limited by UTF-16 units, and U+0800 is the worst-case BMP
+/// encoding (three bytes per unit). Keep enough room to distinguish a full
+/// record from a truncated one.
+pub const max_rendezvous_record_bytes: usize = max_pipe_name_utf16 * 3;
 
 const AclSizeInformation = extern struct {
     ace_count: windows.DWORD,
@@ -469,6 +474,18 @@ fn hexEncode(alloc: std.mem.Allocator, bytes: []const u8) Error![]u8 {
     return result;
 }
 
+fn hexDecode(alloc: std.mem.Allocator, text: []const u8) Error![]u8 {
+    if (text.len == 0 or text.len % 2 != 0) return error.InvalidRecord;
+    const result = try alloc.alloc(u8, text.len / 2);
+    errdefer alloc.free(result);
+    for (0..result.len) |index| {
+        const high = std.fmt.charToDigit(text[index * 2], 16) catch return error.InvalidRecord;
+        const low = std.fmt.charToDigit(text[index * 2 + 1], 16) catch return error.InvalidRecord;
+        result[index] = (@as(u8, high) << 4) | @as(u8, low);
+    }
+    return result;
+}
+
 fn filesystemBase(alloc: std.mem.Allocator) Error![]u8 {
     inline for (.{ "LOCALAPPDATA", "USERPROFILE", "TEMP", "TMP" }) |name| {
         if ((std.process.Environ{ .block = .global }).getAlloc(alloc, name)) |base| {
@@ -709,9 +726,56 @@ pub fn hasRendezvous(
     return true;
 }
 
-/// Resolve the current owner-published endpoint. A missing or malformed
-/// record falls back to the deterministic SID-scoped name for compatibility
-/// with older daemons.
+/// Enumerate owner-published session names without requiring a session
+/// argument. Files are only accepted from the SID-scoped, ACL-verified
+/// rendezvous directory and are decoded from their hex filenames.
+pub fn listSessionNames(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+) Error!std.ArrayList([]u8) {
+    var result: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (result.items) |name| alloc.free(name);
+        result.deinit(alloc);
+    }
+
+    try ensureRendezvousDirectory(io, alloc, "list");
+    const directory = try rendezvousDirectory(alloc, "list");
+    defer alloc.free(directory);
+    var dir = std.Io.Dir.openDirAbsolute(io, directory, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return result,
+        else => return error.AccessDenied,
+    };
+    defer dir.close(io);
+
+    var iterator = dir.iterate();
+    while (iterator.next(io) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied => return error.AccessDenied,
+        error.SystemResources, error.Canceled => return error.Unexpected,
+        else => return error.Unexpected,
+    }) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".endpoint")) continue;
+        const encoded = entry.name[0 .. entry.name.len - ".endpoint".len];
+        const name = hexDecode(alloc, encoded) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+        validateSessionName(name) catch {
+            alloc.free(name);
+            continue;
+        };
+        result.append(alloc, name) catch |err| {
+            alloc.free(name);
+            return err;
+        };
+    }
+    return result;
+}
+
+/// Resolve the current owner-published endpoint. A missing record falls back
+/// to the deterministic SID-scoped name for compatibility with older
+/// daemons. Once a record exists, malformed or truncated contents are an
+/// error rather than a silent fallback.
 pub fn resolveEndpointPath(
     io: std.Io,
     alloc: std.mem.Allocator,
@@ -730,14 +794,22 @@ pub fn resolveEndpointPath(
         else => return error.AccessDenied,
     };
 
-    var bytes: [max_pipe_name_utf16]u8 = undefined;
-    const len = record.readPositionalAll(io, &bytes, 0) catch return endpointPath(alloc, session_name);
+    const stat = record.stat(io) catch return error.InvalidRecord;
+    if (stat.size == 0 or stat.size > max_rendezvous_record_bytes) {
+        return error.InvalidRecord;
+    }
+    var bytes: [max_rendezvous_record_bytes]u8 = undefined;
+    const len = record.readPositionalAll(io, &bytes, 0) catch return error.InvalidRecord;
+    if (len != stat.size) return error.InvalidRecord;
     const endpoint = std.mem.trim(u8, bytes[0..len], " \t\r\n");
     if (!std.mem.startsWith(u8, endpoint, pipe_prefix) or
         !std.unicode.utf8ValidateSlice(endpoint))
     {
-        return endpointPath(alloc, session_name);
+        return error.InvalidRecord;
     }
+    const endpoint_w = utf16Path(alloc, endpoint) catch return error.InvalidRecord;
+    defer alloc.free(endpoint_w);
+    if (endpoint_w.len >= max_pipe_name_utf16) return error.InvalidRecord;
     return alloc.dupe(u8, endpoint);
 }
 
@@ -873,6 +945,40 @@ test "Windows session endpoints recover with a fresh nonce" {
     try std.testing.expect(!std.mem.eql(u8, first, second));
     try std.testing.expect(std.mem.startsWith(u8, first, pipe_prefix));
     try std.testing.expect(std.mem.startsWith(u8, second, pipe_prefix));
+}
+
+test "Windows rendezvous records preserve sixty U+0800 endpoint characters" {
+    const alloc = std.testing.allocator;
+    const session_name = "rendezvous-utf8-record";
+    defer cleanupRendezvous(std.testing.io, alloc, session_name);
+
+    var endpoint: std.ArrayList(u8) = .empty;
+    defer endpoint.deinit(alloc);
+    try endpoint.appendSlice(alloc, "\\\\.\\pipe\\zmx\\");
+    var index: usize = 0;
+    while (index < 60) : (index += 1) {
+        try endpoint.appendSlice(alloc, "\u{0800}");
+    }
+    try publishEndpoint(std.testing.io, alloc, session_name, endpoint.items);
+    const resolved = try resolveEndpointPath(std.testing.io, alloc, session_name);
+    defer alloc.free(resolved);
+    try std.testing.expectEqualStrings(endpoint.items, resolved);
+}
+
+test "Windows rendezvous rejects oversized endpoint records" {
+    const alloc = std.testing.allocator;
+    const session_name = "rendezvous-truncated-record";
+    defer cleanupRendezvous(std.testing.io, alloc, session_name);
+
+    var endpoint: std.ArrayList(u8) = .empty;
+    defer endpoint.deinit(alloc);
+    try endpoint.appendSlice(alloc, pipe_prefix);
+    try endpoint.appendNTimes(alloc, 'x', max_rendezvous_record_bytes);
+    try publishEndpoint(std.testing.io, alloc, session_name, endpoint.items);
+    try std.testing.expectError(
+        error.InvalidRecord,
+        resolveEndpointPath(std.testing.io, alloc, session_name),
+    );
 }
 
 test "Windows fallback log paths are filesystem paths" {
