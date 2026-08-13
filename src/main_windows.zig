@@ -27,6 +27,16 @@ comptime {
     }
 }
 
+fn wireTagForCommand(command: []const u8) !WireTag {
+    if (std.mem.eql(u8, command, "print") or std.mem.eql(u8, command, "p")) {
+        return .Output;
+    }
+    if (std.mem.eql(u8, command, "send") or std.mem.eql(u8, command, "s")) {
+        return .Send;
+    }
+    return error.UnsupportedCommand;
+}
+
 fn sendFrame(connection: local_ipc.Connection, tag: WireTag, payload: []const u8) !void {
     if (payload.len > max_frame_len or payload.len > std.math.maxInt(u32)) {
         return error.FrameTooLarge;
@@ -107,9 +117,15 @@ pub fn main(init: std.process.Init) !void {
         var parts: std.ArrayList([]const u8) = .empty;
         defer parts.deinit(gpa);
         while (args.next()) |part| try parts.append(gpa, part);
-        const tag: WireTag = if (std.mem.eql(u8, command, "print")) .Output else .Send;
-        return sendCommand(io, gpa, &cfg, session_name, tag, parts.items);
+        return sendCommand(io, gpa, &cfg, session_name, try wireTagForCommand(command), parts.items);
     }
 
     return unsupported(io, command);
+}
+
+test "Windows print aliases preserve the frozen Output wire tag" {
+    try std.testing.expectEqual(WireTag.Output, try wireTagForCommand("print"));
+    try std.testing.expectEqual(WireTag.Output, try wireTagForCommand("p"));
+    try std.testing.expectEqual(WireTag.Send, try wireTagForCommand("send"));
+    try std.testing.expectEqual(WireTag.Send, try wireTagForCommand("s"));
 }

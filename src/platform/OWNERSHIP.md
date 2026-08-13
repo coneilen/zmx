@@ -29,13 +29,17 @@ daemon cannot replace a live session. Each pipe uses an owner-only DACL
 (`D:P(A;;GA;;;OW)(A;;GA;;;SY)`) and rejects remote clients; the pipe name is
 also scoped below the current token's user SID. Clients compare the connected
 server process token SID with their own before accepting a connection. Server
-close cancels overlapped accepts and waits for all in-flight accept state before
-releasing the pipe/listener state. The small copied-server control tombstone
-is retained after close so a late copied handle cannot become a use-after-free;
-all kernel handles are released. New session listeners use a random nonce
-endpoint published in an owner-profile rendezvous record, allowing recovery
-when a predictable legacy pipe name was pre-created. Clients verify the
-connected server token SID before using a published endpoint. Pipe objects
+close serializes with posting each `ConnectNamedPipe`, cancels posted
+overlapped accepts, and waits for all in-flight accept state before releasing
+the pipe/listener state. The small copied-server control tombstone is retained
+after close so a late copied handle cannot become a use-after-free; all kernel
+handles are released. New session listeners hold an exclusive per-session
+filesystem lease across rendezvous check, nonce listener creation, publish,
+and recheck, so concurrent processes produce one daemon. The lease is a
+Windows file lock and is reusable after a crashed owner. Session endpoints use
+a random nonce published in an owner-profile rendezvous record, allowing
+recovery when a predictable legacy pipe name was pre-created. Clients verify
+the connected server token SID before using a published endpoint. Pipe objects
 disappear when their last handle closes, so stale endpoint files do not need
 deletion.
 `events_windows.zig` waits on overlapped completion events plus a manual-reset
@@ -43,3 +47,6 @@ cancellation event and applies one cumulative deadline to an operation.
 `local_ipc.Connection.writeAll` is the bounded backpressure primitive for
 ConPTY/session adapters; it loops on partial transport writes and never
 truncates a large frame to a fixed queue size.
+When `LOCALAPPDATA` is unavailable, runtime logs and rendezvous metadata fall
+back to `USERPROFILE`, `TEMP`/`TMP`, or `GetTempPathW`; they never use the
+named-pipe namespace as a filesystem path.

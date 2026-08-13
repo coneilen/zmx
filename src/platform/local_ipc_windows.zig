@@ -259,6 +259,7 @@ const ServerState = struct {
     pipe: ?windows.HANDLE,
     closing_pipe: ?windows.HANDLE = null,
     close_event: windows.HANDLE,
+    rendezvous_lease: ?*runtime_windows.SessionLease = null,
     mutex: std.atomic.Value(u8) = .init(0),
     accepts_in_flight: usize = 0,
     closed: bool = false,
@@ -340,6 +341,15 @@ pub fn listenSession(
     session_name: []const u8,
     policy: local_ipc.AccessPolicy,
 ) Error!local_ipc.Server {
+    const lease: *runtime_windows.SessionLease = runtime_windows.acquireSessionLease(io, session_name) catch |err| switch (err) {
+        error.InvalidSessionName => return error.InvalidEndpoint,
+        error.NameTooLong => return error.NameTooLong,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.AccessDenied,
+    };
+    var lease_attached = false;
+    defer if (!lease_attached) lease.release();
+
     if (runtime_windows.hasRendezvous(io, alloc, session_name) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidSessionName => return error.InvalidEndpoint,
@@ -376,6 +386,24 @@ pub fn listenSession(
                 else => error.Unexpected,
             };
         };
+        const published = runtime_windows.resolveEndpointPath(io, alloc, session_name) catch |err| {
+            server.close();
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.Unexpected,
+            };
+        };
+        defer alloc.free(published);
+        if (!std.mem.eql(u8, published, endpoint)) {
+            server.close();
+            return error.Unexpected;
+        }
+
+        const state: *ServerState = @ptrFromInt(server.handle);
+        state.lock();
+        state.rendezvous_lease = lease;
+        state.unlock();
+        lease_attached = true;
         return server;
     }
 
@@ -390,6 +418,41 @@ fn endpointIsLive(alloc: std.mem.Allocator, endpoint: []const u8) Error!bool {
         .FILE_NOT_FOUND, .SEM_TIMEOUT => false,
         .PIPE_BUSY => true,
         else => error.AccessDenied,
+    };
+}
+
+const AcceptCloseRace = struct {
+    server: local_ipc.Server,
+    result: ?Error = null,
+};
+
+fn acceptCloseRaceThread(race: *AcceptCloseRace) void {
+    var connection = acceptServerWithDeadline(
+        race.server,
+        events_windows.Deadline.afterMs(1000),
+        null,
+    ) catch |err| {
+        race.result = err;
+        return;
+    };
+    connection.close();
+    race.result = error.Unexpected;
+}
+
+const SessionOwnerRace = struct {
+    server: ?local_ipc.Server = null,
+    result: ?Error = null,
+};
+
+fn sessionOwnerRaceThread(race: *SessionOwnerRace) void {
+    race.server = listenSession(
+        std.testing.io,
+        std.heap.page_allocator,
+        "zmx-concurrent-owner",
+        .{},
+    ) catch |err| {
+        race.result = err;
+        return;
     };
 }
 
@@ -507,6 +570,11 @@ fn acceptWithDeadline(
     deadline: ?events_windows.Deadline,
     cancellation: ?*events_windows.Cancellation,
 ) Error!local_ipc.Connection {
+    const event = try completionEvent();
+    defer windows.CloseHandle(event);
+    var overlapped = std.mem.zeroes(OVERLAPPED);
+    overlapped.hEvent = event;
+
     state.lock();
     if (state.closed) {
         state.unlock();
@@ -517,15 +585,13 @@ fn acceptWithDeadline(
         return error.AlreadyClosed;
     };
     state.accepts_in_flight += 1;
+    // Shutdown is serialized with posting the overlapped operation. Once
+    // close observes accepts_in_flight, ConnectNamedPipe has already been
+    // issued and CancelIoEx can reliably cancel it.
+    const connected = ConnectNamedPipe(pipe, &overlapped);
     state.unlock();
     defer finishAccept(state);
 
-    const event = try completionEvent();
-    defer windows.CloseHandle(event);
-
-    var overlapped = std.mem.zeroes(OVERLAPPED);
-    overlapped.hEvent = event;
-    const connected = ConnectNamedPipe(pipe, &overlapped);
     if (connected == 0) {
         switch (windows.GetLastError()) {
             .PIPE_CONNECTED => {},
@@ -803,6 +869,10 @@ fn closeServerThunk(value: local_ipc.Handle) void {
         windows.CloseHandle(handle);
     }
     windows.CloseHandle(state.close_event);
+    if (state.rendezvous_lease) |lease| {
+        state.rendezvous_lease = null;
+        lease.release();
+    }
 }
 
 test "Windows IPC keeps endpoint validation separate from wire framing" {
@@ -864,6 +934,24 @@ test "Windows named pipe late accept after close observes closed state" {
     try std.testing.expectError(error.AlreadyClosed, stale_copy.accept());
 }
 
+test "Windows accept close races serialize operation posting" {
+    const alloc = std.testing.allocator;
+    var index: usize = 0;
+    while (index < 32) : (index += 1) {
+        var server = try listen(
+            alloc,
+            .{ .name = "zmx-ipc-accept-close-race" },
+            .{},
+        );
+        var race = AcceptCloseRace{ .server = server };
+        var thread = try std.Thread.spawn(.{}, acceptCloseRaceThread, .{&race});
+        server.close();
+        thread.join();
+        try std.testing.expect(race.result != null);
+        try std.testing.expect(race.result.? != error.Unexpected);
+    }
+}
+
 test "Windows session listener publishes a recoverable endpoint" {
     const alloc = std.testing.allocator;
     const session_name = "zmx-rendezvous-\u{1F600}";
@@ -889,4 +977,24 @@ test "Windows session listener publishes a recoverable endpoint" {
     var received: [9]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 9), try read(accepted, &received));
     try std.testing.expectEqualStrings("published", &received);
+}
+
+test "Windows session lease serializes concurrent owners" {
+    const session_name = "zmx-concurrent-owner";
+    defer runtime_windows.cleanupRendezvous(std.testing.io, std.heap.page_allocator, session_name);
+
+    var first = SessionOwnerRace{};
+    var second = SessionOwnerRace{};
+    var first_thread = try std.Thread.spawn(.{}, sessionOwnerRaceThread, .{&first});
+    var second_thread = try std.Thread.spawn(.{}, sessionOwnerRaceThread, .{&second});
+    first_thread.join();
+    second_thread.join();
+
+    const owners = @as(usize, @intFromBool(first.server != null)) +
+        @as(usize, @intFromBool(second.server != null));
+    try std.testing.expectEqual(@as(usize, 1), owners);
+    if (first.server) |server| server.close();
+    if (second.server) |server| server.close();
+    if (first.server == null) try std.testing.expectEqual(error.AccessDenied, first.result.?);
+    if (second.server == null) try std.testing.expectEqual(error.AccessDenied, second.result.?);
 }
