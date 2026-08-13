@@ -576,7 +576,9 @@ pub const SessionLease = struct {
 
     pub fn release(self: *SessionLease) void {
         self.file.close(self.io);
-        std.Io.Dir.deleteFileAbsolute(self.io, self.path) catch {};
+        // Keep the lease file at a stable path. Windows releases the byte-range
+        // lock with the handle, while deleting here would let a concurrent
+        // reacquirer open the old identity as a replacement is created.
         lease_allocator.free(self.path);
         lease_allocator.destroy(self);
     }
@@ -670,15 +672,19 @@ pub fn publishEndpoint(
         error.PathAlreadyExists => return error.AccessDenied,
         else => return error.AccessDenied,
     };
-    defer record.close(io);
+    var keep_record = false;
+    defer {
+        record.close(io);
+        if (!keep_record) std.Io.Dir.deleteFileAbsolute(io, record_path) catch {};
+    }
     secureCreatedFile(alloc, record_path) catch |err| {
-        std.Io.Dir.deleteFileAbsolute(io, record_path) catch {};
         return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.AccessDenied,
         };
     };
     record.writeStreamingAll(io, endpoint) catch return error.AccessDenied;
+    keep_record = true;
 }
 
 /// Replace a stale rendezvous record after a server has selected a fresh
@@ -1049,6 +1055,26 @@ test "Windows session lease excludes a second owner" {
         error.AccessDenied,
         acquireSessionLease(std.testing.io, "lease-exclusion"),
     );
+}
+
+test "Windows session lease reuses one stable lock file after release" {
+    const alloc = std.testing.allocator;
+    const session_name = "lease-reusable";
+    const path = try rendezvousLeasePath(alloc, session_name);
+    defer alloc.free(path);
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, path) catch {};
+    const first = try acquireSessionLease(std.testing.io, session_name);
+    first.release();
+
+    var existing = try std.Io.Dir.openFileAbsolute(
+        std.testing.io,
+        path,
+        .{ .mode = .read_only },
+    );
+    existing.close(std.testing.io);
+
+    const second = try acquireSessionLease(std.testing.io, session_name);
+    second.release();
 }
 
 test "Windows runtime rejects insecure preexisting filesystem objects" {

@@ -283,6 +283,16 @@ fn reapCompleted(state: *ServeState) bool {
     }
 }
 
+fn removeWorkerLocked(state: *ServeState, target: *ClientWorker) bool {
+    for (state.workers.items, 0..) |worker, index| {
+        if (worker == target) {
+            _ = state.workers.swapRemove(index);
+            return true;
+        }
+    }
+    return false;
+}
+
 fn reaperMain(state: *ServeState) void {
     while (true) {
         if (reapCompleted(state)) continue;
@@ -395,7 +405,7 @@ pub fn serveConnectionsWithOptions(
         state.mutex.unlock();
         const thread = std.Thread.spawn(.{}, clientWorkerMain, .{worker}) catch |err| {
             state.mutex.lock();
-            _ = state.workers.pop();
+            _ = removeWorkerLocked(&state, worker);
             state.mutex.unlock();
             worker.cancellation.deinit();
             alloc.destroy(worker);
@@ -653,4 +663,33 @@ test "Windows session dispatch reaps many sequential client workers" {
     thread.join();
     try std.testing.expect(probe.completed);
     try std.testing.expectEqual(@as(usize, 128), probe.seen.load(.acquire));
+}
+
+test "Windows failed worker spawn removes the exact worker under the mutex" {
+    var state = ServeState{
+        .alloc = std.testing.allocator,
+        .server = undefined,
+        .handler = undefined,
+        .options = .{},
+    };
+    var first = ClientWorker{
+        .state = &state,
+        .connection = undefined,
+        .cancellation = undefined,
+    };
+    var second = ClientWorker{
+        .state = &state,
+        .connection = undefined,
+        .cancellation = undefined,
+    };
+    try state.workers.append(std.testing.allocator, &first);
+    try state.workers.append(std.testing.allocator, &second);
+    state.mutex.lock();
+    const removed = removeWorkerLocked(&state, &first);
+    state.mutex.unlock();
+    defer state.workers.deinit(std.testing.allocator);
+    try std.testing.expect(removed);
+    try std.testing.expectEqual(@as(usize, 1), state.workers.items.len);
+    try std.testing.expectEqual(&second, state.workers.items[0]);
+    try std.testing.expect(!removeWorkerLocked(&state, &first));
 }

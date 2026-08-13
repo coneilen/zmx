@@ -437,6 +437,8 @@ fn listSessions(
             return std.mem.order(u8, left, right) == .lt;
         }
     }.lessThan);
+    const current_session = try socket.getSeshNameFromEnvAlloc(alloc);
+    defer if (current_session) |name| alloc.free(name);
     if (sessions.items.len == 0) {
         if (short) return;
         var buffer: [4096]u8 = undefined;
@@ -465,7 +467,7 @@ fn listSessions(
                 details.info,
                 details.labels,
                 short,
-                null,
+                current_session,
             );
         }
     }
@@ -517,14 +519,6 @@ fn attachSession(
     );
 }
 
-fn resolveCurrentSession(alloc: std.mem.Allocator) ![]u8 {
-    const session_name = try socket.getSeshNameFromEnvAlloc(alloc) orelse
-        return error.SessionNameRequired;
-    errdefer alloc.free(session_name);
-    try runtime_windows.validateSessionName(session_name);
-    return session_name;
-}
-
 /// Windows production entry point. Session creation and attach use the
 /// frozen IPC server/client contract and the sibling-owned ConPTY provider
 /// boundary. Commands that do not need a PTY still use the same wire tags.
@@ -538,7 +532,9 @@ pub fn main(init: std.process.Init) !void {
     defer args.deinit();
     _ = args.next();
 
-    const command = args.next() orelse "version";
+    const command = args.next() orelse {
+        return listSessions(io, gpa, &cfg, &.{});
+    };
     if (std.mem.eql(u8, command, "version") or
         std.mem.eql(u8, command, "v") or
         std.mem.eql(u8, command, "-v") or
@@ -586,10 +582,7 @@ pub fn main(init: std.process.Init) !void {
         std.mem.eql(u8, command, "detach-all") or
         std.mem.eql(u8, command, "da"))
     {
-        const session_name = if (args.next()) |explicit| blk: {
-            try runtime_windows.validateSessionName(explicit);
-            break :blk try gpa.dupe(u8, explicit);
-        } else try resolveCurrentSession(gpa);
+        const session_name = try socket.resolveSessionOrEnv(gpa, io, args.next());
         defer gpa.free(session_name);
         if (args.next() != null) return error.UnsupportedCommand;
         return sendCommand(io, gpa, &cfg, session_name, .DetachAll, &.{});
@@ -600,11 +593,34 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (wireTagForCommand(command)) |tag| {
-        const session_name = args.next() orelse return error.SessionNameRequired;
-        try runtime_windows.validateSessionName(session_name);
+        var session_arg: ?[]const u8 = null;
         var parts: std.ArrayList([]const u8) = .empty;
         defer parts.deinit(gpa);
-        while (args.next()) |part| try parts.append(gpa, part);
+        if (tag == .History) {
+            while (args.next()) |part| {
+                if (std.mem.eql(u8, part, "--vt") or
+                    std.mem.eql(u8, part, "--html"))
+                {
+                    try parts.append(gpa, part);
+                } else if (session_arg == null) {
+                    session_arg = part;
+                } else {
+                    try parts.append(gpa, part);
+                }
+            }
+        } else {
+            session_arg = args.next();
+            while (args.next()) |part| try parts.append(gpa, part);
+        }
+        const session_name = if (tag == .History or tag == .LabelGet or tag == .Info)
+            try socket.resolveSessionOrEnv(gpa, io, session_arg)
+        else
+            try socket.resolveSessionOrEnv(
+                gpa,
+                io,
+                session_arg orelse return error.SessionNameRequired,
+            );
+        defer gpa.free(session_name);
         if (tag == .History or tag == .LabelGet or tag == .Info) {
             return responseCommand(io, gpa, &cfg, session_name, tag, parts.items);
         }

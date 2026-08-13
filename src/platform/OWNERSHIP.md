@@ -44,7 +44,11 @@ recovery when a predictable legacy pipe name was pre-created. Clients verify
 the connected server token SID before using a published endpoint. Pipe objects
 disappear when their last handle closes; a server removes its owned endpoint
 record before releasing the session lease, while replacement records are
-preserved by an ownership comparison.
+preserved by an ownership comparison. Lease files remain at one stable path
+and only their exclusive byte-range lock is released, preventing a
+release/reacquire race from splitting ownership across file identities.
+`ERROR_SEM_TIMEOUT` and `ERROR_PIPE_BUSY` from a named-pipe probe mean that
+the endpoint is live or busy and must never trigger stale-record deletion.
 `events_windows.zig` waits on overlapped completion events plus a manual-reset
 cancellation event and applies one cumulative deadline to an operation.
 `local_ipc.Connection.writeAll` is the bounded backpressure primitive for
@@ -74,3 +78,6 @@ enumerates only verified SID-scoped records without requiring a session; the
 When `LOCALAPPDATA` is unavailable, runtime logs and rendezvous metadata fall
 back to `USERPROFILE`, `TEMP`/`TMP`, or `GetTempPathW`; they never use the
 named-pipe namespace as a filesystem path.
+Bare Windows invocation follows POSIX behavior by listing sessions. Session
+targeting accepts `.` and resolves it, or an omitted response-command target,
+from `ZMX_SESSION` where the CLI contract permits a current session.

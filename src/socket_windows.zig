@@ -16,7 +16,10 @@ pub fn getSeshNameFromEnv() []const u8 {
 }
 
 pub fn getSeshNameFromEnvAlloc(alloc: std.mem.Allocator) !?[]u8 {
-    const value = try (std.process.Environ{ .block = .global }).getAlloc(alloc, "ZMX_SESSION");
+    const value = (std.process.Environ{ .block = .global }).getAlloc(alloc, "ZMX_SESSION") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => return null,
+        else => return err,
+    };
     if (value.len == 0) {
         alloc.free(value);
         return null;
@@ -32,10 +35,23 @@ pub fn getSeshName(alloc: std.mem.Allocator, sesh: []const u8) ![]const u8 {
 
 pub fn resolveSessionOrEnv(
     alloc: std.mem.Allocator,
-    _: std.Io,
+    io: std.Io,
     session_name: ?[]const u8,
 ) ![]const u8 {
-    const name = session_name orelse getSeshNameFromEnv();
+    const env_name = try getSeshNameFromEnvAlloc(alloc);
+    defer if (env_name) |name| alloc.free(name);
+    const name = if (session_name) |value| blk: {
+        if (!std.mem.eql(u8, value, ".")) break :blk value;
+        if (env_name) |current| break :blk current;
+        var buffer: [4096]u8 = undefined;
+        var writer = std.Io.File.stderr().writer(io, &buffer);
+        writer.interface.print(
+            "error: \".\" requires ZMX_SESSION (are you inside a zmx session?)\n",
+            .{},
+        ) catch {};
+        writer.interface.flush() catch {};
+        return error.SessionNameRequired;
+    } else env_name orelse return error.SessionNameRequired;
     return getSeshName(alloc, name);
 }
 
