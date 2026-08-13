@@ -13,6 +13,12 @@ pub fn getSeshNameFromEnv() []const u8 {
     return lib_posix.getenv("ZMX_SESSION") orelse "";
 }
 
+pub fn getSeshNameFromEnvAlloc(alloc: std.mem.Allocator) !?[]u8 {
+    const value = getSeshNameFromEnv();
+    if (value.len == 0) return null;
+    return alloc.dupe(u8, value);
+}
+
 pub fn getSeshName(alloc: std.mem.Allocator, sesh: []const u8) ![]const u8 {
     const prefix = getSeshPrefix();
     if (prefix.len == 0 and sesh.len == 0) {

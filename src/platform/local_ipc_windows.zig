@@ -260,6 +260,9 @@ const ServerState = struct {
     closing_pipe: ?windows.HANDLE = null,
     close_event: windows.HANDLE,
     rendezvous_lease: ?*runtime_windows.SessionLease = null,
+    rendezvous_io: ?std.Io = null,
+    rendezvous_session: ?[]u8 = null,
+    rendezvous_endpoint: ?[]u8 = null,
     mutex: std.atomic.Value(u8) = .init(0),
     accepts_in_flight: usize = 0,
     closed: bool = false,
@@ -379,6 +382,12 @@ pub fn listenSession(
             return err;
         };
         runtime_windows.replaceEndpoint(io, alloc, session_name, endpoint) catch |err| {
+            runtime_windows.cleanupRendezvousIfOwned(
+                io,
+                server_state_allocator,
+                session_name,
+                endpoint,
+            );
             server.close();
             if (err == error.AccessDenied) continue;
             return switch (err) {
@@ -387,6 +396,12 @@ pub fn listenSession(
             };
         };
         const published = runtime_windows.resolveEndpointPath(io, alloc, session_name) catch |err| {
+            runtime_windows.cleanupRendezvousIfOwned(
+                io,
+                server_state_allocator,
+                session_name,
+                endpoint,
+            );
             server.close();
             return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
@@ -395,13 +410,43 @@ pub fn listenSession(
         };
         defer alloc.free(published);
         if (!std.mem.eql(u8, published, endpoint)) {
+            runtime_windows.cleanupRendezvousIfOwned(
+                io,
+                server_state_allocator,
+                session_name,
+                endpoint,
+            );
             server.close();
             return error.Unexpected;
         }
 
         const state: *ServerState = @ptrFromInt(server.handle);
+        const session_copy = server_state_allocator.dupe(u8, session_name) catch {
+            runtime_windows.cleanupRendezvousIfOwned(
+                io,
+                server_state_allocator,
+                session_name,
+                endpoint,
+            );
+            server.close();
+            return error.OutOfMemory;
+        };
+        const endpoint_copy = server_state_allocator.dupe(u8, endpoint) catch {
+            server_state_allocator.free(session_copy);
+            runtime_windows.cleanupRendezvousIfOwned(
+                io,
+                server_state_allocator,
+                session_name,
+                endpoint,
+            );
+            server.close();
+            return error.OutOfMemory;
+        };
         state.lock();
         state.rendezvous_lease = lease;
+        state.rendezvous_io = io;
+        state.rendezvous_session = session_copy;
+        state.rendezvous_endpoint = endpoint_copy;
         state.unlock();
         lease_attached = true;
         return server;
@@ -892,6 +937,23 @@ fn closeServerThunk(value: local_ipc.Handle) void {
         windows.CloseHandle(handle);
     }
     windows.CloseHandle(state.close_event);
+    if (state.rendezvous_io) |io| {
+        if (state.rendezvous_session) |session_name| {
+            if (state.rendezvous_endpoint) |endpoint| {
+                runtime_windows.cleanupRendezvousIfOwned(
+                    io,
+                    server_state_allocator,
+                    session_name,
+                    endpoint,
+                );
+                server_state_allocator.free(endpoint);
+            }
+            server_state_allocator.free(session_name);
+        }
+    }
+    state.rendezvous_endpoint = null;
+    state.rendezvous_session = null;
+    state.rendezvous_io = null;
     if (state.rendezvous_lease) |lease| {
         state.rendezvous_lease = null;
         lease.release();
@@ -1024,6 +1086,13 @@ test "Windows session listener publishes a recoverable endpoint" {
     var received: [9]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 9), try read(accepted, &received));
     try std.testing.expectEqualStrings("published", &received);
+
+    server.close();
+    try std.testing.expect(!(try runtime_windows.hasRendezvous(
+        std.testing.io,
+        alloc,
+        session_name,
+    )));
 }
 
 test "Windows session lease serializes concurrent owners" {

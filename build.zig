@@ -123,6 +123,15 @@ pub fn build(b: *std.Build) void {
             "release",
             "Build release binaries for all platforms",
         );
+        const sha256_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/sha256.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        });
+        const sha256_exe = b.addExecutable(.{
+            .name = "zmx-sha256",
+            .root_module = sha256_module,
+        });
         const release_targets = linux_targets ++ macos_targets ++ windows_targets;
         for (release_targets) |release_target| {
             const resolved = b.resolveTargetQuery(release_target);
@@ -166,7 +175,7 @@ pub fn build(b: *std.Build) void {
             tar.addDirectoryArg(release_exe.getEmittedBinDirectory());
             tar.addArg(binary_name);
 
-            const shasum = b.addSystemCommand(&.{"sha256sum"});
+            const shasum = b.addRunArtifact(sha256_exe);
             shasum.addFileArg(tarball);
             const shasum_output = shasum.captureStdOut(.{});
 
