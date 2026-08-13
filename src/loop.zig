@@ -879,7 +879,7 @@ pub const Daemon = struct {
             payload[0] == 0x1b)
         {
             self.queuePtyInput(gpa, payload);
-            client.classifier.reset();
+            client.classifier.markEmittedPrefix();
             return;
         }
 
@@ -941,7 +941,7 @@ pub const Daemon = struct {
         // Keyboard input claims leadership, but still shares the filtered
         // stream path so carried mouse prefixes and terminal events retain
         // their correct ordering and filtering.
-        if (class.keyboard and self.leader_client_fd != client.socket_fd) {
+        if (class.claims_leadership and self.leader_client_fd != client.socket_fd) {
             try self.setLeader(gpa, client);
         }
 
@@ -952,6 +952,7 @@ pub const Daemon = struct {
             var input = std.ArrayList(u8).empty;
             defer input.deinit(gpa);
             for (class.ranges) |range| {
+                if (!was_leader and range.from_emitted) continue;
                 if (range.from_carry) {
                     try input.appendSlice(gpa, client.input_carry.items);
                 }
@@ -2201,6 +2202,9 @@ test "leader standalone ESC is flushed immediately" {
 
     try std.testing.expectEqualStrings("\x1b", daemon.pty_write_buf.items);
     try std.testing.expectEqual(@as(usize, 0), leader.input_carry.items.len);
+
+    try daemon.handleInput(alloc, &leader, "[I");
+    try std.testing.expectEqualStrings("\x1b[I", daemon.pty_write_buf.items);
 }
 
 test "leader split escape is reassembled while leadership is unchanged" {
@@ -2337,4 +2341,130 @@ test "non-leader complete prefix before trailing escape stays suppressed" {
 
     try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
     try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+}
+
+test "emitted leader ESC continuation focus cannot retake leadership" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer leader.write_buf.deinit(alloc);
+    defer leader.classifier.deinit(alloc);
+    defer leader.input_carry.deinit(alloc);
+
+    var follower = Client{
+        .alloc = alloc,
+        .socket_fd = 8,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer follower.write_buf.deinit(alloc);
+    defer follower.classifier.deinit(alloc);
+    defer follower.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &leader, "\x1b");
+    try daemon.handleInput(alloc, &follower, "x");
+    try daemon.handleInput(alloc, &leader, "[I");
+
+    try std.testing.expectEqual(@as(?i32, 8), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1bx", daemon.pty_write_buf.items);
+}
+
+test "emitted leader ESC continuation reply cannot retake leadership" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer leader.write_buf.deinit(alloc);
+    defer leader.classifier.deinit(alloc);
+    defer leader.input_carry.deinit(alloc);
+
+    var follower = Client{
+        .alloc = alloc,
+        .socket_fd = 8,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer follower.write_buf.deinit(alloc);
+    defer follower.classifier.deinit(alloc);
+    defer follower.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &leader, "\x1b");
+    try daemon.handleInput(alloc, &follower, "x");
+    try daemon.handleInput(alloc, &leader, "[1;2R");
+
+    try std.testing.expectEqual(@as(?i32, 8), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1bx", daemon.pty_write_buf.items);
+}
+
+test "emitted leader ESC preserves SS3 continuation classification" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer leader.write_buf.deinit(alloc);
+    defer leader.classifier.deinit(alloc);
+    defer leader.input_carry.deinit(alloc);
+
+    var follower = Client{
+        .alloc = alloc,
+        .socket_fd = 8,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer follower.write_buf.deinit(alloc);
+    defer follower.classifier.deinit(alloc);
+    defer follower.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &leader, "\x1b");
+    try daemon.handleInput(alloc, &follower, "x");
+    try daemon.handleInput(alloc, &leader, "OA");
+
+    try std.testing.expectEqual(@as(?i32, 8), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1bx", daemon.pty_write_buf.items);
 }

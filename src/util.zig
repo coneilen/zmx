@@ -693,6 +693,7 @@ pub const InputClassifier = struct {
     mouse_state: MouseState = .none,
     pending_mouse_bytes: u8 = 0,
     ss3_pending: bool = false,
+    emitted_prefix: bool = false,
     ranges: std.ArrayList(Range) = .empty,
     quarantined: bool = false,
     kitty_capture: [128]u8 = undefined,
@@ -726,11 +727,13 @@ pub const InputClassifier = struct {
         start: usize,
         end: usize,
         from_carry: bool,
+        from_emitted: bool,
         kind: RangeKind,
     };
 
     pub const Class = struct {
         keyboard: bool = false,
+        claims_leadership: bool = false,
         mouse: bool = false,
         discarded: bool = false,
         /// Start of an escape sequence that is incomplete in this chunk.
@@ -752,6 +755,7 @@ pub const InputClassifier = struct {
         self.mouse_state = .none;
         self.pending_mouse_bytes = 0;
         self.ss3_pending = false;
+        self.emitted_prefix = false;
         self.ranges.clearRetainingCapacity();
         self.kitty_capture_len = 0;
         self.kitty_capture_active = false;
@@ -774,14 +778,20 @@ pub const InputClassifier = struct {
         start: usize,
         end: usize,
         from_carry: bool,
+        from_emitted: bool,
         kind: RangeKind,
     ) !void {
         try self.ranges.append(alloc, .{
             .start = start,
             .end = end,
             .from_carry = from_carry,
+            .from_emitted = from_emitted,
             .kind = kind,
         });
+    }
+
+    pub fn markEmittedPrefix(self: *InputClassifier) void {
+        self.emitted_prefix = true;
     }
 
     fn captureKittyByte(self: *InputClassifier, byte: u8) void {
@@ -822,6 +832,7 @@ pub const InputClassifier = struct {
             self.mouse_prefix != .none or
             self.ss3_pending) 0 else null;
         var sequence_from_carry = seq_start != null;
+        var sequence_from_emitted = self.emitted_prefix;
         var sequence_kind: CarryKind = .other;
         if (self.mouse_state != .none) sequence_kind = .mouse;
         var i: usize = 0;
@@ -836,6 +847,7 @@ pub const InputClassifier = struct {
                         seq_start orelse 0,
                         i + 1,
                         sequence_from_carry,
+                        sequence_from_emitted,
                         .mouse,
                     );
                     class.mouse = true;
@@ -846,6 +858,8 @@ pub const InputClassifier = struct {
                     self.mouse_prefix = .none;
                     seq_start = null;
                     sequence_from_carry = false;
+                    sequence_from_emitted = false;
+                    self.emitted_prefix = false;
                     sequence_kind = .other;
                 }
                 i += 1;
@@ -858,9 +872,11 @@ pub const InputClassifier = struct {
                     seq_start orelse 0,
                     i + 1,
                     sequence_from_carry,
+                    sequence_from_emitted,
                     .keyboard,
                 );
                 class.keyboard = true;
+                if (!sequence_from_emitted) class.claims_leadership = true;
                 if (sequence_from_carry and class.completed_carry_end == null) {
                     class.completed_carry_end = i + 1;
                 }
@@ -868,6 +884,8 @@ pub const InputClassifier = struct {
                 ss3_complete = true;
                 seq_start = null;
                 sequence_from_carry = false;
+                sequence_from_emitted = false;
+                self.emitted_prefix = false;
                 sequence_kind = .other;
             }
 
@@ -882,7 +900,7 @@ pub const InputClassifier = struct {
                     while (i < end) : (i += 1) _ = self.parser.next(payload[i]);
                     if (kitty.event_type != 3) {
                         class.keyboard = true;
-                        try self.appendRange(alloc, start, end, false, .keyboard);
+                        try self.appendRange(alloc, start, end, false, false, .keyboard);
                     }
                     self.mouse_prefix = .none;
                     seq_start = null;
@@ -942,7 +960,15 @@ pub const InputClassifier = struct {
                     .print => {
                         if (!ss3_complete) {
                             class.keyboard = true;
-                            try self.appendRange(alloc, i, i + 1, false, .keyboard);
+                            if (!sequence_from_emitted) class.claims_leadership = true;
+                            try self.appendRange(
+                                alloc,
+                                i,
+                                i + 1,
+                                false,
+                                sequence_from_emitted,
+                                .keyboard,
+                            );
                         }
                     },
                     .csi_dispatch => |csi| {
@@ -957,11 +983,13 @@ pub const InputClassifier = struct {
                         }
                         if (is_keyboard) {
                             class.keyboard = true;
+                            if (!sequence_from_emitted) class.claims_leadership = true;
                             try self.appendRange(
                                 alloc,
                                 seq_start orelse i,
                                 i + 1,
                                 sequence_from_carry,
+                                sequence_from_emitted,
                                 .keyboard,
                             );
                         }
@@ -969,7 +997,15 @@ pub const InputClassifier = struct {
                     .execute => |code| {
                         if (code == 0x0D or code == 0x0A or code == 0x09 or code == 0x08) {
                             class.keyboard = true;
-                            try self.appendRange(alloc, i, i + 1, false, .keyboard);
+                            if (!sequence_from_emitted) class.claims_leadership = true;
+                            try self.appendRange(
+                                alloc,
+                                i,
+                                i + 1,
+                                false,
+                                sequence_from_emitted,
+                                .keyboard,
+                            );
                         }
                     },
                     else => {},
@@ -980,11 +1016,13 @@ pub const InputClassifier = struct {
                 if (self.kittyEventType()) |event_type| {
                     if (event_type != 3) {
                         class.keyboard = true;
+                        if (!sequence_from_emitted) class.claims_leadership = true;
                         try self.appendRange(
                             alloc,
                             seq_start orelse i,
                             i + 1,
                             sequence_from_carry,
+                            sequence_from_emitted,
                             .keyboard,
                         );
                     }
@@ -997,6 +1035,7 @@ pub const InputClassifier = struct {
                     seq_start orelse 0,
                     i + 1,
                     sequence_from_carry,
+                    sequence_from_emitted,
                     .mouse,
                 );
                 class.mouse = true;
@@ -1007,6 +1046,8 @@ pub const InputClassifier = struct {
                 self.mouse_prefix = .none;
                 seq_start = null;
                 sequence_from_carry = false;
+                sequence_from_emitted = false;
+                self.emitted_prefix = false;
                 sequence_kind = .other;
             } else if (self.mouse_state == .none and
                 self.parser.state == .ground and
@@ -1018,6 +1059,8 @@ pub const InputClassifier = struct {
                 self.mouse_prefix = .none;
                 seq_start = null;
                 sequence_from_carry = false;
+                sequence_from_emitted = false;
+                self.emitted_prefix = false;
                 sequence_kind = .other;
                 self.kitty_capture_active = false;
                 self.kitty_capture_len = 0;
