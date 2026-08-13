@@ -931,6 +931,7 @@ pub const InputClassifier = struct {
                     while (i < end) : (i += 1) _ = self.parser.next(payload[i]);
                     if (kitty.event_type != 3) {
                         class.keyboard = true;
+                        class.claims_leadership = true;
                         try self.appendRange(alloc, start, end, false, false, .keyboard);
                     }
                     self.mouse_prefix = .none;

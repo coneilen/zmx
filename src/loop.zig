@@ -2471,6 +2471,108 @@ test "emitted leader ESC preserves SS3 continuation classification" {
     try std.testing.expectEqualStrings("\x1bx", daemon.pty_write_buf.items);
 }
 
+test "non-leader complete Kitty CSI-u press claims leadership" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "\x1b[65;1:1u");
+
+    try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1b[65;1:1u", daemon.pty_write_buf.items);
+}
+
+test "non-leader complete Kitty CSI-u release stays suppressed" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "\x1b[65;1:3u");
+
+    try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+}
+
+test "emitted leader ESC Kitty continuation cannot retake leadership" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer leader.write_buf.deinit(alloc);
+    defer leader.classifier.deinit(alloc);
+    defer leader.input_carry.deinit(alloc);
+
+    var follower = Client{
+        .alloc = alloc,
+        .socket_fd = 8,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer follower.write_buf.deinit(alloc);
+    defer follower.classifier.deinit(alloc);
+    defer follower.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &leader, "\x1b");
+    try daemon.handleInput(alloc, &follower, "x");
+    try daemon.handleInput(alloc, &leader, "[65;1:1u");
+
+    try std.testing.expectEqual(@as(?i32, 8), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1bx", daemon.pty_write_buf.items);
+}
+
 fn makeLongKittySequence(alloc: std.mem.Allocator, event_type: u8, text_len: usize) ![]u8 {
     var sequence = std.ArrayList(u8).empty;
     errdefer sequence.deinit(alloc);
