@@ -180,7 +180,8 @@ pub fn waitUntil(
 test "Windows deadlines are cumulative and expire at zero" {
     const deadline = Deadline.afterMs(1);
     try std.testing.expect((deadline.remainingMs() orelse 0) <= 1);
-    Sleep(2);
+    // Windows timer resolution can undershoot a two millisecond sleep.
+    Sleep(20);
     try std.testing.expectEqual(@as(?u32, 0), deadline.remainingMs());
 }
 
