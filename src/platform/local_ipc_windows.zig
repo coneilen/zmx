@@ -359,12 +359,18 @@ pub fn listenSession(
         else => return error.AccessDenied,
     }) {
         const existing = runtime_windows.resolveEndpointPath(io, alloc, session_name) catch |err| switch (err) {
+            error.InvalidRecord => blk: {
+                runtime_windows.cleanupRendezvous(io, alloc, session_name);
+                break :blk null;
+            },
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.AccessDenied,
         };
-        defer alloc.free(existing);
-        if (try endpointIsLive(alloc, existing)) return error.AccessDenied;
-        runtime_windows.cleanupRendezvous(io, alloc, session_name);
+        if (existing) |endpoint| {
+            defer alloc.free(endpoint);
+            if (try endpointIsLive(alloc, endpoint)) return error.AccessDenied;
+            runtime_windows.cleanupRendezvous(io, alloc, session_name);
+        }
     }
 
     var attempt: usize = 0;
@@ -459,11 +465,22 @@ fn endpointIsLive(alloc: std.mem.Allocator, endpoint: []const u8) Error!bool {
     const name = try utf16Endpoint(alloc, endpoint);
     defer alloc.free(name);
     if (WaitNamedPipeW(name.ptr, 0) != 0) return true;
-    return switch (windows.GetLastError()) {
-        .FILE_NOT_FOUND, .SEM_TIMEOUT => false,
-        .PIPE_BUSY => true,
+    const err = windows.GetLastError();
+    if (waitErrorMeansLive(err)) return true;
+    return switch (err) {
+        .FILE_NOT_FOUND => false,
         else => error.AccessDenied,
     };
+}
+
+fn waitErrorMeansLive(err: windows.Win32Error) bool {
+    return err == .SEM_TIMEOUT or err == .PIPE_BUSY;
+}
+
+test "Windows semaphore timeout is treated as a live pipe" {
+    try std.testing.expect(waitErrorMeansLive(.SEM_TIMEOUT));
+    try std.testing.expect(waitErrorMeansLive(.PIPE_BUSY));
+    try std.testing.expect(!waitErrorMeansLive(.FILE_NOT_FOUND));
 }
 
 const AcceptCloseRace = struct {
@@ -1093,6 +1110,28 @@ test "Windows session listener publishes a recoverable endpoint" {
         alloc,
         session_name,
     )));
+}
+
+test "Windows malformed rendezvous recovers while holding the session lease" {
+    const alloc = std.testing.allocator;
+    const session_name = "zmx-malformed-rendezvous";
+    defer runtime_windows.cleanupRendezvous(std.testing.io, alloc, session_name);
+    try runtime_windows.publishEndpoint(
+        std.testing.io,
+        alloc,
+        session_name,
+        "malformed-record",
+    );
+
+    var server = try listenSession(std.testing.io, alloc, session_name, .{});
+    defer server.close();
+    const endpoint = try runtime_windows.resolveEndpointPath(
+        std.testing.io,
+        alloc,
+        session_name,
+    );
+    defer alloc.free(endpoint);
+    try std.testing.expect(std.mem.startsWith(u8, endpoint, runtime_windows.pipe_prefix));
 }
 
 test "Windows session lease serializes concurrent owners" {
