@@ -49,6 +49,11 @@ cancellation event and applies one cumulative deadline to an operation.
 `local_ipc.Connection.writeAll` is the bounded backpressure primitive for
 ConPTY/session adapters; it loops on partial transport writes and never
 truncates a large frame to a fixed queue size.
+`session_windows.serveConnectionsWithOptions` accepts continuously and
+dispatches each client on an independent worker. A client deadline is
+cumulative across its frames, and listener shutdown cancels and joins all
+active reads so a stalled peer cannot block another client or retain a
+handle.
 `session_windows.zig` exposes the same connection/server handles, deadline and
 cancellation types, bounded read/write functions, host/attach lifecycle, and
 all frozen wire-tag dispatch to the sibling ConPTY provider. Until that
@@ -59,6 +64,10 @@ Filesystem rendezvous directories and lease/record files are created with a
 protected DACL containing only the current token SID and SYSTEM. Existing
 objects are verified for owner, protected DACL, ACE type/mask, and exact
 current-user/SYSTEM membership; insecure preexisting objects are rejected.
+Rendezvous records are UTF-8 bounded by the maximum valid UTF-16 pipe path and
+oversized, truncated, or malformed records are rejected. Windows `list`
+enumerates only verified SID-scoped records without requiring a session; the
+`get`, `history`, and `info` commands perform bounded response round trips.
 When `LOCALAPPDATA` is unavailable, runtime logs and rendezvous metadata fall
 back to `USERPROFILE`, `TEMP`/`TMP`, or `GetTempPathW`; they never use the
 named-pipe namespace as a filesystem path.
