@@ -37,6 +37,7 @@ else
     @import("platform/pty_posix.zig");
 pub const pty_windows = @import("platform/pty_windows.zig");
 pub const pty_runtime = @import("platform/pty_runtime.zig");
+pub const pty_session_windows = @import("platform/pty_session_windows.zig");
 pub const resize = @import("platform/resize.zig");
 pub const runtime = @import("platform/runtime.zig");
 pub const runtime_posix = if (builtin.os.tag == .windows)

@@ -663,6 +663,10 @@ const windows_impl = struct {
         // first instruction can run; otherwise terminate the unassigned
         // process rather than allowing a child to escape the job.
         if (kernel32.AssignProcessToJobObject(job, process_info.hProcess) == 0) {
+            std.log.err(
+                "AssignProcessToJobObject failed for pid={d}, error={d}",
+                .{ process_info.dwProcessId, lastErrorCode() },
+            );
             _ = kernel32.TerminateProcess(process_info.hProcess, 1);
             _ = kernel32.WaitForSingleObject(process_info.hProcess, INFINITE);
             return error.WindowsApiFailure;
@@ -975,7 +979,11 @@ const windows_impl = struct {
                 try env_map.put("TERM", "xterm-256color");
             }
             const block = try env_map.createWindowsBlock(alloc, .{});
-            return block.slice;
+            defer block.deinit(alloc);
+            const copy = try alloc.alloc(u16, block.slice.len + 1);
+            @memcpy(copy[0..block.slice.len], block.slice);
+            copy[block.slice.len] = 0;
+            return copy;
         } else {
             var env_map = try std.process.getEnvMap(alloc);
             defer env_map.deinit();

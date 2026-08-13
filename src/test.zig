@@ -10,6 +10,7 @@ comptime {
         _ = @import("platform/runtime_windows.zig");
         _ = @import("platform/pty_windows.zig");
         _ = @import("platform/pty_runtime.zig");
+        _ = @import("platform/pty_session_windows.zig");
         _ = @import("platform/session_wire.zig");
         _ = @import("platform/session_windows.zig");
     } else {
