@@ -8,6 +8,7 @@ const local_ipc = @import("platform/local_ipc.zig");
 const local_ipc_windows = @import("platform/local_ipc_windows.zig");
 const session_windows = @import("platform/session_windows.zig");
 const wire = @import("platform/session_wire.zig");
+const label = @import("label.zig");
 
 const WireTag = wire.Tag;
 const WireHeader = wire.Header;
@@ -36,7 +37,7 @@ fn wireTagForCommand(command: []const u8) !WireTag {
         return .Write;
     }
     if (std.mem.eql(u8, command, "detach") or std.mem.eql(u8, command, "d")) {
-        return .Detach;
+        return .DetachAll;
     }
     if (std.mem.eql(u8, command, "detach-all") or std.mem.eql(u8, command, "da")) {
         return .DetachAll;
@@ -88,6 +89,81 @@ fn readStdin(alloc: std.mem.Allocator, io: std.Io) ![]u8 {
     return payload.toOwnedSlice(alloc);
 }
 
+fn readCommandPayload(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    tag: WireTag,
+    parts: []const []const u8,
+) ![]u8 {
+    var payload: std.ArrayList(u8) = .empty;
+    errdefer payload.deinit(alloc);
+    if (parts.len > 0) {
+        for (parts, 0..) |part, index| {
+            if (index != 0) try payload.append(alloc, ' ');
+            try payload.appendSlice(alloc, part);
+        }
+    } else {
+        const stdin_file = std.Io.File.stdin();
+        defer stdin_file.close(io);
+        var stdin_buffer: [4096]u8 = undefined;
+        var reader = stdin_file.reader(io, &stdin_buffer);
+        if (!try stdin_file.isTty(io)) {
+            while (true) {
+                var chunk: [1024]u8 = undefined;
+                const amount = try reader.interface.readSliceShort(&chunk);
+                if (amount == 0) break;
+                if (payload.items.len > max_frame_len - amount) return error.FrameTooLarge;
+                try payload.appendSlice(alloc, chunk[0..amount]);
+            }
+            stripPipedNewline(&payload, tag);
+        }
+    }
+    if (payload.items.len == 0) return error.TextRequired;
+    return payload.toOwnedSlice(alloc);
+}
+
+fn stripPipedNewline(payload: *std.ArrayList(u8), tag: WireTag) void {
+    if (tag != .Output and payload.items.len > 0 and payload.items[payload.items.len - 1] == '\n') {
+        _ = payload.pop();
+    }
+}
+
+fn historyFormatByte(parts: []const []const u8) !u8 {
+    if (parts.len == 0) return 0;
+    if (parts.len != 1) return error.UnsupportedCommand;
+    if (std.mem.eql(u8, parts[0], "--vt")) return 1;
+    if (std.mem.eql(u8, parts[0], "--html")) return 2;
+    return error.UnsupportedCommand;
+}
+
+fn joinCommandParts(
+    alloc: std.mem.Allocator,
+    parts: []const []const u8,
+) ![]u8 {
+    var payload: std.ArrayList(u8) = .empty;
+    errdefer payload.deinit(alloc);
+    for (parts, 0..) |part, index| {
+        if (index != 0) try payload.append(alloc, ' ');
+        try payload.appendSlice(alloc, part);
+    }
+    return payload.toOwnedSlice(alloc);
+}
+
+fn awaitResponse(
+    alloc: std.mem.Allocator,
+    connection: local_ipc.Connection,
+    expected_tag: WireTag,
+) !void {
+    var response = try session_windows.readFrameWithDeadline(
+        alloc,
+        connection,
+        session_windows.Deadline.afterMs(5000),
+        null,
+    );
+    defer response.deinit(alloc);
+    if (response.header.tag != expected_tag) return error.Unexpected;
+}
+
 pub fn encodeWritePayload(
     alloc: std.mem.Allocator,
     path: []const u8,
@@ -114,8 +190,6 @@ fn sendCommand(
     tag: WireTag,
     parts: []const []const u8,
 ) !void {
-    var payload = std.ArrayList(u8).empty;
-    defer payload.deinit(alloc);
     if (tag == .Write) {
         if (parts.len != 1) return error.UnsupportedCommand;
         const path = parts[0];
@@ -127,23 +201,33 @@ fn sendCommand(
         defer alloc.free(endpoint);
         var connection = try local_ipc_windows.connect(alloc, .{ .name = endpoint });
         defer connection.close();
-        return sendFrame(connection, tag, write_payload);
+        try sendFrame(connection, tag, write_payload);
+        try awaitResponse(alloc, connection, .Ack);
+        var buffer: [4096]u8 = undefined;
+        var writer = std.Io.File.stdout().writer(io, &buffer);
+        try writer.interface.print("file created {s}\n", .{path});
+        try writer.interface.flush();
+        return;
     }
-    for (parts, 0..) |part, index| {
-        if (index != 0) try payload.append(alloc, ' ');
-        try payload.appendSlice(alloc, part);
-    }
+    const command_payload = if (tag == .Output or tag == .Send)
+        try readCommandPayload(alloc, io, tag, parts)
+    else
+        try joinCommandParts(alloc, parts);
+    defer alloc.free(command_payload);
     const requires_payload = switch (tag) {
-        .Output, .Send, .Write, .LabelSet => true,
+        .Output, .Send, .LabelSet => true,
         else => false,
     };
-    if (requires_payload and payload.items.len == 0) return error.TextRequired;
+    if (requires_payload and command_payload.len == 0) return error.TextRequired;
 
     const endpoint = try socket.getSocketPathWithIo(io, alloc, cfg.socket_dir, session_name);
     defer alloc.free(endpoint);
     var connection = try local_ipc_windows.connect(alloc, .{ .name = endpoint });
     defer connection.close();
-    try sendFrame(connection, tag, payload.items);
+    try sendFrame(connection, tag, command_payload);
+    if (tag == .LabelSet or tag == .LabelClear) {
+        try awaitResponse(alloc, connection, .Ack);
+    }
 }
 
 fn requestResponse(
@@ -191,6 +275,94 @@ fn renderInfo(io: std.Io, session_name: []const u8, payload: []const u8) !void {
     try writer.interface.flush();
 }
 
+const SessionDetails = struct {
+    info: wire.Info,
+    labels: []u8,
+};
+
+fn requestSessionDetails(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    cfg: *const Cfg,
+    session_name: []const u8,
+) !SessionDetails {
+    const endpoint = try socket.getSocketPathWithIo(io, alloc, cfg.socket_dir, session_name);
+    defer alloc.free(endpoint);
+    var connection = try local_ipc_windows.connect(alloc, .{ .name = endpoint });
+    defer connection.close();
+    try sendFrame(connection, .Info, "");
+    try sendFrame(connection, .LabelGet, "");
+
+    var info: ?wire.Info = null;
+    var labels: ?[]u8 = null;
+    errdefer if (labels) |value| alloc.free(value);
+    const deadline = session_windows.Deadline.afterMs(5000);
+    while (info == null or labels == null) {
+        var response = try session_windows.readFrameWithDeadline(
+            alloc,
+            connection,
+            deadline,
+            null,
+        );
+        defer response.deinit(alloc);
+        switch (response.header.tag) {
+            .Info => {
+                if (response.payload.len != @sizeOf(wire.Info)) return error.Unexpected;
+                info = std.mem.bytesToValue(wire.Info, response.payload);
+            },
+            .LabelData => {
+                if (labels != null) alloc.free(labels.?);
+                labels = try alloc.dupe(u8, response.payload);
+            },
+            else => {},
+        }
+    }
+    return .{
+        .info = info.?,
+        .labels = labels.?,
+    };
+}
+
+fn writeSessionLine(
+    writer: *std.Io.Writer,
+    session_name: []const u8,
+    info: wire.Info,
+    labels: []const u8,
+    short: bool,
+    current_session: ?[]const u8,
+) !void {
+    if (short) {
+        try writer.print("{s}\n", .{session_name});
+        return;
+    }
+    const prefix = if (current_session) |current|
+        if (std.mem.eql(u8, current, session_name)) "→ " else "  "
+    else
+        "";
+    const cmd_len = @min(@as(usize, info.cmd_len), info.cmd.len);
+    const cwd_len = @min(@as(usize, info.cwd_len), info.cwd.len);
+    try writer.print("{s}name={s}\tpid={d}\tclients={d}\tcreated={d}", .{
+        prefix,
+        session_name,
+        info.pid,
+        info.clients_len,
+        info.created_at,
+    });
+    if (cwd_len > 0) try writer.print("\tcwd={s}", .{info.cwd[0..cwd_len]});
+    if (cmd_len > 0) try writer.print("\tcmd={s}", .{info.cmd[0..cmd_len]});
+    if (info.task_ended_at > 0) {
+        try writer.print("\tended={d}\texit_code={d}", .{
+            info.task_ended_at,
+            info.task_exit_code,
+        });
+    }
+    var iterator = label.LabelIterator.init(labels);
+    while (iterator.next()) |kv| {
+        try writer.print("\t{s}={s}", .{ kv.key, kv.value });
+    }
+    try writer.print("\n", .{});
+}
+
 fn renderPayload(io: std.Io, payload: []const u8) !void {
     var buffer: [4096]u8 = undefined;
     var writer = std.Io.File.stdout().writer(io, &buffer);
@@ -211,14 +383,11 @@ fn responseCommand(
     var expected = command;
     switch (command) {
         .History => {
-            try request_payload.append(alloc, 0);
+            try request_payload.append(alloc, try historyFormatByte(parts));
             expected = .History;
         },
         .LabelGet => {
-            for (parts, 0..) |part, index| {
-                if (index != 0) try request_payload.append(alloc, ' ');
-                try request_payload.appendSlice(alloc, part);
-            }
+            if (parts.len > 1) return error.UnsupportedCommand;
             expected = .LabelData;
         },
         .Info => expected = .Info,
@@ -236,6 +405,9 @@ fn responseCommand(
     defer alloc.free(payload);
     if (command == .Info) {
         try renderInfo(io, session_name, payload);
+    } else if (command == .LabelGet and parts.len == 1) {
+        const value = try label.getLabelValueFromPairs(parts[0], payload);
+        try renderPayload(io, value);
     } else {
         try renderPayload(io, payload);
     }
@@ -260,22 +432,44 @@ fn listSessions(
         for (sessions.items) |name| alloc.free(name);
         sessions.deinit(alloc);
     }
-    for (sessions.items) |session_name| {
-        if (short) {
-            var buffer: [4096]u8 = undefined;
-            var writer = std.Io.File.stdout().writer(io, &buffer);
-            try writer.interface.print("{s}\n", .{session_name});
-            try writer.interface.flush();
-            continue;
+    std.mem.sort([]u8, sessions.items, {}, struct {
+        fn lessThan(_: void, left: []u8, right: []u8) bool {
+            return std.mem.order(u8, left, right) == .lt;
         }
-        responseCommand(io, alloc, cfg, session_name, .Info, &.{}) catch {
-            var buffer: [4096]u8 = undefined;
-            var writer = std.Io.File.stdout().writer(io, &buffer);
-            try writer.interface.print("{s}\n", .{session_name});
-            try writer.interface.flush();
-            continue;
-        };
+    }.lessThan);
+    if (sessions.items.len == 0) {
+        if (short) return;
+        var buffer: [4096]u8 = undefined;
+        var writer = std.Io.File.stderr().writer(io, &buffer);
+        try writer.interface.print("no sessions found in {s}\n", .{cfg.socket_dir});
+        try writer.interface.flush();
+        return;
     }
+
+    var buffer: [4096]u8 = undefined;
+    var writer = std.Io.File.stdout().writer(io, &buffer);
+    for (sessions.items) |session_name| {
+        {
+            const details = requestSessionDetails(io, alloc, cfg, session_name) catch |err| {
+                if (short) continue;
+                try writer.interface.print(
+                    "  name={s}\terr={s}\tstatus=unreachable\n",
+                    .{ session_name, @errorName(err) },
+                );
+                continue;
+            };
+            defer alloc.free(details.labels);
+            try writeSessionLine(
+                &writer.interface,
+                session_name,
+                details.info,
+                details.labels,
+                short,
+                null,
+            );
+        }
+    }
+    try writer.interface.flush();
 }
 
 fn unsupported(io: std.Io, command: []const u8) !void {
@@ -406,7 +600,7 @@ test "Windows print aliases preserve the frozen Output wire tag" {
     try std.testing.expectEqual(WireTag.Write, try wireTagForCommand("write"));
     try std.testing.expectEqual(WireTag.Write, try wireTagForCommand("wr"));
     try std.testing.expectError(error.UnsupportedCommand, wireTagForCommand("w"));
-    try std.testing.expectEqual(WireTag.Detach, try wireTagForCommand("detach"));
+    try std.testing.expectEqual(WireTag.DetachAll, try wireTagForCommand("detach"));
     try std.testing.expectEqual(WireTag.DetachAll, try wireTagForCommand("detach-all"));
     try std.testing.expectEqual(WireTag.Kill, try wireTagForCommand("kill"));
     try std.testing.expectEqual(WireTag.History, try wireTagForCommand("history"));
@@ -416,12 +610,59 @@ test "Windows print aliases preserve the frozen Output wire tag" {
     try std.testing.expectEqual(WireTag.Info, try wireTagForCommand("info"));
 }
 
+test "Windows command parity preserves stdin newline and history formats" {
+    var send_payload: std.ArrayList(u8) = .empty;
+    defer send_payload.deinit(std.testing.allocator);
+    try send_payload.appendSlice(std.testing.allocator, "send\n");
+    stripPipedNewline(&send_payload, .Send);
+    try std.testing.expectEqualStrings("send", send_payload.items);
+
+    var print_payload: std.ArrayList(u8) = .empty;
+    defer print_payload.deinit(std.testing.allocator);
+    try print_payload.appendSlice(std.testing.allocator, "print\n");
+    stripPipedNewline(&print_payload, .Output);
+    try std.testing.expectEqualStrings("print\n", print_payload.items);
+
+    try std.testing.expectEqual(@as(u8, 0), try historyFormatByte(&.{}));
+    try std.testing.expectEqual(@as(u8, 1), try historyFormatByte(&.{"--vt"}));
+    try std.testing.expectEqual(@as(u8, 2), try historyFormatByte(&.{"--html"}));
+    try std.testing.expectError(
+        error.UnsupportedCommand,
+        historyFormatByte(&.{"--unknown"}),
+    );
+}
+
 test "Windows Write payload preserves path length and stdin bytes" {
     const payload = try encodeWritePayload(std.testing.allocator, "a\\b.txt", "contents");
     defer std.testing.allocator.free(payload);
     try std.testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, payload[0..4], .little));
     try std.testing.expectEqualStrings("a\\b.txt", payload[4..11]);
     try std.testing.expectEqualStrings("contents", payload[11..]);
+}
+
+test "Windows list rendering includes task state and labels" {
+    var info = std.mem.zeroes(wire.Info);
+    info.pid = 123;
+    info.clients_len = 2;
+    info.created_at = 7;
+    info.task_ended_at = 9;
+    info.task_exit_code = 3;
+    info.cmd_len = 3;
+    @memcpy(info.cmd[0..3], "cmd");
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeSessionLine(
+        &output.writer,
+        "dev",
+        info,
+        "project=zmx",
+        false,
+        null,
+    );
+    try std.testing.expectEqualStrings(
+        "name=dev\tpid=123\tclients=2\tcreated=7\tcmd=cmd\tended=9\texit_code=3\tproject=zmx\n",
+        output.writer.buffered(),
+    );
 }
 
 test "Windows production commands route run and attach through the session adapter" {
