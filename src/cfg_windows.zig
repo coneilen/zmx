@@ -36,26 +36,11 @@ pub fn deinit(self: *Cfg, alloc: std.mem.Allocator) void {
     if (self.log_dir.len > 0) alloc.free(self.log_dir);
 }
 
-/// Named-pipe namespaces do not need a directory. Only the log directory is
-/// materialized by the Windows configuration adapter.
+/// Named-pipe namespaces do not need a directory. The log directory is
+/// materialized with the same protected filesystem policy as rendezvous
+/// metadata so it cannot weaken a later fallback session path.
 pub fn mkdir(self: *Cfg, io: std.Io) !void {
-    try mkdirAll(io, self.log_dir, .default_dir);
-}
-
-fn mkdirAll(io: std.Io, path: []const u8, permissions: std.Io.Dir.Permissions) !void {
-    var it = std.fs.path.componentIterator(path);
-    var component = it.last() orelse return error.BadPathName;
-    while (true) {
-        std.Io.Dir.createDirAbsolute(io, component.path, permissions) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            error.FileNotFound => |e| {
-                component = it.previous() orelse return e;
-                continue;
-            },
-            else => |e| return e,
-        };
-        component = it.next() orelse return;
-    }
+    try runtime_windows.ensureSecureDirectoryPath(io, self.log_dir);
 }
 
 test "Windows Cfg keeps named-pipe namespace out of filesystem setup" {

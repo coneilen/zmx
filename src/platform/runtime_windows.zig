@@ -36,6 +36,12 @@ extern "advapi32" fn SystemFunction036(
     buffer: *anyopaque,
     length: windows.ULONG,
 ) callconv(.winapi) c_int;
+extern "advapi32" fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+    string_security_descriptor: windows.LPCWSTR,
+    string_sd_revision: windows.DWORD,
+    security_descriptor: *?*anyopaque,
+    security_descriptor_size: ?*windows.DWORD,
+) callconv(.winapi) c_int;
 extern "kernel32" fn OpenProcess(
     desired_access: windows.DWORD,
     inherit_handle: windows.BOOL,
@@ -51,6 +57,52 @@ extern "kernel32" fn GetTempPathW(
     buffer_length: windows.DWORD,
     buffer: [*]u16,
 ) callconv(.winapi) windows.DWORD;
+extern "kernel32" fn CreateDirectoryW(
+    path_name: windows.LPCWSTR,
+    security_attributes: ?*windows.SECURITY_ATTRIBUTES,
+) callconv(.winapi) c_int;
+extern "advapi32" fn SetFileSecurityW(
+    file_name: windows.LPCWSTR,
+    security_information: windows.DWORD,
+    security_descriptor: *anyopaque,
+) callconv(.winapi) c_int;
+extern "advapi32" fn GetNamedSecurityInfoW(
+    object_name: windows.LPCWSTR,
+    object_type: windows.DWORD,
+    security_information: windows.DWORD,
+    owner: ?*?*anyopaque,
+    group: ?*?*anyopaque,
+    dacl: ?*?*anyopaque,
+    sacl: ?*?*anyopaque,
+    security_descriptor: ?*?*anyopaque,
+) callconv(.winapi) windows.DWORD;
+extern "advapi32" fn GetSecurityDescriptorOwner(
+    security_descriptor: *anyopaque,
+    owner: *?*anyopaque,
+    owner_defaulted: *c_int,
+) callconv(.winapi) c_int;
+extern "advapi32" fn GetSecurityDescriptorDacl(
+    security_descriptor: *anyopaque,
+    dacl_present: *c_int,
+    dacl: *?*anyopaque,
+    dacl_defaulted: *c_int,
+) callconv(.winapi) c_int;
+extern "advapi32" fn GetSecurityDescriptorControl(
+    security_descriptor: *anyopaque,
+    control: *windows.WORD,
+    revision: *windows.DWORD,
+) callconv(.winapi) c_int;
+extern "advapi32" fn GetAclInformation(
+    acl: *anyopaque,
+    information: *AclSizeInformation,
+    information_length: windows.DWORD,
+    information_class: windows.DWORD,
+) callconv(.winapi) c_int;
+extern "advapi32" fn GetAce(
+    acl: *anyopaque,
+    ace_index: windows.DWORD,
+    ace: *?*anyopaque,
+) callconv(.winapi) c_int;
 
 pub const Error = runtime.PathError || error{
     AccessDenied,
@@ -63,6 +115,34 @@ const lease_allocator = std.heap.page_allocator;
 const token_query: windows.DWORD = 0x0008;
 const token_user_information: windows.DWORD = 1;
 const process_query_limited_information: windows.DWORD = 0x1000;
+const security_descriptor_revision: windows.DWORD = 1;
+const se_file_object: windows.DWORD = 1;
+const owner_security_information: windows.DWORD = 0x0000_0001;
+const dacl_security_information: windows.DWORD = 0x0000_0004;
+const protected_dacl_security_information: windows.DWORD = 0x8000_0000;
+const security_descriptor_dacl_protected: windows.WORD = 0x1000;
+const acl_information_basic: windows.DWORD = 2;
+const access_allowed_ace_type: u8 = 0;
+const file_all_access: windows.DWORD = 0x001f_01ff;
+const system_sid = "S-1-5-18";
+
+const AclSizeInformation = extern struct {
+    ace_count: windows.DWORD,
+    acl_bytes_in_use: windows.DWORD,
+    acl_bytes_free: windows.DWORD,
+};
+
+const AceHeader = extern struct {
+    ace_type: u8,
+    ace_flags: u8,
+    ace_size: windows.WORD,
+};
+
+const AccessAllowedAce = extern struct {
+    header: AceHeader,
+    mask: windows.DWORD,
+    sid_start: windows.DWORD,
+};
 
 const SidAndAttributes = extern struct {
     sid: *anyopaque,
@@ -136,6 +216,215 @@ pub fn currentUserSid(alloc: std.mem.Allocator) Error![]u8 {
     return sidForToken(alloc, token);
 }
 
+fn utf16Path(alloc: std.mem.Allocator, path: []const u8) Error![:0]u16 {
+    if (!std.unicode.utf8ValidateSlice(path)) return error.InvalidRecord;
+    return std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch |err| switch (err) {
+        error.InvalidUtf8 => error.InvalidRecord,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
+fn filesystemSddl(alloc: std.mem.Allocator) Error![:0]u16 {
+    const sid = try currentUserSid(alloc);
+    defer alloc.free(sid);
+    const sddl = std.fmt.allocPrint(
+        alloc,
+        "O:{s}G:SYD:P(A;;FA;;;{s})(A;;FA;;;SY)",
+        .{ sid, sid },
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer alloc.free(sddl);
+    return std.unicode.utf8ToUtf16LeAllocZ(alloc, sddl) catch |err| switch (err) {
+        error.InvalidUtf8 => error.InvalidRecord,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
+fn applyFilesystemSecurity(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+) Error!void {
+    const path_w = try utf16Path(alloc, path);
+    defer alloc.free(path_w);
+    const sddl_w = try filesystemSddl(alloc);
+    defer alloc.free(sddl_w);
+
+    var descriptor: ?*anyopaque = null;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl_w.ptr,
+        security_descriptor_revision,
+        &descriptor,
+        null,
+    ) == 0) {
+        return error.AccessDenied;
+    }
+    defer _ = LocalFree(descriptor);
+
+    if (SetFileSecurityW(
+        path_w.ptr,
+        owner_security_information |
+            dacl_security_information |
+            protected_dacl_security_information,
+        descriptor.?,
+    ) == 0) {
+        return error.AccessDenied;
+    }
+}
+
+fn sidStringFromPointer(alloc: std.mem.Allocator, sid: *anyopaque) Error![]u8 {
+    var sid_string: ?[*:0]u16 = null;
+    if (ConvertSidToStringSidW(sid, &sid_string) == 0) return error.AccessDenied;
+    defer _ = LocalFree(sid_string);
+    return std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.span(sid_string.?)) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.AccessDenied,
+    };
+}
+
+fn verifyFilesystemSecurity(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+) Error!void {
+    const path_w = try utf16Path(alloc, path);
+    defer alloc.free(path_w);
+
+    var owner: ?*anyopaque = null;
+    var dacl: ?*anyopaque = null;
+    var descriptor: ?*anyopaque = null;
+    const result = GetNamedSecurityInfoW(
+        path_w.ptr,
+        se_file_object,
+        owner_security_information | dacl_security_information,
+        &owner,
+        null,
+        &dacl,
+        null,
+        &descriptor,
+    );
+    if (result != 0 or descriptor == null or owner == null or dacl == null) {
+        return error.AccessDenied;
+    }
+    defer _ = LocalFree(descriptor);
+
+    const current_sid = try currentUserSid(alloc);
+    defer alloc.free(current_sid);
+    const owner_sid = try sidStringFromPointer(alloc, owner.?);
+    defer alloc.free(owner_sid);
+    if (!std.mem.eql(u8, owner_sid, current_sid)) return error.AccessDenied;
+
+    var control: windows.WORD = 0;
+    var revision: windows.DWORD = 0;
+    if (GetSecurityDescriptorControl(descriptor.?, &control, &revision) == 0 or
+        (control & security_descriptor_dacl_protected) == 0)
+    {
+        return error.AccessDenied;
+    }
+
+    var dacl_present: c_int = 0;
+    var dacl_defaulted: c_int = 0;
+    var verified_dacl: ?*anyopaque = null;
+    if (GetSecurityDescriptorDacl(
+        descriptor.?,
+        &dacl_present,
+        &verified_dacl,
+        &dacl_defaulted,
+    ) == 0 or dacl_present == 0 or verified_dacl == null) {
+        return error.AccessDenied;
+    }
+
+    var acl_info: AclSizeInformation = undefined;
+    if (GetAclInformation(
+        verified_dacl.?,
+        &acl_info,
+        @sizeOf(AclSizeInformation),
+        acl_information_basic,
+    ) == 0 or acl_info.ace_count != 2) {
+        return error.AccessDenied;
+    }
+
+    var saw_user = false;
+    var saw_system = false;
+    var index: windows.DWORD = 0;
+    while (index < acl_info.ace_count) : (index += 1) {
+        var ace: ?*anyopaque = null;
+        if (GetAce(verified_dacl.?, index, &ace) == 0 or ace == null) {
+            return error.AccessDenied;
+        }
+        const allowed: *const AccessAllowedAce = @ptrCast(@alignCast(ace.?));
+        if (allowed.header.ace_type != access_allowed_ace_type or
+            allowed.header.ace_flags != 0 or
+            allowed.mask != file_all_access)
+        {
+            return error.AccessDenied;
+        }
+        const ace_sid: *anyopaque = @ptrCast(@constCast(&allowed.sid_start));
+        const ace_sid_string = try sidStringFromPointer(alloc, ace_sid);
+        defer alloc.free(ace_sid_string);
+        if (std.mem.eql(u8, ace_sid_string, current_sid)) {
+            if (saw_user) return error.AccessDenied;
+            saw_user = true;
+        } else if (std.mem.eql(u8, ace_sid_string, system_sid)) {
+            if (saw_system) return error.AccessDenied;
+            saw_system = true;
+        } else {
+            return error.AccessDenied;
+        }
+    }
+    if (!saw_user or !saw_system) return error.AccessDenied;
+}
+
+fn ensureSecureDirectory(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+) Error!void {
+    const path_w = try utf16Path(alloc, path);
+    defer alloc.free(path_w);
+    const sddl_w = try filesystemSddl(alloc);
+    defer alloc.free(sddl_w);
+
+    var descriptor: ?*anyopaque = null;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl_w.ptr,
+        security_descriptor_revision,
+        &descriptor,
+        null,
+    ) == 0) {
+        return error.AccessDenied;
+    }
+    defer _ = LocalFree(descriptor);
+    var attributes = windows.SECURITY_ATTRIBUTES{
+        .nLength = @sizeOf(windows.SECURITY_ATTRIBUTES),
+        .lpSecurityDescriptor = descriptor,
+        .bInheritHandle = winBool(
+            @TypeOf(@as(windows.SECURITY_ATTRIBUTES, undefined).bInheritHandle),
+            false,
+        ),
+    };
+    if (CreateDirectoryW(path_w.ptr, &attributes) == 0) {
+        if (windows.GetLastError() != .ALREADY_EXISTS) return error.AccessDenied;
+    }
+    return verifyFilesystemSecurity(alloc, path);
+}
+
+fn secureCreatedFile(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+) Error!void {
+    try applyFilesystemSecurity(alloc, path);
+    try verifyFilesystemSecurity(alloc, path);
+}
+
+pub fn ensureSecureDirectoryPath(
+    io: std.Io,
+    path: []const u8,
+) Error!void {
+    _ = io;
+    const parent = std.fs.path.dirname(path) orelse return error.AccessDenied;
+    try ensureSecureDirectory(lease_allocator, parent);
+    try ensureSecureDirectory(lease_allocator, path);
+}
+
 pub fn socketDirForSid(alloc: std.mem.Allocator, sid: []const u8) Error![]u8 {
     if (sid.len == 0 or std.mem.indexOfScalar(u8, sid, '\\') != null) {
         return error.InvalidSessionName;
@@ -183,7 +472,7 @@ fn hexEncode(alloc: std.mem.Allocator, bytes: []const u8) Error![]u8 {
 fn filesystemBase(alloc: std.mem.Allocator) Error![]u8 {
     inline for (.{ "LOCALAPPDATA", "USERPROFILE", "TEMP", "TMP" }) |name| {
         if ((std.process.Environ{ .block = .global }).getAlloc(alloc, name)) |base| {
-            if (base.len > 0) return base;
+            if (base.len > 0 and !std.mem.startsWith(u8, base, "\\\\.\\pipe\\")) return base;
             alloc.free(base);
         } else |_| {}
     }
@@ -191,10 +480,16 @@ fn filesystemBase(alloc: std.mem.Allocator) Error![]u8 {
     var utf16: [32768]u16 = undefined;
     const length = GetTempPathW(@intCast(utf16.len), &utf16);
     if (length == 0 or length >= utf16.len) return error.AccessDenied;
-    return std.unicode.utf16LeToUtf8Alloc(alloc, utf16[0..length]) catch |err| switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.Unexpected,
-    };
+    const base = std.unicode.utf16LeToUtf8Alloc(alloc, utf16[0..length]) catch |err|
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.Unexpected,
+        };
+    if (std.mem.startsWith(u8, base, "\\\\.\\pipe\\")) {
+        alloc.free(base);
+        return error.AccessDenied;
+    }
+    return base;
 }
 
 fn rendezvousBase(alloc: std.mem.Allocator) Error![]u8 {
@@ -217,6 +512,29 @@ fn rendezvousDirectory(
     return std.fmt.allocPrint(alloc, "{s}\\{s}", .{ base, sid });
 }
 
+fn ensureRendezvousDirectory(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    session_name: []const u8,
+) Error!void {
+    _ = io;
+    try validateSessionName(session_name);
+    const sid = try currentUserSid(alloc);
+    defer alloc.free(sid);
+    const root = try filesystemBase(alloc);
+    defer alloc.free(root);
+    const base = try rendezvousBase(alloc);
+    defer alloc.free(base);
+    const zmx_dir = try std.fmt.allocPrint(alloc, "{s}\\zmx", .{root});
+    defer alloc.free(zmx_dir);
+    const user_dir = try std.fmt.allocPrint(alloc, "{s}\\{s}", .{ base, sid });
+    defer alloc.free(user_dir);
+
+    try ensureSecureDirectory(alloc, zmx_dir);
+    try ensureSecureDirectory(alloc, base);
+    try ensureSecureDirectory(alloc, user_dir);
+}
+
 fn rendezvousRecordPath(
     alloc: std.mem.Allocator,
     session_name: []const u8,
@@ -232,22 +550,6 @@ fn rendezvousLeasePath(alloc: std.mem.Allocator, session_name: []const u8) Error
     const record_path = try rendezvousRecordPath(alloc, session_name);
     defer alloc.free(record_path);
     return std.fmt.allocPrint(alloc, "{s}.lease", .{record_path});
-}
-
-fn mkdirAll(io: std.Io, path_name: []const u8) !void {
-    var it = std.fs.path.componentIterator(path_name);
-    var component = it.last() orelse return error.BadPathName;
-    while (true) {
-        std.Io.Dir.createDirAbsolute(io, component.path, .default_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            error.FileNotFound => {
-                component = it.previous() orelse return err;
-                continue;
-            },
-            else => return err,
-        };
-        component = it.next() orelse return;
-    }
 }
 
 pub const SessionLease = struct {
@@ -273,8 +575,12 @@ pub fn acquireSessionLease(
     try validateSessionName(session_name);
     const path = try rendezvousLeasePath(lease_allocator, session_name);
     errdefer lease_allocator.free(path);
-    mkdirAll(io, std.fs.path.dirname(path) orelse return error.Unexpected) catch return error.AccessDenied;
+    ensureRendezvousDirectory(io, lease_allocator, session_name) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.AccessDenied,
+    };
 
+    var created = true;
     const file = std.Io.Dir.createFileAbsolute(io, path, .{
         .read = true,
         .exclusive = true,
@@ -282,16 +588,37 @@ pub fn acquireSessionLease(
         .lock_nonblocking = true,
         .permissions = .default_file,
     }) catch |create_err| switch (create_err) {
-        error.PathAlreadyExists => std.Io.Dir.openFileAbsolute(io, path, .{
-            .mode = .read_write,
-            .lock = .exclusive,
-            .lock_nonblocking = true,
-        }) catch |open_err| switch (open_err) {
-            error.WouldBlock => return error.AccessDenied,
-            else => return error.AccessDenied,
+        error.PathAlreadyExists => blk: {
+            created = false;
+            break :blk std.Io.Dir.openFileAbsolute(io, path, .{
+                .mode = .read_write,
+                .lock = .exclusive,
+                .lock_nonblocking = true,
+            }) catch |open_err| switch (open_err) {
+                error.WouldBlock => return error.AccessDenied,
+                else => return error.AccessDenied,
+            };
         },
         else => return error.AccessDenied,
     };
+    if (created) {
+        secureCreatedFile(lease_allocator, path) catch |err| {
+            file.close(io);
+            std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.AccessDenied,
+            };
+        };
+    } else {
+        verifyFilesystemSecurity(lease_allocator, path) catch |err| {
+            file.close(io);
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.AccessDenied,
+            };
+        };
+    }
 
     const lease = lease_allocator.create(SessionLease) catch {
         file.close(io);
@@ -317,10 +644,7 @@ pub fn publishEndpoint(
     try validateSessionName(session_name);
     const record_path = try rendezvousRecordPath(alloc, session_name);
     defer alloc.free(record_path);
-    mkdirAll(io, std.fs.path.dirname(record_path) orelse return error.Unexpected) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return error.AccessDenied,
-    };
+    try ensureRendezvousDirectory(io, alloc, session_name);
     var record = std.Io.Dir.createFileAbsolute(io, record_path, .{
         .read = true,
         .exclusive = true,
@@ -330,6 +654,13 @@ pub fn publishEndpoint(
         else => return error.AccessDenied,
     };
     defer record.close(io);
+    secureCreatedFile(alloc, record_path) catch |err| {
+        std.Io.Dir.deleteFileAbsolute(io, record_path) catch {};
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.AccessDenied,
+        };
+    };
     record.writeStreamingAll(io, endpoint) catch return error.AccessDenied;
 }
 
@@ -366,6 +697,7 @@ pub fn hasRendezvous(
     alloc: std.mem.Allocator,
     session_name: []const u8,
 ) Error!bool {
+    try ensureRendezvousDirectory(io, alloc, session_name);
     const record_path = try rendezvousRecordPath(alloc, session_name);
     defer alloc.free(record_path);
     var record = std.Io.Dir.openFileAbsolute(io, record_path, .{ .mode = .read_only }) catch |err| switch (err) {
@@ -373,6 +705,7 @@ pub fn hasRendezvous(
         else => return error.AccessDenied,
     };
     record.close(io);
+    try verifyFilesystemSecurity(alloc, record_path);
     return true;
 }
 
@@ -384,6 +717,7 @@ pub fn resolveEndpointPath(
     alloc: std.mem.Allocator,
     session_name: []const u8,
 ) Error![]u8 {
+    try ensureRendezvousDirectory(io, alloc, session_name);
     const record_path = rendezvousRecordPath(alloc, session_name) catch return endpointPath(alloc, session_name);
     defer alloc.free(record_path);
     var record = std.Io.Dir.openFileAbsolute(io, record_path, .{ .mode = .read_only }) catch |err| switch (err) {
@@ -391,6 +725,10 @@ pub fn resolveEndpointPath(
         else => return endpointPath(alloc, session_name),
     };
     defer record.close(io);
+    verifyFilesystemSecurity(alloc, record_path) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.AccessDenied,
+    };
 
     var bytes: [max_pipe_name_utf16]u8 = undefined;
     const len = record.readPositionalAll(io, &bytes, 0) catch return endpointPath(alloc, session_name);
@@ -552,4 +890,16 @@ test "Windows session lease excludes a second owner" {
         error.AccessDenied,
         acquireSessionLease(std.testing.io, "lease-exclusion"),
     );
+}
+
+test "Windows runtime rejects insecure preexisting filesystem objects" {
+    const alloc = std.testing.allocator;
+    const root = try filesystemBase(alloc);
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}\\zmx-insecure-acl-check", .{root});
+    defer alloc.free(path);
+    std.Io.Dir.deleteDirAbsolute(std.testing.io, path) catch {};
+    try std.Io.Dir.createDirAbsolute(std.testing.io, path, .default_dir);
+    defer std.Io.Dir.deleteDirAbsolute(std.testing.io, path) catch {};
+    try std.testing.expectError(error.AccessDenied, ensureSecureDirectory(alloc, path));
 }

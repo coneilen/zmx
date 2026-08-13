@@ -1,7 +1,13 @@
+const builtin = @import("builtin");
 const std = @import("std");
-const cross = @import("cross.zig");
+const cross = if (builtin.os.tag == .windows) struct {} else @import("cross.zig");
 
 pub var log_system = LogSystem{};
+
+const default_log_permissions: std.Io.File.Permissions = if (builtin.os.tag == .windows)
+    @enumFromInt(0)
+else
+    std.Io.File.Permissions.fromMode(0o640);
 
 pub fn zmxLogFn(
     comptime level: std.log.Level,
@@ -19,7 +25,7 @@ pub const LogSystem = struct {
     max_size: u64 = 2 * 1024 * 1024, // 2MB
     path: []const u8 = "",
     io: std.Io = undefined,
-    mode: std.Io.File.Permissions = std.Io.File.Permissions.fromMode(0o640),
+    mode: std.Io.File.Permissions = default_log_permissions,
 
     pub fn init(self: *LogSystem, io: std.Io, path: []const u8, mode: std.Io.File.Permissions) !void {
         self.io = io;
@@ -40,12 +46,16 @@ pub const LogSystem = struct {
         // between our length() check and seekTo(), causing us to overwrite
         // recent parent entries. lseek(fd, 0, SEEK_END) is atomic — it
         // always positions at the true end of file at seek time.
-        const new_pos = cross.c.lseek(file.handle, 0, cross.c.SEEK_END);
-        if (new_pos == -1) {
-            std.Io.File.close(file, self.io);
-            return error.SeekFailed;
+        if (builtin.os.tag == .windows) {
+            self.current_size = 0;
+        } else {
+            const new_pos = cross.c.lseek(file.handle, 0, cross.c.SEEK_END);
+            if (new_pos == -1) {
+                std.Io.File.close(file, self.io);
+                return error.SeekFailed;
+            }
+            self.current_size = @as(u64, @intCast(new_pos));
         }
-        self.current_size = @as(u64, @intCast(new_pos));
         self.file = file;
     }
 

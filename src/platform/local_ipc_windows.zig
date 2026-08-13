@@ -426,6 +426,12 @@ const AcceptCloseRace = struct {
     result: ?Error = null,
 };
 
+const CancelCloseRace = struct {
+    server: local_ipc.Server,
+    cancellation: *events_windows.Cancellation,
+    result: ?Error = null,
+};
+
 fn acceptCloseRaceThread(race: *AcceptCloseRace) void {
     var connection = acceptServerWithDeadline(
         race.server,
@@ -436,6 +442,18 @@ fn acceptCloseRaceThread(race: *AcceptCloseRace) void {
         return;
     };
     connection.close();
+    race.result = error.Unexpected;
+}
+
+fn acceptCancelCloseRaceThread(race: *CancelCloseRace) void {
+    _ = acceptServerWithDeadline(
+        race.server,
+        events_windows.Deadline.afterMs(1000),
+        race.cancellation,
+    ) catch |err| {
+        race.result = err;
+        return;
+    };
     race.result = error.Unexpected;
 }
 
@@ -655,8 +673,13 @@ fn finishAccept(state: *ServerState) void {
 fn resetPipe(state: *ServerState, pipe: windows.HANDLE) void {
     state.lock();
     const replace = !state.closed and state.pipe == pipe;
+    // Once shutdown has claimed this handle, the close path is its sole
+    // owner. In particular, a cancelled accept must not close a handle that
+    // closeServerThunk will close after the in-flight barrier.
+    const close_owns_pipe = state.closed and state.closing_pipe == pipe;
     if (replace) state.pipe = null;
     state.unlock();
+    if (close_owns_pipe) return;
     _ = DisconnectNamedPipe(pipe);
     windows.CloseHandle(pipe);
     if (!replace) return;
@@ -947,6 +970,30 @@ test "Windows accept close races serialize operation posting" {
         var thread = try std.Thread.spawn(.{}, acceptCloseRaceThread, .{&race});
         server.close();
         thread.join();
+        try std.testing.expect(race.result != null);
+        try std.testing.expect(race.result.? != error.Unexpected);
+    }
+}
+
+test "Windows cancelled accept never closes shutdown-owned pipe" {
+    const alloc = std.testing.allocator;
+    var index: usize = 0;
+    while (index < 64) : (index += 1) {
+        var server = try listen(
+            alloc,
+            .{ .name = "zmx-ipc-cancel-close-owner" },
+            .{},
+        );
+        var cancellation = try events_windows.Cancellation.init();
+        var race = CancelCloseRace{
+            .server = server,
+            .cancellation = &cancellation,
+        };
+        var thread = try std.Thread.spawn(.{}, acceptCancelCloseRaceThread, .{&race});
+        try cancellation.cancel();
+        server.close();
+        thread.join();
+        cancellation.deinit();
         try std.testing.expect(race.result != null);
         try std.testing.expect(race.result.? != error.Unexpected);
     }
