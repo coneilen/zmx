@@ -10,24 +10,112 @@ comptime {
 
 const windows = std.os.windows;
 const kernel32 = windows.kernel32;
+const OVERLAPPED = extern struct {
+    internal: usize,
+    internal_high: usize,
+    offset: windows.DWORD,
+    offset_high: windows.DWORD,
+    hEvent: windows.HANDLE,
+};
+
+const create_event_manual_reset: windows.DWORD = 1;
+const event_modify_state: windows.DWORD = 2;
+const synchronize: windows.DWORD = 0x0010_0000;
+const pipe_access_duplex: windows.DWORD = 3;
+const file_flag_overlapped: windows.DWORD = 0x4000_0000;
+const pipe_type_byte: windows.DWORD = 0;
+const pipe_readmode_byte: windows.DWORD = 0;
+const pipe_wait: windows.DWORD = 0;
+const generic_read: windows.DWORD = 0x8000_0000;
+const generic_write: windows.DWORD = 0x4000_0000;
+const open_existing: windows.DWORD = 3;
+const infinite: windows.DWORD = 0xffff_ffff;
+
+fn winBool(comptime T: type, value: bool) T {
+    return switch (@typeInfo(T)) {
+        .@"enum" => @enumFromInt(@intFromBool(value)),
+        else => @intFromBool(value),
+    };
+}
 
 extern "advapi32" fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
     string_security_descriptor: windows.LPCWSTR,
     string_sd_revision: windows.DWORD,
     security_descriptor: *?*anyopaque,
     security_descriptor_size: ?*windows.DWORD,
-) callconv(.winapi) windows.BOOL;
+) callconv(.winapi) c_int;
 
 extern "kernel32" fn LocalFree(memory: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn ConnectNamedPipe(
     pipe: windows.HANDLE,
-    overlapped: ?*windows.OVERLAPPED,
-) callconv(.winapi) windows.BOOL;
-extern "kernel32" fn DisconnectNamedPipe(pipe: windows.HANDLE) callconv(.winapi) windows.BOOL;
+    overlapped: ?*OVERLAPPED,
+) callconv(.winapi) c_int;
+extern "kernel32" fn CreateEventExW(
+    attributes: ?*windows.SECURITY_ATTRIBUTES,
+    name: ?windows.LPCWSTR,
+    flags: windows.DWORD,
+    desired_access: windows.DWORD,
+) callconv(.winapi) ?windows.HANDLE;
+extern "kernel32" fn CreateNamedPipeW(
+    name: windows.LPCWSTR,
+    open_mode: windows.DWORD,
+    pipe_mode: windows.DWORD,
+    max_instances: windows.DWORD,
+    out_buffer_size: windows.DWORD,
+    in_buffer_size: windows.DWORD,
+    default_timeout: windows.DWORD,
+    attributes: ?*windows.SECURITY_ATTRIBUTES,
+) callconv(.winapi) windows.HANDLE;
+extern "kernel32" fn CreateFileW(
+    name: windows.LPCWSTR,
+    desired_access: windows.DWORD,
+    share_mode: windows.DWORD,
+    security_attributes: ?*windows.SECURITY_ATTRIBUTES,
+    creation_disposition: windows.DWORD,
+    flags_and_attributes: windows.DWORD,
+    template_file: ?windows.HANDLE,
+) callconv(.winapi) windows.HANDLE;
+extern "kernel32" fn CancelIoEx(
+    file: windows.HANDLE,
+    overlapped: ?*OVERLAPPED,
+) callconv(.winapi) c_int;
+extern "kernel32" fn GetOverlappedResult(
+    file: windows.HANDLE,
+    overlapped: *OVERLAPPED,
+    transferred: *windows.DWORD,
+    wait: c_int,
+) callconv(.winapi) c_int;
+extern "kernel32" fn ReadFile(
+    file: windows.HANDLE,
+    buffer: [*]u8,
+    bytes_to_read: windows.DWORD,
+    bytes_read: *windows.DWORD,
+    overlapped: ?*OVERLAPPED,
+) callconv(.winapi) c_int;
+extern "kernel32" fn WriteFile(
+    file: windows.HANDLE,
+    buffer: [*]const u8,
+    bytes_to_write: windows.DWORD,
+    bytes_written: *windows.DWORD,
+    overlapped: ?*OVERLAPPED,
+) callconv(.winapi) c_int;
+extern "kernel32" fn DisconnectNamedPipe(pipe: windows.HANDLE) callconv(.winapi) c_int;
 extern "kernel32" fn WaitNamedPipeW(
     name: windows.LPCWSTR,
     timeout_ms: windows.DWORD,
-) callconv(.winapi) windows.BOOL;
+) callconv(.winapi) c_int;
+extern "kernel32" fn SetEvent(event: windows.HANDLE) callconv(.winapi) c_int;
+extern "kernel32" fn WaitForSingleObject(
+    handle: windows.HANDLE,
+    milliseconds: windows.DWORD,
+) callconv(.winapi) windows.DWORD;
+extern "kernel32" fn WaitForMultipleObjectsEx(
+    count: windows.DWORD,
+    handles: [*]const windows.HANDLE,
+    wait_all: c_int,
+    milliseconds: windows.DWORD,
+    alertable: c_int,
+) callconv(.winapi) windows.DWORD;
 
 pub const Error = error{
     AccessDenied,
@@ -71,11 +159,11 @@ fn mapLastError(err: windows.Win32Error) Error {
 }
 
 fn completionEvent() Error!windows.HANDLE {
-    return kernel32.CreateEventExW(
+    return CreateEventExW(
         null,
         null,
-        windows.CREATE_EVENT_MANUAL_RESET,
-        windows.EVENT_MODIFY_STATE | windows.SYNCHRONIZE,
+        create_event_manual_reset,
+        event_modify_state | synchronize,
     ) orelse error.SystemResources;
 }
 
@@ -129,7 +217,7 @@ fn createPipe(
         1,
         &descriptor,
         null,
-    ) == windows.FALSE) {
+    ) == 0) {
         return error.AccessDenied;
     }
     defer _ = LocalFree(descriptor);
@@ -137,16 +225,19 @@ fn createPipe(
     var attributes = windows.SECURITY_ATTRIBUTES{
         .nLength = @sizeOf(windows.SECURITY_ATTRIBUTES),
         .lpSecurityDescriptor = descriptor,
-        .bInheritHandle = windows.FALSE,
+        .bInheritHandle = winBool(
+            @TypeOf(@as(windows.SECURITY_ATTRIBUTES, undefined).bInheritHandle),
+            false,
+        ),
     };
-    var open_mode: windows.DWORD = windows.PIPE_ACCESS_DUPLEX | windows.FILE_FLAG_OVERLAPPED;
+    var open_mode: windows.DWORD = pipe_access_duplex | file_flag_overlapped;
     if (first) open_mode |= first_pipe_instance;
-    const pipe = kernel32.CreateNamedPipeW(
+    const pipe = CreateNamedPipeW(
         name.ptr,
         open_mode,
-        windows.PIPE_TYPE_BYTE |
-            windows.PIPE_READMODE_BYTE |
-            windows.PIPE_WAIT |
+        pipe_type_byte |
+            pipe_readmode_byte |
+            pipe_wait |
             reject_remote_clients,
         255,
         io_buffer_size,
@@ -165,7 +256,21 @@ const ServerState = struct {
     name: [:0]u16,
     policy: local_ipc.AccessPolicy,
     pipe: ?windows.HANDLE,
+    closing_pipe: ?windows.HANDLE = null,
+    close_event: windows.HANDLE,
+    mutex: std.atomic.Value(u8) = .init(0),
+    accepts_in_flight: usize = 0,
     closed: bool = false,
+
+    fn lock(self: *ServerState) void {
+        while (self.mutex.cmpxchgStrong(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn unlock(self: *ServerState) void {
+        self.mutex.store(0, .release);
+    }
 };
 
 pub const Factory = struct {
@@ -197,6 +302,8 @@ pub fn listen(
     errdefer alloc.free(name);
     const pipe = try createPipe(alloc, name, policy, true);
     errdefer windows.CloseHandle(pipe);
+    const close_event = try completionEvent();
+    errdefer windows.CloseHandle(close_event);
 
     const state = try alloc.create(ServerState);
     errdefer alloc.destroy(state);
@@ -205,6 +312,7 @@ pub fn listen(
         .name = name,
         .policy = policy,
         .pipe = pipe,
+        .close_event = close_event,
     };
     return .{
         .handle = @intFromPtr(state),
@@ -266,16 +374,24 @@ pub fn connectWithDeadline(
             if (cancel.isCancelled()) return error.Cancelled;
         }
         if (deadline.remainingMs() == 0) return error.Timeout;
-        const pipe = kernel32.CreateFileW(
+        const pipe = CreateFileW(
             name.ptr,
-            windows.GENERIC_READ | windows.GENERIC_WRITE,
+            generic_read | generic_write,
             0,
             null,
-            windows.OPEN_EXISTING,
-            windows.FILE_FLAG_OVERLAPPED,
+            open_existing,
+            file_flag_overlapped,
             null,
         );
         if (pipe != windows.INVALID_HANDLE_VALUE) {
+            runtime_windows.verifyPipeServerIdentity(alloc, pipe) catch |err| {
+                windows.CloseHandle(pipe);
+                return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.AccessDenied => error.AccessDenied,
+                    else => error.Unexpected,
+                };
+            };
             return .{
                 .handle = handleValue(pipe),
                 .close_fn = closeHandle,
@@ -290,7 +406,7 @@ pub fn connectWithDeadline(
                     if (cancel.isCancelled()) return error.Cancelled;
                 }
                 const slice = @min(remaining, @as(u32, 50));
-                if (WaitNamedPipeW(name.ptr, slice) == windows.FALSE) {
+                if (WaitNamedPipeW(name.ptr, slice) == 0) {
                     switch (windows.GetLastError()) {
                         .SEM_TIMEOUT => {
                             if (deadline.remainingMs() == 0) return error.Timeout;
@@ -317,15 +433,26 @@ fn acceptWithDeadline(
     deadline: ?events_windows.Deadline,
     cancellation: ?*events_windows.Cancellation,
 ) Error!local_ipc.Connection {
-    if (state.closed) return error.AlreadyClosed;
-    const pipe = state.pipe orelse return error.AlreadyClosed;
+    state.lock();
+    if (state.closed) {
+        state.unlock();
+        return error.AlreadyClosed;
+    }
+    const pipe = state.pipe orelse {
+        state.unlock();
+        return error.AlreadyClosed;
+    };
+    state.accepts_in_flight += 1;
+    state.unlock();
+    defer finishAccept(state);
+
     const event = try completionEvent();
     defer windows.CloseHandle(event);
 
-    var overlapped = std.mem.zeroes(windows.OVERLAPPED);
+    var overlapped = std.mem.zeroes(OVERLAPPED);
     overlapped.hEvent = event;
     const connected = ConnectNamedPipe(pipe, &overlapped);
-    if (connected == windows.FALSE) {
+    if (connected == 0) {
         switch (windows.GetLastError()) {
             .PIPE_CONNECTED => {},
             .IO_PENDING => awaitCompletion(pipe, &overlapped, event, deadline, cancellation) catch |err| {
@@ -339,23 +466,69 @@ fn acceptWithDeadline(
         }
     }
 
+    state.lock();
+    if (state.closed) {
+        const close_owns_pipe = state.closing_pipe == pipe;
+        state.unlock();
+        if (!close_owns_pipe) {
+            _ = DisconnectNamedPipe(pipe);
+            windows.CloseHandle(pipe);
+        }
+        return error.AlreadyClosed;
+    }
     state.pipe = null;
+    state.unlock();
     const next_pipe = createPipe(state.allocator, state.name, state.policy, false) catch |err| {
         windows.CloseHandle(pipe);
         return err;
     };
+    state.lock();
+    if (state.closed) {
+        const close_owns_pipe = state.closing_pipe == pipe;
+        state.unlock();
+        windows.CloseHandle(next_pipe);
+        if (!close_owns_pipe) {
+            _ = DisconnectNamedPipe(pipe);
+            windows.CloseHandle(pipe);
+        }
+        return error.AlreadyClosed;
+    }
     state.pipe = next_pipe;
+    state.unlock();
     return .{
         .handle = handleValue(pipe),
         .close_fn = closeHandle,
     };
 }
 
+fn finishAccept(state: *ServerState) void {
+    state.lock();
+    state.accepts_in_flight -= 1;
+    if (state.closed and state.accepts_in_flight == 0) {
+        _ = SetEvent(state.close_event);
+    }
+    state.unlock();
+}
+
 fn resetPipe(state: *ServerState, pipe: windows.HANDLE) void {
-    if (state.pipe == pipe) state.pipe = null;
+    state.lock();
+    const replace = !state.closed and state.pipe == pipe;
+    if (replace) state.pipe = null;
+    state.unlock();
     _ = DisconnectNamedPipe(pipe);
     windows.CloseHandle(pipe);
-    state.pipe = createPipe(state.allocator, state.name, state.policy, false) catch null;
+    if (!replace) return;
+    const replacement = createPipe(state.allocator, state.name, state.policy, false) catch null;
+    if (replacement) |new_pipe| {
+        state.lock();
+        if (state.closed or state.pipe != null) {
+            state.unlock();
+            windows.CloseHandle(new_pipe);
+        } else {
+            state.pipe = new_pipe;
+            state.unlock();
+        }
+    }
 }
 
 pub fn acceptServerWithDeadline(
@@ -369,15 +542,15 @@ pub fn acceptServerWithDeadline(
 
 fn awaitCompletion(
     pipe: windows.HANDLE,
-    overlapped: *windows.OVERLAPPED,
+    overlapped: *OVERLAPPED,
     event: windows.HANDLE,
     deadline: ?events_windows.Deadline,
     cancellation: ?*events_windows.Cancellation,
 ) Error!void {
-    const timeout = if (deadline) |value| value.remainingMs() orelse 0 else windows.INFINITE;
+    const timeout = if (deadline) |value| value.remainingMs() orelse 0 else infinite;
     if (timeout == 0 and deadline != null) {
-        _ = kernel32.CancelIoEx(pipe, overlapped);
-        _ = windows.WaitForSingleObject(event, windows.INFINITE) catch {};
+        _ = CancelIoEx(pipe, overlapped);
+        _ = WaitForSingleObject(event, infinite);
         return error.Timeout;
     }
 
@@ -388,32 +561,31 @@ fn awaitCompletion(
         handles[1] = cancel.handle;
         count = 2;
     }
-    const result = windows.WaitForMultipleObjectsEx(
-        handles[0..count],
-        false,
+    const result = WaitForMultipleObjectsEx(
+        @intCast(count),
+        &handles,
+        0,
         timeout,
-        false,
-    ) catch |err| switch (err) {
-        error.WaitTimeOut => {
-            _ = kernel32.CancelIoEx(pipe, overlapped);
-            _ = windows.WaitForSingleObject(event, windows.INFINITE) catch {};
-            return error.Timeout;
-        },
-        error.WaitAbandoned => {
-            _ = kernel32.CancelIoEx(pipe, overlapped);
-            _ = windows.WaitForSingleObject(event, windows.INFINITE) catch {};
-            return error.Cancelled;
-        },
-        else => return error.SystemResources,
-    };
+        0,
+    );
+    if (result == 0x102) {
+        _ = CancelIoEx(pipe, overlapped);
+        _ = WaitForSingleObject(event, infinite);
+        return error.Timeout;
+    }
+    if (result == 0x80) {
+        _ = CancelIoEx(pipe, overlapped);
+        _ = WaitForSingleObject(event, infinite);
+        return error.Cancelled;
+    }
     if (result == 1 and count == 2) {
-        _ = kernel32.CancelIoEx(pipe, overlapped);
-        _ = windows.WaitForSingleObject(event, windows.INFINITE) catch {};
+        _ = CancelIoEx(pipe, overlapped);
+        _ = WaitForSingleObject(event, infinite);
         return error.Cancelled;
     }
 
     var transferred: windows.DWORD = 0;
-    if (kernel32.GetOverlappedResult(pipe, overlapped, &transferred, windows.FALSE) == windows.FALSE) {
+    if (GetOverlappedResult(pipe, overlapped, &transferred, 0) == 0) {
         return mapLastError(windows.GetLastError());
     }
 }
@@ -436,16 +608,16 @@ pub fn readWithDeadline(
     const pipe = handleFromValue(value);
     const event = try completionEvent();
     defer windows.CloseHandle(event);
-    var overlapped = std.mem.zeroes(windows.OVERLAPPED);
+    var overlapped = std.mem.zeroes(OVERLAPPED);
     overlapped.hEvent = event;
     var transferred: windows.DWORD = 0;
     const amount: windows.DWORD = @intCast(@min(buffer.len, std.math.maxInt(windows.DWORD)));
-    if (kernel32.ReadFile(pipe, buffer.ptr, amount, &transferred, &overlapped) == windows.FALSE) {
+    if (ReadFile(pipe, buffer.ptr, amount, &transferred, &overlapped) == 0) {
         switch (windows.GetLastError()) {
             .IO_PENDING => try awaitCompletion(pipe, &overlapped, event, deadline, cancellation),
             else => |err| return mapLastError(err),
         }
-        if (kernel32.GetOverlappedResult(pipe, &overlapped, &transferred, windows.FALSE) == windows.FALSE) {
+        if (GetOverlappedResult(pipe, &overlapped, &transferred, 0) == 0) {
             return mapLastError(windows.GetLastError());
         }
     }
@@ -470,16 +642,16 @@ pub fn writeWithDeadline(
     const pipe = handleFromValue(value);
     const event = try completionEvent();
     defer windows.CloseHandle(event);
-    var overlapped = std.mem.zeroes(windows.OVERLAPPED);
+    var overlapped = std.mem.zeroes(OVERLAPPED);
     overlapped.hEvent = event;
     var transferred: windows.DWORD = 0;
     const amount: windows.DWORD = @intCast(@min(bytes.len, std.math.maxInt(windows.DWORD)));
-    if (kernel32.WriteFile(pipe, bytes.ptr, amount, &transferred, &overlapped) == windows.FALSE) {
+    if (WriteFile(pipe, bytes.ptr, amount, &transferred, &overlapped) == 0) {
         switch (windows.GetLastError()) {
             .IO_PENDING => try awaitCompletion(pipe, &overlapped, event, deadline, cancellation),
             else => |err| return mapLastError(err),
         }
-        if (kernel32.GetOverlappedResult(pipe, &overlapped, &transferred, windows.FALSE) == windows.FALSE) {
+        if (GetOverlappedResult(pipe, &overlapped, &transferred, 0) == 0) {
             return mapLastError(windows.GetLastError());
         }
     }
@@ -519,18 +691,34 @@ pub fn writeAll(
 
 fn closeHandle(value: local_ipc.Handle) void {
     const handle = handleFromValue(value);
-    _ = kernel32.CancelIoEx(handle, null);
+    _ = CancelIoEx(handle, null);
     windows.CloseHandle(handle);
 }
 
 fn closeServerThunk(value: local_ipc.Handle) void {
     const state: *ServerState = @ptrFromInt(value);
-    if (state.closed) return;
-    state.closed = true;
-    if (state.pipe) |pipe| {
-        _ = kernel32.CancelIoEx(pipe, null);
-        windows.CloseHandle(pipe);
+    state.lock();
+    if (state.closed) {
+        state.unlock();
+        return;
     }
+    state.closed = true;
+    const pipe = state.pipe;
+    state.closing_pipe = pipe;
+    state.pipe = null;
+    const accepts_in_flight = state.accepts_in_flight;
+    state.unlock();
+
+    if (pipe) |handle| {
+        _ = CancelIoEx(handle, null);
+    }
+    if (accepts_in_flight != 0) {
+        _ = WaitForSingleObject(state.close_event, infinite);
+    }
+    if (pipe) |handle| {
+        windows.CloseHandle(handle);
+    }
+    windows.CloseHandle(state.close_event);
     state.allocator.free(state.name);
     state.allocator.destroy(state);
 }

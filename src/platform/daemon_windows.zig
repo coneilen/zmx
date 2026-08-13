@@ -47,7 +47,7 @@ pub const Lease = struct {
     handle: windows.HANDLE,
 
     pub fn acquire(name: [:0]const u16) !Lease {
-        const handle = CreateMutexW(null, windows.TRUE, name.ptr) orelse
+        const handle = CreateMutexW(null, 1, name.ptr) orelse
             return error.SystemResources;
         if (windows.GetLastError() == .ALREADY_EXISTS) {
             windows.CloseHandle(handle);

@@ -9,15 +9,51 @@ comptime {
 const windows = std.os.windows;
 const kernel32 = windows.kernel32;
 
-extern "advapi32" fn GetUserNameW(
-    buffer: [*]u16,
-    size: *windows.DWORD,
-) callconv(.winapi) windows.BOOL;
+extern "advapi32" fn OpenProcessToken(
+    process: windows.HANDLE,
+    desired_access: windows.DWORD,
+    token: *windows.HANDLE,
+) callconv(.winapi) c_int;
+extern "advapi32" fn GetTokenInformation(
+    token: windows.HANDLE,
+    information_class: windows.DWORD,
+    information: ?*anyopaque,
+    information_length: windows.DWORD,
+    return_length: *windows.DWORD,
+) callconv(.winapi) c_int;
+extern "advapi32" fn ConvertSidToStringSidW(
+    sid: *anyopaque,
+    string_sid: *?[*:0]u16,
+) callconv(.winapi) c_int;
+extern "kernel32" fn OpenProcess(
+    desired_access: windows.DWORD,
+    inherit_handle: windows.BOOL,
+    process_id: windows.DWORD,
+) callconv(.winapi) ?windows.HANDLE;
+extern "kernel32" fn GetCurrentProcess() callconv(.winapi) windows.HANDLE;
+extern "kernel32" fn GetNamedPipeServerProcessId(
+    pipe: windows.HANDLE,
+    process_id: *windows.DWORD,
+) callconv(.winapi) c_int;
+extern "kernel32" fn LocalFree(memory: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 
-const Error = runtime.PathError || error{
+pub const Error = runtime.PathError || error{
     AccessDenied,
     Unexpected,
 } || std.mem.Allocator.Error;
+
+const token_query: windows.DWORD = 0x0008;
+const token_user_information: windows.DWORD = 1;
+const process_query_limited_information: windows.DWORD = 0x1000;
+
+const SidAndAttributes = extern struct {
+    sid: *anyopaque,
+    attributes: windows.DWORD,
+};
+
+const TokenUser = extern struct {
+    user: SidAndAttributes,
+};
 
 /// Named pipes are not filesystem objects.  The namespace is nevertheless
 /// scoped by the current Windows account and every server pipe is created with
@@ -39,33 +75,64 @@ pub fn validateSessionName(name: []const u8) runtime.PathError!void {
     }
 }
 
-fn username(alloc: std.mem.Allocator) Error![]u8 {
-    var utf16: [256]u16 = undefined;
-    var len: windows.DWORD = utf16.len;
-    if (GetUserNameW(&utf16, &len) == windows.FALSE) {
-        return error.Unexpected;
+fn sidForToken(alloc: std.mem.Allocator, token: windows.HANDLE) Error![]u8 {
+    var needed: windows.DWORD = 0;
+    _ = GetTokenInformation(token, token_user_information, null, 0, &needed);
+    if (needed == 0) return error.AccessDenied;
+
+    const storage = try alloc.alignedAlloc(
+        u8,
+        std.mem.Alignment.fromByteUnits(@alignOf(TokenUser)),
+        needed,
+    );
+    defer alloc.free(storage);
+    if (GetTokenInformation(
+        token,
+        token_user_information,
+        storage.ptr,
+        needed,
+        &needed,
+    ) == 0) {
+        return error.AccessDenied;
     }
-    // GetUserNameW includes the terminating NUL in the returned length.
-    const used: usize = if (len > 0) @as(usize, len - 1) else 0;
-    const utf8 = std.unicode.utf16LeToUtf8Alloc(alloc, utf16[0..used]) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.Unexpected,
+
+    const token_user: *const TokenUser = @ptrCast(@alignCast(storage.ptr));
+    var sid_string: ?[*:0]u16 = null;
+    if (ConvertSidToStringSidW(token_user.user.sid, &sid_string) == 0) {
+        return error.AccessDenied;
+    }
+    defer _ = LocalFree(sid_string);
+
+    return std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.span(sid_string.?)) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.Unexpected,
     };
-    if (utf8.len == 0) {
-        alloc.free(utf8);
-        return error.Unexpected;
+}
+
+pub fn currentUserSid(alloc: std.mem.Allocator) Error![]u8 {
+    var token: windows.HANDLE = undefined;
+    if (OpenProcessToken(GetCurrentProcess(), token_query, &token) == 0) {
+        return error.AccessDenied;
     }
-    return utf8;
+    defer windows.CloseHandle(token);
+    return sidForToken(alloc, token);
+}
+
+pub fn socketDirForSid(alloc: std.mem.Allocator, sid: []const u8) Error![]u8 {
+    if (sid.len == 0 or std.mem.indexOfScalar(u8, sid, '\\') != null) {
+        return error.InvalidSessionName;
+    }
+    return std.fmt.allocPrint(alloc, "{s}-{s}", .{ pipe_prefix, sid });
 }
 
 pub fn socketDir(alloc: std.mem.Allocator) Error![]u8 {
-    const user = try username(alloc);
-    defer alloc.free(user);
-    return std.fmt.allocPrint(alloc, "{s}-{s}", .{ pipe_prefix, user });
+    const sid = try currentUserSid(alloc);
+    defer alloc.free(sid);
+    return socketDirForSid(alloc, sid);
 }
 
 pub fn logDir(alloc: std.mem.Allocator) Error![]u8 {
-    if (std.process.getEnvVarOwned(alloc, "LOCALAPPDATA")) |base| {
+    if ((std.process.Environ{ .block = .global }).getAlloc(alloc, "LOCALAPPDATA")) |base| {
         defer alloc.free(base);
         return std.fmt.allocPrint(alloc, "{s}\\zmx\\logs", .{base});
     } else |_| {
@@ -87,6 +154,31 @@ pub fn endpointPath(
 /// server/client handle removes the endpoint, so stale-file cleanup is both
 /// unnecessary and unsafe on Windows.
 pub fn cleanupStaleEndpoint(_: []const u8) void {}
+
+pub fn verifyPipeServerIdentity(
+    alloc: std.mem.Allocator,
+    pipe: windows.HANDLE,
+) Error!void {
+    var process_id: windows.DWORD = 0;
+    if (GetNamedPipeServerProcessId(pipe, &process_id) == 0) {
+        return error.AccessDenied;
+    }
+    const process = OpenProcess(process_query_limited_information, 0, process_id) orelse
+        return error.AccessDenied;
+    defer windows.CloseHandle(process);
+
+    var token: windows.HANDLE = undefined;
+    if (OpenProcessToken(process, token_query, &token) == 0) {
+        return error.AccessDenied;
+    }
+    defer windows.CloseHandle(token);
+
+    const server_sid = try sidForToken(alloc, token);
+    defer alloc.free(server_sid);
+    const current_sid = try currentUserSid(alloc);
+    defer alloc.free(current_sid);
+    if (!std.mem.eql(u8, server_sid, current_sid)) return error.AccessDenied;
+}
 
 pub fn joinEndpointPath(
     alloc: std.mem.Allocator,
@@ -148,4 +240,13 @@ test "Windows runtime counts UTF-16 endpoint units" {
         error.NameTooLong,
         joinEndpointPath(alloc, "\\\\.\\pipe\\zmx-user", "abcdef", 24),
     );
+}
+
+test "Windows pipe namespaces distinguish users with the same username" {
+    const alloc = std.testing.allocator;
+    const first = try socketDirForSid(alloc, "S-1-5-21-100");
+    defer alloc.free(first);
+    const second = try socketDirForSid(alloc, "S-1-5-21-200");
+    defer alloc.free(second);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
 }

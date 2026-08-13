@@ -1,6 +1,6 @@
 const std = @import("std");
 const lib_posix = @import("posix.zig");
-const Cfg = @import("cfg.zig");
+const Cfg = @import("cfg.zig").Cfg;
 const socket = @import("socket.zig");
 const ipc = @import("ipc.zig");
 const assert = std.debug.assert;

@@ -31,20 +31,22 @@ pub fn build(b: *std.Build) void {
     });
     exe_mod.addOptions("build_options", options);
 
-    const dep = b.dependency("ghostty", .{
-        .target = target,
-        .optimize = optimize,
-        .@"emit-lib-vt" = true,
-        // Not redundant: in lib-vt mode emit-xcframework defaults to "xcodebuild
-        // on PATH" (true even via the CLT stub), which pulls in the iOS SDK at
-        // configure time and breaks builds without full Xcode.
-        .@"emit-xcframework" = false,
-        .@"emit-macos-app" = false,
-    });
-    exe_mod.addImport(
-        "ghostty-vt",
-        dep.module("ghostty-vt"),
-    );
+    if (target.result.os.tag != .windows) {
+        const dep = b.dependency("ghostty", .{
+            .target = target,
+            .optimize = optimize,
+            .@"emit-lib-vt" = true,
+            // Not redundant: in lib-vt mode emit-xcframework defaults to "xcodebuild
+            // on PATH" (true even via the CLT stub), which pulls in the iOS SDK at
+            // configure time and breaks builds without full Xcode.
+            .@"emit-xcframework" = false,
+            .@"emit-macos-app" = false,
+        });
+        exe_mod.addImport(
+            "ghostty-vt",
+            dep.module("ghostty-vt"),
+        );
+    }
 
     // Run
     {
@@ -72,17 +74,19 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         });
-        const test_dep = b.dependency("ghostty", .{
-            .target = target,
-            .optimize = optimize,
-            .@"emit-lib-vt" = true,
-            .@"emit-xcframework" = false,
-            .@"emit-macos-app" = false,
-        });
-        test_module.addImport(
-            "ghostty-vt",
-            test_dep.module("ghostty-vt"),
-        );
+        if (target.result.os.tag != .windows) {
+            const test_dep = b.dependency("ghostty", .{
+                .target = target,
+                .optimize = optimize,
+                .@"emit-lib-vt" = true,
+                .@"emit-xcframework" = false,
+                .@"emit-macos-app" = false,
+            });
+            test_module.addImport(
+                "ghostty-vt",
+                test_dep.module("ghostty-vt"),
+            );
+        }
         const exe_unit_tests = b.addTest(.{
             .root_module = test_module,
             // .use_llvm = true,

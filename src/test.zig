@@ -8,13 +8,16 @@ comptime {
         _ = @import("platform/runtime_windows.zig");
     } else {
         _ = @import("main.zig");
+        _ = @import("main_posix.zig");
         _ = @import("util.zig");
         _ = @import("socket.zig");
+        _ = @import("socket_posix.zig");
         _ = @import("ipc.zig");
         _ = @import("label.zig");
         _ = @import("signal.zig");
         _ = @import("loop.zig");
         _ = @import("cfg.zig");
+        _ = @import("cfg_posix.zig");
         _ = @import("daemonize.zig");
         _ = @import("platform.zig");
         _ = @import("platform/daemon.zig");

@@ -8,15 +8,36 @@ comptime {
 
 const windows = std.os.windows;
 const kernel32 = windows.kernel32;
+const create_event_manual_reset: windows.DWORD = 1;
+const event_modify_state: windows.DWORD = 2;
+const synchronize: windows.DWORD = 0x0010_0000;
+const wait_object_0: windows.DWORD = 0;
+const infinite: windows.DWORD = 0xffff_ffff;
 
-extern "kernel32" fn SetEvent(handle: windows.HANDLE) callconv(.winapi) windows.BOOL;
-extern "kernel32" fn ResetEvent(handle: windows.HANDLE) callconv(.winapi) windows.BOOL;
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+extern "kernel32" fn WaitForSingleObject(
+    handle: windows.HANDLE,
+    milliseconds: windows.DWORD,
+) callconv(.winapi) windows.DWORD;
+
+fn monotonicNs() i128 {
+    return @as(i128, @intCast(GetTickCount64())) * std.time.ns_per_ms;
+}
+
+extern "kernel32" fn SetEvent(handle: windows.HANDLE) callconv(.winapi) c_int;
+extern "kernel32" fn ResetEvent(handle: windows.HANDLE) callconv(.winapi) c_int;
+extern "kernel32" fn CreateEventExW(
+    attributes: ?*windows.SECURITY_ATTRIBUTES,
+    name: ?windows.LPCWSTR,
+    flags: windows.DWORD,
+    desired_access: windows.DWORD,
+) callconv(.winapi) ?windows.HANDLE;
 
 pub const Deadline = struct {
     end_ns: i128,
 
     pub fn afterMs(milliseconds: u64) Deadline {
-        const now = std.time.nanoTimestamp();
+        const now = monotonicNs();
         const delta = @as(i128, @intCast(milliseconds)) * std.time.ns_per_ms;
         return .{ .end_ns = if (std.math.maxInt(i128) - now < delta)
             std.math.maxInt(i128)
@@ -25,7 +46,7 @@ pub const Deadline = struct {
     }
 
     pub fn remainingMs(self: Deadline) ?u32 {
-        const remaining = self.end_ns - std.time.nanoTimestamp();
+        const remaining = self.end_ns - monotonicNs();
         if (remaining <= 0) return 0;
         const ms = @divTrunc(remaining + std.time.ns_per_ms - 1, std.time.ns_per_ms);
         return @intCast(@min(ms, @as(i128, std.math.maxInt(u32))));
@@ -36,11 +57,11 @@ pub const Cancellation = struct {
     handle: windows.HANDLE,
 
     pub fn init() !Cancellation {
-        const handle = kernel32.CreateEventExW(
+        const handle = CreateEventExW(
             null,
             null,
-            windows.CREATE_EVENT_MANUAL_RESET,
-            windows.EVENT_MODIFY_STATE | windows.SYNCHRONIZE,
+            create_event_manual_reset,
+            event_modify_state | synchronize,
         ) orelse return error.SystemResources;
         return .{ .handle = handle };
     }
@@ -51,15 +72,15 @@ pub const Cancellation = struct {
     }
 
     pub fn cancel(self: Cancellation) !void {
-        if (SetEvent(self.handle) == windows.FALSE) return error.Unexpected;
+        if (SetEvent(self.handle) == 0) return error.Unexpected;
     }
 
     pub fn reset(self: Cancellation) !void {
-        if (ResetEvent(self.handle) == windows.FALSE) return error.Unexpected;
+        if (ResetEvent(self.handle) == 0) return error.Unexpected;
     }
 
     pub fn isCancelled(self: Cancellation) bool {
-        return kernel32.WaitForSingleObject(self.handle, 0) == windows.WAIT_OBJECT_0;
+        return WaitForSingleObject(self.handle, 0) == wait_object_0;
     }
 
     pub fn contract(self: *Cancellation) events.Cancellation {
@@ -100,7 +121,7 @@ pub const Waiter = struct {
             handles[watch_count] = cancel.handle;
         }
         const handle_count = watch_count + @intFromBool(self.cancellation != null);
-        const timeout = timeout_ms orelse windows.INFINITE;
+        const timeout = timeout_ms orelse infinite;
         const result = windows.WaitForMultipleObjectsEx(
             handles[0..handle_count],
             false,
