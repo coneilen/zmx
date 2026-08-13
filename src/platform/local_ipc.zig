@@ -50,6 +50,8 @@ pub const Client = struct {
 };
 
 pub const AccessPolicy = struct {
+    /// Windows adapters translate this to an owner-only DACL. POSIX adapters
+    /// apply the mode fields to the runtime directory/socket.
     directory_mode: u32 = 0o750,
     endpoint_mode: u32 = 0o600,
     owner_only: bool = true,

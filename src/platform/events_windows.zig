@@ -1,0 +1,172 @@
+const builtin = @import("builtin");
+const std = @import("std");
+const events = @import("events.zig");
+
+comptime {
+    if (builtin.os.tag != .windows) @compileError("events_windows requires a Windows target");
+}
+
+const windows = std.os.windows;
+const kernel32 = windows.kernel32;
+
+extern "kernel32" fn SetEvent(handle: windows.HANDLE) callconv(.winapi) windows.BOOL;
+extern "kernel32" fn ResetEvent(handle: windows.HANDLE) callconv(.winapi) windows.BOOL;
+
+pub const Deadline = struct {
+    end_ns: i128,
+
+    pub fn afterMs(milliseconds: u64) Deadline {
+        const now = std.time.nanoTimestamp();
+        const delta = @as(i128, @intCast(milliseconds)) * std.time.ns_per_ms;
+        return .{ .end_ns = if (std.math.maxInt(i128) - now < delta)
+            std.math.maxInt(i128)
+        else
+            now + delta };
+    }
+
+    pub fn remainingMs(self: Deadline) ?u32 {
+        const remaining = self.end_ns - std.time.nanoTimestamp();
+        if (remaining <= 0) return 0;
+        const ms = @divTrunc(remaining + std.time.ns_per_ms - 1, std.time.ns_per_ms);
+        return @intCast(@min(ms, @as(i128, std.math.maxInt(u32))));
+    }
+};
+
+pub const Cancellation = struct {
+    handle: windows.HANDLE,
+
+    pub fn init() !Cancellation {
+        const handle = kernel32.CreateEventExW(
+            null,
+            null,
+            windows.CREATE_EVENT_MANUAL_RESET,
+            windows.EVENT_MODIFY_STATE | windows.SYNCHRONIZE,
+        ) orelse return error.SystemResources;
+        return .{ .handle = handle };
+    }
+
+    pub fn deinit(self: *Cancellation) void {
+        windows.CloseHandle(self.handle);
+        self.handle = undefined;
+    }
+
+    pub fn cancel(self: Cancellation) !void {
+        if (SetEvent(self.handle) == windows.FALSE) return error.Unexpected;
+    }
+
+    pub fn reset(self: Cancellation) !void {
+        if (ResetEvent(self.handle) == windows.FALSE) return error.Unexpected;
+    }
+
+    pub fn isCancelled(self: Cancellation) bool {
+        return kernel32.WaitForSingleObject(self.handle, 0) == windows.WAIT_OBJECT_0;
+    }
+
+    pub fn contract(self: *Cancellation) events.Cancellation {
+        return .{
+            .context = self,
+            .is_cancelled_fn = isCancelledThunk,
+            .reset_fn = resetThunk,
+        };
+    }
+
+    fn isCancelledThunk(context: *anyopaque) bool {
+        const self: *Cancellation = @ptrCast(@alignCast(context));
+        return self.isCancelled();
+    }
+
+    fn resetThunk(context: *anyopaque) void {
+        const self: *Cancellation = @ptrCast(@alignCast(context));
+        self.reset() catch {};
+    }
+};
+
+pub const Waiter = struct {
+    cancellation: ?*Cancellation = null,
+
+    pub fn wait(self: *Waiter, watches: []const events.Watch, timeout_ms: ?u32) events.Error!events.Result {
+        if (watches.len == 0) return error.InvalidHandle;
+        if (watches.len > windows.MAXIMUM_WAIT_OBJECTS or
+            (self.cancellation != null and watches.len == windows.MAXIMUM_WAIT_OBJECTS))
+            return error.SystemResources;
+
+        var handles: [windows.MAXIMUM_WAIT_OBJECTS]windows.HANDLE = undefined;
+        for (watches, 0..) |watch, i| {
+            if (watch.handle == 0) return error.InvalidHandle;
+            handles[i] = @ptrFromInt(watch.handle);
+        }
+        const watch_count = watches.len;
+        if (self.cancellation) |cancel| {
+            handles[watch_count] = cancel.handle;
+        }
+        const handle_count = watch_count + @intFromBool(self.cancellation != null);
+        const timeout = timeout_ms orelse windows.INFINITE;
+        const result = windows.WaitForMultipleObjectsEx(
+            handles[0..handle_count],
+            false,
+            timeout,
+            false,
+        ) catch |err| switch (err) {
+            error.WaitTimeOut => return error.Timeout,
+            error.WaitAbandoned => return error.Cancelled,
+            else => return error.SystemResources,
+        };
+        if (result == watch_count and self.cancellation != null) return error.Cancelled;
+        if (result >= watch_count) return error.InvalidHandle;
+        return .{
+            .index = result,
+            .ready = .{ .read = true },
+        };
+    }
+
+    pub fn waiter(self: *Waiter) events.Waiter {
+        return .{
+            .context = self,
+            .wait_fn = waitThunk,
+        };
+    }
+
+    fn waitThunk(
+        context: *anyopaque,
+        watches: []const events.Watch,
+        timeout_ms: ?u32,
+    ) events.Error!events.Result {
+        const self: *Waiter = @ptrCast(@alignCast(context));
+        return self.wait(watches, timeout_ms);
+    }
+};
+
+pub fn waitUntil(
+    waiter: *Waiter,
+    watches: []const events.Watch,
+    deadline: Deadline,
+) events.Error!events.Result {
+    return waiter.wait(watches, deadline.remainingMs());
+}
+
+test "Windows deadlines are cumulative and expire at zero" {
+    const deadline = Deadline.afterMs(1);
+    try std.testing.expect((deadline.remainingMs() orelse 0) <= 1);
+    std.Thread.sleep(2 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(?u32, 0), deadline.remainingMs());
+}
+
+test "Windows cancellation wakes a wait without consuming the watched event" {
+    var watched = try Cancellation.init();
+    defer watched.deinit();
+    var cancelled = try Cancellation.init();
+    defer cancelled.deinit();
+
+    var waiter = Waiter{ .cancellation = &cancelled };
+    const watches = [_]events.Watch{.{
+        .handle = @intFromPtr(watched.handle),
+        .interest = .{ .read = true },
+    }};
+    try cancelled.cancel();
+    try std.testing.expectError(error.Cancelled, waiter.wait(&watches, 1000));
+    try cancelled.reset();
+    try watched.cancel();
+    const result = try waiter.wait(&watches, 1000);
+    try std.testing.expectEqual(@as(usize, 0), result.index);
+    try std.testing.expect(result.ready.read);
+}
