@@ -9,6 +9,13 @@ comptime {
 const windows = std.os.windows;
 const kernel32 = windows.kernel32;
 
+fn winBool(comptime T: type, value: bool) T {
+    return switch (@typeInfo(T)) {
+        .@"enum" => @enumFromInt(@intFromBool(value)),
+        else => @intFromBool(value),
+    };
+}
+
 extern "advapi32" fn OpenProcessToken(
     process: windows.HANDLE,
     desired_access: windows.DWORD,
@@ -163,7 +170,11 @@ pub fn verifyPipeServerIdentity(
     if (GetNamedPipeServerProcessId(pipe, &process_id) == 0) {
         return error.AccessDenied;
     }
-    const process = OpenProcess(process_query_limited_information, 0, process_id) orelse
+    const process = OpenProcess(
+        process_query_limited_information,
+        winBool(windows.BOOL, false),
+        process_id,
+    ) orelse
         return error.AccessDenied;
     defer windows.CloseHandle(process);
 

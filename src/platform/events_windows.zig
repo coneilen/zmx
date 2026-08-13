@@ -13,11 +13,22 @@ const event_modify_state: windows.DWORD = 2;
 const synchronize: windows.DWORD = 0x0010_0000;
 const wait_object_0: windows.DWORD = 0;
 const infinite: windows.DWORD = 0xffff_ffff;
+const wait_timeout: windows.DWORD = 0x102;
+const wait_abandoned_0: windows.DWORD = 0x80;
+const max_wait_objects: usize = 64;
 
 extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+extern "kernel32" fn Sleep(milliseconds: windows.DWORD) callconv(.winapi) void;
 extern "kernel32" fn WaitForSingleObject(
     handle: windows.HANDLE,
     milliseconds: windows.DWORD,
+) callconv(.winapi) windows.DWORD;
+extern "kernel32" fn WaitForMultipleObjectsEx(
+    count: windows.DWORD,
+    handles: [*]const windows.HANDLE,
+    wait_all: c_int,
+    milliseconds: windows.DWORD,
+    alertable: c_int,
 ) callconv(.winapi) windows.DWORD;
 
 fn monotonicNs() i128 {
@@ -107,11 +118,11 @@ pub const Waiter = struct {
 
     pub fn wait(self: *Waiter, watches: []const events.Watch, timeout_ms: ?u32) events.Error!events.Result {
         if (watches.len == 0) return error.InvalidHandle;
-        if (watches.len > windows.MAXIMUM_WAIT_OBJECTS or
-            (self.cancellation != null and watches.len == windows.MAXIMUM_WAIT_OBJECTS))
+        if (watches.len > max_wait_objects or
+            (self.cancellation != null and watches.len == max_wait_objects))
             return error.SystemResources;
 
-        var handles: [windows.MAXIMUM_WAIT_OBJECTS]windows.HANDLE = undefined;
+        var handles: [max_wait_objects]windows.HANDLE = undefined;
         for (watches, 0..) |watch, i| {
             if (watch.handle == 0) return error.InvalidHandle;
             handles[i] = @ptrFromInt(watch.handle);
@@ -122,20 +133,21 @@ pub const Waiter = struct {
         }
         const handle_count = watch_count + @intFromBool(self.cancellation != null);
         const timeout = timeout_ms orelse infinite;
-        const result = windows.WaitForMultipleObjectsEx(
-            handles[0..handle_count],
-            false,
+        const result = WaitForMultipleObjectsEx(
+            @intCast(handle_count),
+            &handles,
+            0,
             timeout,
-            false,
-        ) catch |err| switch (err) {
-            error.WaitTimeOut => return error.Timeout,
-            error.WaitAbandoned => return error.Cancelled,
-            else => return error.SystemResources,
-        };
+            0,
+        );
+        if (result == wait_timeout) return error.Timeout;
+        if (result >= wait_abandoned_0 and result < wait_abandoned_0 + @as(windows.DWORD, @intCast(handle_count))) {
+            return error.Cancelled;
+        }
         if (result == watch_count and self.cancellation != null) return error.Cancelled;
-        if (result >= watch_count) return error.InvalidHandle;
+        if (result >= @as(windows.DWORD, @intCast(watch_count))) return error.InvalidHandle;
         return .{
-            .index = result,
+            .index = @intCast(result),
             .ready = .{ .read = true },
         };
     }
@@ -168,7 +180,7 @@ pub fn waitUntil(
 test "Windows deadlines are cumulative and expire at zero" {
     const deadline = Deadline.afterMs(1);
     try std.testing.expect((deadline.remainingMs() orelse 0) <= 1);
-    std.Thread.sleep(2 * std.time.ns_per_ms);
+    Sleep(2);
     try std.testing.expectEqual(@as(?u32, 0), deadline.remainingMs());
 }
 
