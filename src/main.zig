@@ -6,6 +6,8 @@ const implementation = if (builtin.os.tag == .windows)
 else
     @import("main_posix.zig");
 
+pub const std_options: std.Options = implementation.std_options;
+
 pub fn main(init: std.process.Init) !void {
     return implementation.main(init);
 }

@@ -48,3 +48,8 @@ pub const runtime_native = if (builtin.os.tag == .windows)
 else
     @import("platform/runtime_posix.zig");
 pub const shell = @import("platform/shell.zig");
+pub const session_wire = @import("platform/session_wire.zig");
+pub const session_native = if (builtin.os.tag == .windows)
+    @import("platform/session_windows.zig")
+else
+    @import("platform/session_wire.zig");

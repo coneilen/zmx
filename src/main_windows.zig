@@ -1,24 +1,22 @@
 const std = @import("std");
 const build_options = @import("build_options");
+const log = @import("log.zig");
 const Cfg = @import("cfg.zig").Cfg;
 const socket = @import("socket.zig");
 const runtime_windows = @import("platform/runtime_windows.zig");
 const local_ipc = @import("platform/local_ipc.zig");
 const local_ipc_windows = @import("platform/local_ipc_windows.zig");
+const session_windows = @import("platform/session_windows.zig");
+const wire = @import("platform/session_wire.zig");
 
-const WireTag = enum(u8) {
-    Output = 1,
-    Ack = 10,
-    Send = 18,
-    _,
+const WireTag = wire.Tag;
+const WireHeader = wire.Header;
+const max_frame_len: usize = wire.MAX_FRAME_LEN;
+
+pub const std_options: std.Options = .{
+    .logFn = log.zmxLogFn,
+    .log_level = .debug,
 };
-
-const WireHeader = packed struct {
-    tag: WireTag,
-    len: u32,
-};
-
-const max_frame_len: usize = 256 * 1024 * 1024;
 
 comptime {
     if (@sizeOf(WireHeader) != 8) @compileError("Windows IPC header must match ipc.Header");
@@ -34,6 +32,38 @@ fn wireTagForCommand(command: []const u8) !WireTag {
     if (std.mem.eql(u8, command, "send") or std.mem.eql(u8, command, "s")) {
         return .Send;
     }
+    if (std.mem.eql(u8, command, "write") or std.mem.eql(u8, command, "w")) {
+        return .Write;
+    }
+    if (std.mem.eql(u8, command, "detach") or std.mem.eql(u8, command, "d")) {
+        return .Detach;
+    }
+    if (std.mem.eql(u8, command, "detach-all") or std.mem.eql(u8, command, "da")) {
+        return .DetachAll;
+    }
+    if (std.mem.eql(u8, command, "kill") or std.mem.eql(u8, command, "k")) {
+        return .Kill;
+    }
+    if (std.mem.eql(u8, command, "history") or std.mem.eql(u8, command, "hi")) {
+        return .History;
+    }
+    if (std.mem.eql(u8, command, "get") or std.mem.eql(u8, command, "g")) {
+        return .LabelGet;
+    }
+    if (std.mem.eql(u8, command, "set")) {
+        return .LabelSet;
+    }
+    if (std.mem.eql(u8, command, "clear")) {
+        return .LabelClear;
+    }
+    if (std.mem.eql(u8, command, "info") or
+        std.mem.eql(u8, command, "i") or
+        std.mem.eql(u8, command, "list") or
+        std.mem.eql(u8, command, "l") or
+        std.mem.eql(u8, command, "ls"))
+    {
+        return .Info;
+    }
     return error.UnsupportedCommand;
 }
 
@@ -41,9 +71,7 @@ fn sendFrame(connection: local_ipc.Connection, tag: WireTag, payload: []const u8
     if (payload.len > max_frame_len or payload.len > std.math.maxInt(u32)) {
         return error.FrameTooLarge;
     }
-    const header = WireHeader{ .tag = tag, .len = @intCast(payload.len) };
-    try connection.writeAll(std.mem.asBytes(&header));
-    try connection.writeAll(payload);
+    try wire.writeFrame(connection, tag, payload);
 }
 
 fn sendCommand(
@@ -60,7 +88,11 @@ fn sendCommand(
         if (index != 0) try payload.append(alloc, ' ');
         try payload.appendSlice(alloc, part);
     }
-    if (payload.items.len == 0) return error.TextRequired;
+    const requires_payload = switch (tag) {
+        .Output, .Send, .Write, .LabelSet => true,
+        else => false,
+    };
+    if (requires_payload and payload.items.len == 0) return error.TextRequired;
 
     const endpoint = try socket.getSocketPathWithIo(io, alloc, cfg.socket_dir, session_name);
     defer alloc.free(endpoint);
@@ -80,9 +112,43 @@ fn unsupported(io: std.Io, command: []const u8) !void {
     return error.UnsupportedCommand;
 }
 
-/// Windows production entry point. Transport framing and send/print dispatch
-/// are native here; ConPTY-dependent commands fail explicitly until the
-/// sibling-owned process adapter supplies its frozen session callbacks.
+fn runSession(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    session_name: []const u8,
+    command: ?[]const []const u8,
+) !void {
+    try session_windows.host(
+        .{
+            .io = io,
+            .alloc = alloc,
+            .session_name = session_name,
+            .shell = "cmd.exe",
+            .task_mode = command != null,
+            .command = command,
+        },
+        session_windows.pendingProvider(),
+    );
+}
+
+fn attachSession(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    session_name: []const u8,
+) !void {
+    return session_windows.attach(
+        .{
+            .io = io,
+            .alloc = alloc,
+            .session_name = session_name,
+        },
+        session_windows.pendingProvider(),
+    );
+}
+
+/// Windows production entry point. Session creation and attach use the
+/// frozen IPC server/client contract and the sibling-owned ConPTY provider
+/// boundary. Commands that do not need a PTY still use the same wire tags.
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
@@ -109,18 +175,33 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (std.mem.eql(u8, command, "send") or std.mem.eql(u8, command, "s") or
-        std.mem.eql(u8, command, "print") or std.mem.eql(u8, command, "p"))
-    {
+    if (std.mem.eql(u8, command, "run") or std.mem.eql(u8, command, "r")) {
+        const session_name = args.next() orelse return error.SessionNameRequired;
+        try runtime_windows.validateSessionName(session_name);
+        var command_args: std.ArrayList([]const u8) = .empty;
+        defer command_args.deinit(gpa);
+        while (args.next()) |part| try command_args.append(gpa, part);
+        const command_slice: ?[]const []const u8 =
+            if (command_args.items.len == 0) null else command_args.items;
+        return runSession(io, gpa, session_name, command_slice);
+    }
+
+    if (std.mem.eql(u8, command, "attach") or std.mem.eql(u8, command, "a")) {
+        const session_name = args.next() orelse return error.SessionNameRequired;
+        try runtime_windows.validateSessionName(session_name);
+        return attachSession(io, gpa, session_name);
+    }
+
+    if (wireTagForCommand(command)) |tag| {
         const session_name = args.next() orelse return error.SessionNameRequired;
         try runtime_windows.validateSessionName(session_name);
         var parts: std.ArrayList([]const u8) = .empty;
         defer parts.deinit(gpa);
         while (args.next()) |part| try parts.append(gpa, part);
-        return sendCommand(io, gpa, &cfg, session_name, try wireTagForCommand(command), parts.items);
+        return sendCommand(io, gpa, &cfg, session_name, tag, parts.items);
+    } else |_| {
+        return unsupported(io, command);
     }
-
-    return unsupported(io, command);
 }
 
 test "Windows print aliases preserve the frozen Output wire tag" {
@@ -128,4 +209,30 @@ test "Windows print aliases preserve the frozen Output wire tag" {
     try std.testing.expectEqual(WireTag.Output, try wireTagForCommand("p"));
     try std.testing.expectEqual(WireTag.Send, try wireTagForCommand("send"));
     try std.testing.expectEqual(WireTag.Send, try wireTagForCommand("s"));
+    try std.testing.expectEqual(WireTag.Write, try wireTagForCommand("write"));
+    try std.testing.expectEqual(WireTag.Detach, try wireTagForCommand("detach"));
+    try std.testing.expectEqual(WireTag.DetachAll, try wireTagForCommand("detach-all"));
+    try std.testing.expectEqual(WireTag.Kill, try wireTagForCommand("kill"));
+    try std.testing.expectEqual(WireTag.History, try wireTagForCommand("history"));
+    try std.testing.expectEqual(WireTag.LabelGet, try wireTagForCommand("get"));
+    try std.testing.expectEqual(WireTag.LabelSet, try wireTagForCommand("set"));
+    try std.testing.expectEqual(WireTag.LabelClear, try wireTagForCommand("clear"));
+    try std.testing.expectEqual(WireTag.Info, try wireTagForCommand("list"));
+}
+
+test "Windows production commands route run and attach through the session adapter" {
+    try std.testing.expectError(
+        error.ConPtyProviderUnavailable,
+        runSession(
+            std.testing.io,
+            std.testing.allocator,
+            "adapter-run-test",
+            null,
+        ),
+    );
+}
+
+test "Windows root exports the logging hook through std_options" {
+    const root = @import("main.zig");
+    root.std_options.logFn(.debug, .default, "Windows logging hook test", .{});
 }

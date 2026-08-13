@@ -1,8 +1,13 @@
-const std = @import("std");
 const builtin = @import("builtin");
-const cross = @import("cross.zig");
+const std = @import("std");
+const cross = if (builtin.os.tag == .windows) struct {} else @import("cross.zig");
 
 pub var log_system = LogSystem{};
+
+const default_log_permissions: std.Io.File.Permissions = if (builtin.os.tag == .windows)
+    @enumFromInt(0)
+else
+    std.Io.File.Permissions.fromMode(0o640);
 
 pub fn zmxLogFn(
     comptime level: std.log.Level,
@@ -13,11 +18,6 @@ pub fn zmxLogFn(
     log_system.log(level, scope, format, args) catch {};
 }
 
-fn defaultLogPermissions() std.Io.File.Permissions {
-    if (builtin.os.tag == .windows) return .default_file;
-    return std.Io.File.Permissions.fromMode(0o640);
-}
-
 pub const LogSystem = struct {
     file: ?std.Io.File = null,
     mutex: std.Io.Mutex = .init,
@@ -25,7 +25,7 @@ pub const LogSystem = struct {
     max_size: u64 = 2 * 1024 * 1024, // 2MB
     path: []const u8 = "",
     io: std.Io = undefined,
-    mode: std.Io.File.Permissions = defaultLogPermissions(),
+    mode: std.Io.File.Permissions = default_log_permissions,
 
     pub fn init(self: *LogSystem, io: std.Io, path: []const u8, mode: std.Io.File.Permissions) !void {
         self.io = io;
@@ -41,18 +41,14 @@ pub const LogSystem = struct {
             else => return err,
         };
 
-        if (comptime builtin.os.tag == .windows) {
-            const stat = try file.stat(self.io);
-            var seek_buf: [1]u8 = undefined;
-            var writer = file.writer(self.io, &seek_buf);
-            try writer.seekTo(stat.size);
-            self.current_size = stat.size;
+        // Use lseek(SEEK_END) instead of length() + seekTo() to avoid a
+        // TOCTOU race: after fork() the parent may still write to the log
+        // between our length() check and seekTo(), causing us to overwrite
+        // recent parent entries. lseek(fd, 0, SEEK_END) is atomic — it
+        // always positions at the true end of file at seek time.
+        if (builtin.os.tag == .windows) {
+            self.current_size = 0;
         } else {
-            // Use lseek(SEEK_END) instead of length() + seekTo() to avoid a
-            // TOCTOU race: after fork() the parent may still write to the log
-            // between our length() check and seekTo(), causing us to overwrite
-            // recent parent entries. lseek(fd, 0, SEEK_END) is atomic — it
-            // always positions at the true end of file at seek time.
             const new_pos = cross.c.lseek(file.handle, 0, cross.c.SEEK_END);
             if (new_pos == -1) {
                 std.Io.File.close(file, self.io);

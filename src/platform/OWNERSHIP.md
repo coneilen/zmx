@@ -15,6 +15,8 @@ duplicating zmx's CLI, session, or IPC wire semantics.
 | `platform/runtime_posix.zig` | POSIX runtime directories and Unix-socket-compatible name validation | Existing POSIX runtime adapter |
 | `platform/daemon.zig` | Daemon lifetime state and process-role outcomes | `daemon_windows.zig` single-session lifetime adapter |
 | `platform/shell.zig` | Interactive/task shell selection and task marker shape | ConPTY task-shell adapter |
+| `platform/session_wire.zig` | Target-neutral frozen Windows session frame/tag contract | Shared with the ConPTY provider |
+| `platform/session_windows.zig` | Windows host/attach lifecycle, complete tag dispatch, and transport I/O exports | Sibling ConPTY/session provider |
 
 `src/ipc.zig` remains the sole owner of zmx wire framing and tags. The
 platform local-IPC contract transports bytes but must never introduce a second
@@ -47,6 +49,16 @@ cancellation event and applies one cumulative deadline to an operation.
 `local_ipc.Connection.writeAll` is the bounded backpressure primitive for
 ConPTY/session adapters; it loops on partial transport writes and never
 truncates a large frame to a fixed queue size.
+`session_windows.zig` exposes the same connection/server handles, deadline and
+cancellation types, bounded read/write functions, host/attach lifecycle, and
+all frozen wire-tag dispatch to the sibling ConPTY provider. Until that
+provider is linked, Windows `run` and `attach` take this production path and
+return an explicit `ConPtyProviderUnavailable` error rather than silently
+falling back to a send-only implementation.
+Filesystem rendezvous directories and lease/record files are created with a
+protected DACL containing only the current token SID and SYSTEM. Existing
+objects are verified for owner, protected DACL, ACE type/mask, and exact
+current-user/SYSTEM membership; insecure preexisting objects are rejected.
 When `LOCALAPPDATA` is unavailable, runtime logs and rendezvous metadata fall
 back to `USERPROFILE`, `TEMP`/`TMP`, or `GetTempPathW`; they never use the
 named-pipe namespace as a filesystem path.
