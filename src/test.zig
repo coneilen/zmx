@@ -16,6 +16,7 @@ comptime {
     _ = @import("platform/local_ipc_posix.zig");
     _ = @import("platform/pty.zig");
     _ = @import("platform/pty_posix.zig");
+    _ = @import("platform/pty_windows.zig");
     _ = @import("platform/resize.zig");
     _ = @import("platform/runtime.zig");
     _ = @import("platform/runtime_posix.zig");

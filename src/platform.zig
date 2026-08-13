@@ -12,6 +12,7 @@ pub const ipc = @import("platform/local_ipc.zig");
 pub const ipc_posix = @import("platform/local_ipc_posix.zig");
 pub const pty = @import("platform/pty.zig");
 pub const pty_posix = @import("platform/pty_posix.zig");
+pub const pty_windows = @import("platform/pty_windows.zig");
 pub const resize = @import("platform/resize.zig");
 pub const runtime = @import("platform/runtime.zig");
 pub const runtime_posix = @import("platform/runtime_posix.zig");
