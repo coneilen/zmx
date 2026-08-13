@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const lib_posix = @import("posix.zig");
 const events_posix = @import("platform/events_posix.zig");
 
@@ -17,6 +18,7 @@ pub fn wakeSignalPipe(_: lib_posix.SIG, _: *const lib_posix.siginfo_t, _: ?*anyo
 // setting wakes the loop. The handler writes to sig_pipe instead; poll()
 // wakes on its read end.
 pub fn installWakeHandler(sig: u6) void {
+    if (builtin.os.tag == .windows) return;
     const act: lib_posix.Sigaction = .{
         .handler = .{ .sigaction = wakeSignalPipe },
         .mask = lib_posix.sigemptyset(),
@@ -26,6 +28,7 @@ pub fn installWakeHandler(sig: u6) void {
 }
 
 pub fn ignoreSigpipe() void {
+    if (builtin.os.tag == .windows) return;
     const act: lib_posix.Sigaction = .{
         .handler = .{ .handler = lib_posix.SIG.IGN },
         .mask = lib_posix.sigemptyset(),
@@ -35,9 +38,11 @@ pub fn ignoreSigpipe() void {
 }
 
 pub fn openSignalPipe() !void {
+    if (builtin.os.tag == .windows) return;
     sig_pipe = try events_posix.openCancellationPipe();
 }
 
 pub fn drainSignalPipe() void {
+    if (builtin.os.tag == .windows) return;
     events_posix.drainCancellationPipe(sig_pipe);
 }

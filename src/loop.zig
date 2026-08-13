@@ -14,6 +14,9 @@ const assert = std.debug.assert;
 const daemonize = @import("daemonize.zig");
 const builtin = @import("builtin");
 const platform_daemon = @import("platform/daemon.zig");
+const pty = @import("platform/pty.zig");
+const pty_runtime = @import("platform/pty_runtime.zig");
+const platform_resize = @import("platform/resize.zig");
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
@@ -592,6 +595,7 @@ pub const Daemon = struct {
     pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
     shell: []const u8 = "/bin/sh",
     lifetime: platform_daemon.Lifetime = .{},
+    pty_runtime: pty_runtime.Runtime = pty_runtime.Runtime.init(std.heap.c_allocator),
 
     /// Create a Daemon. Caller is responsible for freeing all variables passed
     /// into the init fn.
@@ -601,6 +605,7 @@ pub const Daemon = struct {
             .session_name = sesh_name,
             .socket_path = socket_path,
             .created_at = @intCast(std.Io.Timestamp.now(io, .real).toSeconds()),
+            .pty_runtime = pty_runtime.Runtime.init(std.heap.c_allocator),
         };
     }
 
@@ -613,6 +618,7 @@ pub const Daemon = struct {
         }
         self.labels.deinit(gpa);
         self.pty_write_buf.deinit(gpa);
+        self.pty_runtime.deinit();
         gpa.free(self.socket_path);
     }
 
@@ -712,6 +718,13 @@ pub const Daemon = struct {
 
         var keep_fds_open = [_]i32{ server_sock_fd, dir.handle, log_fd };
         const cmd = try daemonize.createCmdZ(self.shell, self.is_task_mode, self.command);
+        const spawn_spec = pty.SpawnSpec{
+            .session_name = sesh_name,
+            .shell = self.shell,
+            .task_mode = self.is_task_mode,
+            .command = self.command,
+            .size = platform_resize.fallback(),
+        };
 
         // `cwd_path` is the decoded path, and is empty when the cwd is on
         // another host: OSC 7 crosses SSH boundaries, so a session that ssh'd
@@ -733,6 +746,8 @@ pub const Daemon = struct {
             sesh_name,
             cmd,
             &keep_fds_open,
+            &self.pty_runtime,
+            spawn_spec,
         ) catch |err| {
             switch (err) {
                 error.IsClientProc => {
@@ -1143,6 +1158,16 @@ pub const Daemon = struct {
     pub fn handleKill(self: *Daemon, gpa: std.mem.Allocator, io: std.Io) void {
         std.log.info("kill received session={s}", .{self.session_name});
         self.shutdown(gpa);
+        if (comptime builtin.os.tag == .windows) {
+            self.pty_runtime.signal(@intCast(self.pid), .hangup) catch |err| {
+                std.log.warn("failed to send ConPTY Ctrl+C err={s}", .{@errorName(err)});
+            };
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .real) catch unreachable;
+            self.pty_runtime.signal(@intCast(self.pid), .kill) catch |err| {
+                std.log.warn("failed to terminate ConPTY job err={s}", .{@errorName(err)});
+            };
+            return;
+        }
         // gracefully shutdown shell processes, shells tend to ignore SIGTERM so we send SIGHUP
         // instead
         //   https://www.gnu.org/software/bash/manual/html_node/Signals.html

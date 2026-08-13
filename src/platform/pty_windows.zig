@@ -133,6 +133,18 @@ pub fn sendControl(state: *BackendState, process: pty.ProcessId, control: Contro
     return implementation.sendControl(state, process, control);
 }
 
+fn sleepNs(ns: u64) void {
+    if (comptime builtin.zig_version.minor >= 16) {
+        std.Io.sleep(
+            std.testing.io,
+            std.Io.Duration.fromNanoseconds(ns),
+            .real,
+        ) catch {};
+    } else {
+        std.Thread.sleep(ns);
+    }
+}
+
 const unsupported_impl = struct {
     const State = struct {
         alloc: std.mem.Allocator,
@@ -211,6 +223,10 @@ const windows_impl = struct {
     const DWORD = u32;
     const SIZE_T = usize;
     const HRESULT = i32;
+    const PROCESS_INFORMATION = if (builtin.zig_version.minor >= 16)
+        windows.PROCESS.INFORMATION
+    else
+        windows.PROCESS_INFORMATION;
 
     const ERROR_BROKEN_PIPE: DWORD = 109;
     const ERROR_NO_DATA: DWORD = 232;
@@ -330,6 +346,8 @@ const windows_impl = struct {
             process: HANDLE,
             exit_code: DWORD,
         ) callconv(.winapi) BOOL;
+        extern "kernel32" fn CancelSynchronousIo(thread: HANDLE) callconv(.winapi) BOOL;
+        extern "kernel32" fn Sleep(milliseconds: DWORD) callconv(.winapi) void;
         extern "kernel32" fn ResumeThread(thread: HANDLE) callconv(.winapi) DWORD;
         extern "kernel32" fn WaitForSingleObject(
             handle: HANDLE,
@@ -372,7 +390,7 @@ const windows_impl = struct {
             environment: ?*anyopaque,
             current_directory: ?[*:0]const u16,
             startup_info: *windows.STARTUPINFOW,
-            process_information: *windows.PROCESS_INFORMATION,
+            process_information: *PROCESS_INFORMATION,
         ) callconv(.winapi) BOOL;
     };
 
@@ -380,14 +398,91 @@ const windows_impl = struct {
         alloc: std.mem.Allocator,
         input: ?HANDLE = null,
         output: ?HANDLE = null,
-        input_read_side: ?HANDLE = null,
-        output_write_side: ?HANDLE = null,
         pseudo_console: ?HPCON = null,
         job: ?HANDLE = null,
         process: ?HANDLE = null,
         thread: ?HANDLE = null,
+        reader_thread: ?std.Thread = null,
+        writer_thread: ?std.Thread = null,
+        input_queue: SpscQueue = undefined,
+        output_queue: SpscQueue = undefined,
+        stop_workers: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         pid: DWORD = 0,
         io_closed: bool = false,
+    };
+
+    const QUEUE_CAPACITY = 256 * 1024;
+
+    const SpscQueue = struct {
+        alloc: std.mem.Allocator,
+        storage: []u8,
+        head: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        tail: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn empty(alloc: std.mem.Allocator) SpscQueue {
+            return .{
+                .alloc = alloc,
+                .storage = &[_]u8{},
+            };
+        }
+
+        fn init(alloc: std.mem.Allocator, capacity: usize) !SpscQueue {
+            return .{
+                .alloc = alloc,
+                .storage = try alloc.alloc(u8, capacity),
+            };
+        }
+
+        fn deinit(self: *SpscQueue) void {
+            if (self.storage.len == 0) return;
+            self.alloc.free(self.storage);
+            self.storage = &[_]u8{};
+        }
+
+        fn close(self: *SpscQueue) void {
+            self.closed.store(true, .release);
+        }
+
+        fn isClosed(self: *const SpscQueue) bool {
+            return self.closed.load(.acquire);
+        }
+
+        fn push(self: *SpscQueue, bytes: []const u8) usize {
+            if (bytes.len == 0 or self.isClosed()) return 0;
+            const head = self.head.load(.monotonic);
+            const tail = self.tail.load(.acquire);
+            const used = head -% tail;
+            const free = self.storage.len -| used;
+            const amount = @min(bytes.len, free);
+            if (amount == 0) return 0;
+
+            const start = head % self.storage.len;
+            const first = @min(amount, self.storage.len - start);
+            @memcpy(self.storage[start..][0..first], bytes[0..first]);
+            if (first < amount) {
+                @memcpy(self.storage[0 .. amount - first], bytes[first..amount]);
+            }
+            self.head.store(head +% amount, .release);
+            return amount;
+        }
+
+        fn pop(self: *SpscQueue, buffer: []u8) usize {
+            const tail = self.tail.load(.monotonic);
+            const head = self.head.load(.acquire);
+            const available = head -% tail;
+            const amount = @min(buffer.len, available);
+            if (amount == 0) return 0;
+
+            const start = tail % self.storage.len;
+            const first = @min(amount, self.storage.len - start);
+            @memcpy(buffer[0..first], self.storage[start..][0..first]);
+            if (first < amount) {
+                @memcpy(buffer[first..amount], self.storage[0 .. amount - first]);
+            }
+            self.tail.store(tail +% amount, .release);
+            return amount;
+        }
     };
 
     const State = struct {
@@ -426,23 +521,21 @@ const windows_impl = struct {
 
     fn spawn(state: *State, spec: pty.SpawnSpec) !pty.Spawned {
         const session = try state.alloc.create(Session);
-        session.* = .{ .alloc = state.alloc };
+        session.* = .{
+            .alloc = state.alloc,
+            .input_queue = SpscQueue.empty(state.alloc),
+            .output_queue = SpscQueue.empty(state.alloc),
+        };
         errdefer destroySession(session);
+        session.input_queue = try SpscQueue.init(state.alloc, QUEUE_CAPACITY);
+        session.output_queue = try SpscQueue.init(state.alloc, QUEUE_CAPACITY);
 
         const command_line = try buildCommandLine(state.alloc, spec);
         defer state.alloc.free(command_line);
         const command_line_w = try std.unicode.utf8ToUtf16LeAllocZ(state.alloc, command_line);
         defer state.alloc.free(command_line_w);
 
-        var env_map = try std.process.getEnvMap(state.alloc);
-        defer env_map.deinit();
-        try env_map.put("ZMX_SESSION", spec.session_name);
-        if (env_map.get("TERM")) |term| {
-            if (std.mem.eql(u8, term, "dumb")) try env_map.put("TERM", "xterm-256color");
-        } else {
-            try env_map.put("TERM", "xterm-256color");
-        }
-        const environment = try std.process.createWindowsEnvBlock(state.alloc, &env_map);
+        const environment = try createEnvironment(state.alloc, spec.session_name);
         defer state.alloc.free(environment);
 
         const coord = try sizeToCoord(spec.size);
@@ -534,7 +627,7 @@ const windows_impl = struct {
         };
         startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
         startup.StartupInfo.cb = @sizeOf(STARTUPINFOEXW);
-        var process_info: windows.PROCESS_INFORMATION = undefined;
+        var process_info: PROCESS_INFORMATION = undefined;
         const creation_flags: windows.CreateProcessFlags = .{
             .create_suspended = true,
             .extended_startupinfo_present = true,
@@ -547,7 +640,7 @@ const windows_impl = struct {
             null,
             0,
             creation_flags,
-            @ptrCast(environment.ptr),
+            @ptrCast(@constCast(environment.ptr)),
             null,
             @ptrCast(&startup.StartupInfo),
             &process_info,
@@ -557,6 +650,14 @@ const windows_impl = struct {
         session.process = process_info.hProcess;
         session.thread = process_info.hThread;
         session.pid = process_info.dwProcessId;
+
+        // CreatePseudoConsole duplicates the pipe endpoints during process
+        // creation. Keeping the ConPTY-side endpoints open in the host would
+        // mask EOF and keep teardown dependent on handle-leak timing.
+        _ = kernel32.CloseHandle(input_read);
+        input_read_owned = false;
+        _ = kernel32.CloseHandle(output_write);
+        output_write_owned = false;
 
         // The process is still suspended. Enrollment must succeed before the
         // first instruction can run; otherwise terminate the unassigned
@@ -571,12 +672,18 @@ const windows_impl = struct {
             _ = kernel32.WaitForSingleObject(process_info.hProcess, INFINITE);
             return error.WindowsApiFailure;
         }
-        session.input_read_side = input_read;
-        input_read_owned = false;
-        session.output_write_side = output_write;
-        output_write_owned = false;
         _ = kernel32.CloseHandle(process_info.hThread);
         session.thread = null;
+
+        session.reader_thread = try std.Thread.spawn(.{}, readerMain, .{session});
+        errdefer {
+            session.stop_workers.store(true, .release);
+            session.input_queue.close();
+            session.output_queue.close();
+            if (session.reader_thread) |reader| reader.join();
+            session.reader_thread = null;
+        }
+        session.writer_thread = try std.Thread.spawn(.{}, writerMain, .{session});
 
         state.sessions.append(state.alloc, session) catch |err| {
             _ = kernel32.TerminateJobObject(job, 1);
@@ -591,49 +698,26 @@ const windows_impl = struct {
 
     fn read(state: *State, master: pty.Handle, buffer: []u8) !usize {
         const session = findSessionByMaster(state, master) orelse return error.InvalidHandle;
-        const output = session.output orelse return error.InvalidHandle;
         if (buffer.len == 0) return 0;
-        var available: DWORD = 0;
-        if (kernel32.PeekNamedPipe(output, null, 0, null, &available, null) == 0) {
-            return switch (lastErrorCode()) {
-                ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED => 0,
-                else => error.WindowsApiFailure,
-            };
-        }
-        if (available == 0) {
-            return if (isAlive(session)) error.WouldBlock else 0;
-        }
-        const amount: DWORD = @intCast(@min(@as(usize, available), buffer.len));
-        var read_count: DWORD = 0;
-        if (kernel32.ReadFile(output, buffer.ptr, amount, &read_count, null) == 0) {
-            return switch (lastErrorCode()) {
-                ERROR_BROKEN_PIPE, ERROR_NO_DATA => 0,
-                ERROR_OPERATION_ABORTED => error.ProcessExited,
-                else => error.WindowsApiFailure,
-            };
-        }
-        return read_count;
+        const amount = session.output_queue.pop(buffer);
+        if (amount > 0) return amount;
+        if (session.output_queue.isClosed()) return 0;
+        return error.WouldBlock;
     }
 
     fn write(state: *State, master: pty.Handle, bytes: []const u8) !usize {
         const session = findSessionByMaster(state, master) orelse return error.InvalidHandle;
-        const input = session.input orelse return error.InvalidHandle;
-        var total: usize = 0;
-        while (total < bytes.len) {
-            const amount: DWORD = @intCast(@min(bytes.len - total, std.math.maxInt(DWORD)));
-            var written: DWORD = 0;
-            if (kernel32.WriteFile(input, bytes[total..].ptr, amount, &written, null) == 0) {
-                return switch (lastErrorCode()) {
-                    ERROR_BROKEN_PIPE, ERROR_NO_DATA => error.BrokenPipe,
-                    ERROR_OPERATION_ABORTED => error.ProcessExited,
-                    else => error.WindowsApiFailure,
-                };
-            }
-            total += written;
-            if (written == 0) break;
+        if (bytes.len == 0) return 0;
+        if (!isAlive(session)) {
+            session.input_queue.close();
+            return error.ProcessExited;
         }
-        _ = kernel32.FlushFileBuffers(input);
-        return total;
+        const amount = session.input_queue.push(bytes);
+        if (amount == 0) {
+            if (session.input_queue.isClosed()) return error.BrokenPipe;
+            return error.WouldBlock;
+        }
+        return amount;
     }
 
     fn resizeMaster(state: *State, master: pty.Handle, size: resize.Size) !void {
@@ -694,14 +778,15 @@ const windows_impl = struct {
             .ctrl_c => 0x03,
         };
         const input = session.input orelse return error.InvalidHandle;
-        var written: DWORD = 0;
         const control_bytes = [_]u8{byte};
-        if (kernel32.WriteFile(input, &control_bytes, 1, &written, null) == 0 or written != 1) {
-            return switch (lastErrorCode()) {
-                ERROR_BROKEN_PIPE, ERROR_NO_DATA => error.BrokenPipe,
-                ERROR_OPERATION_ABORTED => error.ProcessExited,
-                else => error.WindowsApiFailure,
-            };
+        _ = input;
+        if (!isAlive(session)) {
+            session.input_queue.close();
+            return error.ProcessExited;
+        }
+        if (session.input_queue.push(&control_bytes) != 1) {
+            if (session.input_queue.isClosed()) return error.BrokenPipe;
+            return error.WouldBlock;
         }
     }
 
@@ -716,26 +801,35 @@ const windows_impl = struct {
     fn closeIo(session: *Session) void {
         if (session.io_closed) return;
         session.io_closed = true;
-        if (session.pseudo_console) |pseudo_console| {
-            _ = kernel32.ClosePseudoConsole(pseudo_console);
-            session.pseudo_console = null;
+        session.stop_workers.store(true, .release);
+        session.input_queue.close();
+        session.output_queue.close();
+
+        if (session.writer_thread) |writer| {
+            _ = kernel32.CancelSynchronousIo(writer.getHandle());
+            writer.join();
+            session.writer_thread = null;
+        }
+        if (session.reader_thread) |reader| {
+            reader.join();
+            session.reader_thread = null;
+        }
+
+        if (session.output) |output| {
+            drainOutput(output);
+            _ = kernel32.CloseHandle(output);
+            session.output = null;
         }
         if (session.input) |input| {
             _ = kernel32.CloseHandle(input);
             session.input = null;
         }
-        if (session.output) |output| {
-            _ = kernel32.CloseHandle(output);
-            session.output = null;
+        if (session.pseudo_console) |pseudo_console| {
+            _ = kernel32.ClosePseudoConsole(pseudo_console);
+            session.pseudo_console = null;
         }
-        if (session.input_read_side) |input_read| {
-            _ = kernel32.CloseHandle(input_read);
-            session.input_read_side = null;
-        }
-        if (session.output_write_side) |output_write| {
-            _ = kernel32.CloseHandle(output_write);
-            session.output_write_side = null;
-        }
+        session.input_queue.deinit();
+        session.output_queue.deinit();
     }
 
     fn destroySession(session: *Session) void {
@@ -753,6 +847,85 @@ const windows_impl = struct {
             session.job = null;
         }
         session.alloc.destroy(session);
+    }
+
+    fn readerMain(session: *Session) void {
+        const output = session.output orelse {
+            session.output_queue.close();
+            return;
+        };
+        var buffer: [8192]u8 = undefined;
+        while (!session.stop_workers.load(.acquire)) {
+            var available: DWORD = 0;
+            if (kernel32.PeekNamedPipe(output, null, 0, null, &available, null) == 0) {
+                switch (lastErrorCode()) {
+                    ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED => break,
+                    else => {
+                        kernel32.Sleep(1);
+                        continue;
+                    },
+                }
+            }
+            if (available == 0) {
+                if (!isAlive(session)) break;
+                kernel32.Sleep(1);
+                continue;
+            }
+
+            const amount: DWORD = @intCast(@min(@as(usize, available), buffer.len));
+            var read_count: DWORD = 0;
+            if (kernel32.ReadFile(output, &buffer, amount, &read_count, null) == 0) break;
+            if (read_count == 0) continue;
+
+            var offset: usize = 0;
+            while (offset < read_count and !session.stop_workers.load(.acquire)) {
+                const pushed = session.output_queue.push(buffer[offset..read_count]);
+                offset += pushed;
+                if (offset < read_count) kernel32.Sleep(1);
+            }
+        }
+        session.output_queue.close();
+    }
+
+    fn writerMain(session: *Session) void {
+        const input = session.input orelse {
+            session.input_queue.close();
+            return;
+        };
+        var buffer: [8192]u8 = undefined;
+        while (!session.stop_workers.load(.acquire)) {
+            const amount = session.input_queue.pop(&buffer);
+            if (amount == 0) {
+                if (session.input_queue.isClosed()) break;
+                kernel32.Sleep(1);
+                continue;
+            }
+
+            var offset: usize = 0;
+            while (offset < amount and !session.stop_workers.load(.acquire)) {
+                const count: DWORD = @intCast(@min(amount - offset, std.math.maxInt(DWORD)));
+                var written: DWORD = 0;
+                if (kernel32.WriteFile(input, buffer[offset..].ptr, count, &written, null) == 0) {
+                    session.input_queue.close();
+                    return;
+                }
+                if (written == 0) continue;
+                offset += written;
+            }
+        }
+    }
+
+    fn drainOutput(output: HANDLE) void {
+        var buffer: [8192]u8 = undefined;
+        var drained: usize = 0;
+        while (drained < QUEUE_CAPACITY) {
+            var available: DWORD = 0;
+            if (kernel32.PeekNamedPipe(output, null, 0, null, &available, null) == 0 or available == 0) break;
+            const amount: DWORD = @intCast(@min(@as(usize, available), buffer.len));
+            var read_count: DWORD = 0;
+            if (kernel32.ReadFile(output, &buffer, amount, &read_count, null) == 0 or read_count == 0) break;
+            drained += read_count;
+        }
     }
 
     fn removeSession(state: *State, session: *Session) void {
@@ -789,6 +962,31 @@ const windows_impl = struct {
 
     fn lastErrorCode() DWORD {
         return @intFromEnum(windows.GetLastError());
+    }
+
+    fn createEnvironment(alloc: std.mem.Allocator, session_name: []const u8) ![]const u16 {
+        if (comptime builtin.zig_version.minor >= 16) {
+            var env_map = try std.process.Environ.createMap(.{ .block = .global }, alloc);
+            defer env_map.deinit();
+            try env_map.put("ZMX_SESSION", session_name);
+            if (env_map.get("TERM")) |term| {
+                if (std.mem.eql(u8, term, "dumb")) try env_map.put("TERM", "xterm-256color");
+            } else {
+                try env_map.put("TERM", "xterm-256color");
+            }
+            const block = try env_map.createWindowsBlock(alloc, .{});
+            return block.slice;
+        } else {
+            var env_map = try std.process.getEnvMap(alloc);
+            defer env_map.deinit();
+            try env_map.put("ZMX_SESSION", session_name);
+            if (env_map.get("TERM")) |term| {
+                if (std.mem.eql(u8, term, "dumb")) try env_map.put("TERM", "xterm-256color");
+            } else {
+                try env_map.put("TERM", "xterm-256color");
+            }
+            return try std.process.createWindowsEnvBlock(alloc, &env_map);
+        }
     }
 
     fn spawnThunk(context: *anyopaque, spec: pty.SpawnSpec) anyerror!pty.Spawned {
@@ -886,7 +1084,7 @@ test "real ConPTY preserves UTF-8 output and Ctrl+C" {
     });
     defer reap(&state, spawned.process);
 
-    var output: [4096]u8 = undefined;
+    var output: [8192]u8 = undefined;
     var total: usize = 0;
     var attempts: usize = 0;
     while (attempts < 100 and total < output.len) : (attempts += 1) {
@@ -896,7 +1094,7 @@ test "real ConPTY preserves UTF-8 output and Ctrl+C" {
         };
         total += count;
         if (std.mem.indexOf(u8, output[0..total], "hello") != null) break;
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        sleepNs(10 * std.time.ns_per_ms);
     }
     _ = try wait(&state, spawned.process);
     try std.testing.expect(std.mem.indexOf(u8, output[0..total], "hello") != null);
@@ -933,7 +1131,7 @@ test "real ConPTY sends Ctrl+C to the attached process" {
         };
         total += count;
         if (std.mem.indexOf(u8, output[0..total], "ready") == null) {
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            sleepNs(10 * std.time.ns_per_ms);
         }
     }
     try std.testing.expect(std.mem.indexOf(u8, output[0..total], "ready") != null);
@@ -945,7 +1143,7 @@ test "real ConPTY sends Ctrl+C to the attached process" {
             exited = true;
             break;
         }
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        sleepNs(100 * std.time.ns_per_ms);
     }
     try std.testing.expect(exited);
 }
@@ -968,22 +1166,109 @@ test "real ConPTY accepts resize updates" {
     try backend(&state).signal(spawned.process, .kill);
 }
 
+test "real ConPTY worker queues preserve input and EOF semantics" {
+    if (builtin.os.tag != .windows) return;
+
+    var state = init(std.testing.allocator);
+    defer deinit(&state);
+    const command = [_][]const u8{
+        "cmd.exe",
+        "/d",
+        "/v:on",
+        "/c",
+        "set /p value= & echo got:!value!",
+    };
+    const spawned = try spawn(&state, .{
+        .session_name = "conpty-worker-input",
+        .shell = "cmd.exe",
+        .task_mode = true,
+        .command = command[0..],
+        .size = .{ .rows = 24, .cols = 80 },
+    });
+    defer reap(&state, spawned.process);
+
+    try std.testing.expectEqual(@as(usize, 7), try write(&state, spawned.master, "hello\r\n"));
+    var output: [4096]u8 = undefined;
+    var total: usize = 0;
+    var attempts: usize = 0;
+    while (attempts < 500 and std.mem.indexOf(u8, output[0..total], "got:hello") == null) : (attempts += 1) {
+        const count = read(&state, spawned.master, output[total..]) catch |err| switch (err) {
+            error.WouldBlock => 0,
+            else => return err,
+        };
+        total += count;
+        if (std.mem.indexOf(u8, output[0..total], "got:hello") == null) sleepNs(10 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, output[0..total], "got:hello") != null);
+    _ = try wait(&state, spawned.process);
+
+    var eof = false;
+    for (0..200) |_| {
+        const count = read(&state, spawned.master, output[0..]) catch |err| switch (err) {
+            error.WouldBlock => 0,
+            else => return err,
+        };
+        if (count == 0) {
+            eof = true;
+            break;
+        }
+        sleepNs(5 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(eof);
+    try std.testing.expectError(error.ProcessExited, write(&state, spawned.master, "after-exit"));
+}
+
+test "real ConPTY output backpressure does not block the caller" {
+    if (builtin.os.tag != .windows) return;
+
+    var state = init(std.testing.allocator);
+    defer deinit(&state);
+    const command = [_][]const u8{
+        "cmd.exe",
+        "/d",
+        "/c",
+        "for /L %i in (1,1,20000) do @echo backpressure",
+    };
+    const spawned = try spawn(&state, .{
+        .session_name = "conpty-worker-output",
+        .shell = "cmd.exe",
+        .task_mode = true,
+        .command = command[0..],
+        .size = .{ .rows = 24, .cols = 80 },
+    });
+    defer reap(&state, spawned.process);
+
+    sleepNs(100 * std.time.ns_per_ms);
+    var output: [8192]u8 = undefined;
+    var total: usize = 0;
+    var attempts: usize = 0;
+    while (attempts < 200 and std.mem.indexOf(u8, output[0..total], "backpressure") == null) : (attempts += 1) {
+        const count = read(&state, spawned.master, output[total..]) catch |err| switch (err) {
+            error.WouldBlock => 0,
+            else => return err,
+        };
+        total += count;
+        if (std.mem.indexOf(u8, output[0..total], "backpressure") == null) sleepNs(10 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, output[0..total], "backpressure") != null);
+    try backend(&state).signal(spawned.process, .kill);
+}
+
 test "real ConPTY job cleanup terminates descendants" {
     if (builtin.os.tag != .windows) return;
 
     const marker = "conpty-job-tree-marker.txt";
     const child_script = "conpty-job-child.cmd";
-    std.fs.cwd().deleteFile(marker) catch |err| switch (err) {
+    deleteTestFile(marker) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
-    {
-        const file = try std.fs.cwd().createFile(child_script, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll("@echo off\r\nping -n 3 127.0.0.1 >nul\r\necho escaped>conpty-job-tree-marker.txt\r\n");
-    }
-    defer std.fs.cwd().deleteFile(child_script) catch {};
-    defer std.fs.cwd().deleteFile(marker) catch {};
+    try createTestFile(
+        child_script,
+        "@echo off\r\nping -n 3 127.0.0.1 >nul\r\necho escaped>conpty-job-tree-marker.txt\r\n",
+    );
+    defer deleteTestFile(child_script) catch {};
+    defer deleteTestFile(marker) catch {};
 
     var state = init(std.testing.allocator);
     defer deinit(&state);
@@ -1004,6 +1289,31 @@ test "real ConPTY job cleanup terminates descendants" {
     _ = try wait(&state, spawned.process);
     reap(&state, spawned.process);
 
-    std.Thread.sleep(2500 * std.time.ns_per_ms);
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(marker, .{}));
+    sleepNs(2500 * std.time.ns_per_ms);
+    try std.testing.expectError(error.FileNotFound, accessTestFile(marker));
+}
+
+fn deleteTestFile(path: []const u8) !void {
+    if (comptime builtin.zig_version.minor >= 16) {
+        return std.Io.Dir.cwd().deleteFile(std.testing.io, path);
+    }
+    return std.fs.cwd().deleteFile(path);
+}
+
+fn createTestFile(path: []const u8, contents: []const u8) !void {
+    if (comptime builtin.zig_version.minor >= 16) {
+        const file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{});
+        defer file.close(std.testing.io);
+        return file.writeStreamingAll(std.testing.io, contents);
+    }
+    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+    return file.writeAll(contents);
+}
+
+fn accessTestFile(path: []const u8) !void {
+    if (comptime builtin.zig_version.minor >= 16) {
+        return std.Io.Dir.cwd().access(std.testing.io, path, .{});
+    }
+    return std.fs.cwd().access(path, .{});
 }

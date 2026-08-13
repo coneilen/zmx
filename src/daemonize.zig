@@ -8,6 +8,9 @@ const log = @import("log.zig");
 const cross = @import("cross.zig");
 const platform_shell = @import("platform/shell.zig");
 const pty_posix = @import("platform/pty_posix.zig");
+const pty = @import("platform/pty.zig");
+const pty_runtime = @import("platform/pty_runtime.zig");
+const builtin = @import("builtin");
 
 const Cmd = platform_shell.Cmd;
 
@@ -51,14 +54,23 @@ fn exec(sesh_name: []const u8, cmd: Cmd) !noreturn {
     lib_posix.exit(1);
 }
 
-pub const PtyInfo = pty_posix.Info;
+pub const PtyInfo = if (builtin.os.tag == .windows) pty.Spawned else pty_posix.Info;
 
 /// spawnPty runs forkpty() and executes the shell or shell command the user
 /// provides.
 ///
 /// This is the second fork in the double-fork technique explained in the
 /// daemonize() comment.
-pub fn spawnPty(sesh_name: []const u8, cmd: Cmd, size: ipc.Resize) !PtyInfo {
+pub fn spawnPty(
+    sesh_name: []const u8,
+    cmd: Cmd,
+    size: ipc.Resize,
+    runtime: *pty_runtime.Runtime,
+    spawn_spec: pty.SpawnSpec,
+) !PtyInfo {
+    if (builtin.os.tag == .windows) {
+        return runtime.spawn(spawn_spec);
+    }
     const forked = try pty_posix.forkPty(size);
     const master_fd = forked.master_fd;
     const pid = forked.pid;
@@ -130,7 +142,16 @@ pub fn spawnPty(sesh_name: []const u8, cmd: Cmd, size: ipc.Resize) !PtyInfo {
 ///                 ✝          │ PID≠SID → can't get a tty
 ///                            ▼
 ///                          DAEMON ✓
-pub fn daemonize(sesh_name: []const u8, cmd: Cmd, keep_fds_open: []i32) !PtyInfo {
+pub fn daemonize(
+    sesh_name: []const u8,
+    cmd: Cmd,
+    keep_fds_open: []i32,
+    runtime: *pty_runtime.Runtime,
+    spawn_spec: pty.SpawnSpec,
+) !PtyInfo {
+    if (builtin.os.tag == .windows) {
+        return runtime.spawn(spawn_spec);
+    }
     // creates the daemon
     const pid = try lib_posix.fork();
     assert(pid != -1);
@@ -198,5 +219,5 @@ pub fn daemonize(sesh_name: []const u8, cmd: Cmd, keep_fds_open: []i32) !PtyInfo
         }
     }
 
-    return spawnPty(sesh_name, cmd, term_size);
+    return spawnPty(sesh_name, cmd, term_size, runtime, spawn_spec);
 }

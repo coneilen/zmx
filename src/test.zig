@@ -6,6 +6,8 @@ comptime {
         _ = @import("platform/events_windows.zig");
         _ = @import("platform/local_ipc_windows.zig");
         _ = @import("platform/runtime_windows.zig");
+        _ = @import("platform/pty_windows.zig");
+        _ = @import("platform/pty_runtime.zig");
     } else {
         _ = @import("main.zig");
         _ = @import("main_posix.zig");
@@ -31,5 +33,7 @@ comptime {
         _ = @import("platform/runtime.zig");
         _ = @import("platform/runtime_posix.zig");
         _ = @import("platform/shell.zig");
+        _ = @import("platform/pty_windows.zig");
+        _ = @import("platform/pty_runtime.zig");
     }
 }
