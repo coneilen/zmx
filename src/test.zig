@@ -8,4 +8,16 @@ comptime {
     _ = @import("loop.zig");
     _ = @import("cfg.zig");
     _ = @import("daemonize.zig");
+    _ = @import("platform.zig");
+    _ = @import("platform/daemon.zig");
+    _ = @import("platform/events.zig");
+    _ = @import("platform/events_posix.zig");
+    _ = @import("platform/local_ipc.zig");
+    _ = @import("platform/local_ipc_posix.zig");
+    _ = @import("platform/pty.zig");
+    _ = @import("platform/pty_posix.zig");
+    _ = @import("platform/resize.zig");
+    _ = @import("platform/runtime.zig");
+    _ = @import("platform/runtime_posix.zig");
+    _ = @import("platform/shell.zig");
 }

@@ -1,7 +1,9 @@
 const std = @import("std");
-const cross = @import("cross.zig");
 const socket = @import("socket.zig");
 const lib_posix = @import("posix.zig");
+const resize = @import("platform/resize.zig");
+const pty_posix = @import("platform/pty_posix.zig");
+const events_posix = @import("platform/events_posix.zig");
 
 pub const Tag = enum(u8) {
     Input = 0,
@@ -40,32 +42,10 @@ pub const Header = packed struct {
     len: u32,
 };
 
-pub const Resize = packed struct {
-    rows: u16,
-    cols: u16,
-    xpixel: u16 = 0,
-    ypixel: u16 = 0,
-};
+pub const Resize = resize.Size;
 
 pub fn getTerminalSize(fd: i32) Resize {
-    var ws: cross.c.struct_winsize = undefined;
-    if (cross.c.ioctl(fd, cross.c.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
-        return .{ .rows = ws.ws_row, .cols = ws.ws_col, .xpixel = ws.ws_xpixel, .ypixel = ws.ws_ypixel };
-    }
-    inline for (.{ lib_posix.STDOUT_FILENO, lib_posix.STDIN_FILENO, lib_posix.STDERR_FILENO }) |fallback_fd| {
-        if (fallback_fd != fd) {
-            if (cross.c.ioctl(fallback_fd, cross.c.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
-                return .{ .rows = ws.ws_row, .cols = ws.ws_col, .xpixel = ws.ws_xpixel, .ypixel = ws.ws_ypixel };
-            }
-        }
-    }
-    if (lib_posix.open("/dev/tty", .{ .ACCMODE = .RDWR }, 0)) |tty_fd| {
-        defer lib_posix.close(tty_fd);
-        if (cross.c.ioctl(tty_fd, cross.c.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
-            return .{ .rows = ws.ws_row, .cols = ws.ws_col, .xpixel = ws.ws_xpixel, .ypixel = ws.ws_ypixel };
-        }
-    } else |_| {}
-    return .{ .rows = 24, .cols = 120 };
+    return pty_posix.getTerminalSize(fd);
 }
 
 pub const MAX_CMD_LEN = 256;
@@ -252,7 +232,7 @@ pub fn probeSession(
     send(fd, .LabelGet, "") catch {};
 
     var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
-    const poll_result = lib_posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
+    const poll_result = events_posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
     if (poll_result == 0) {
         return error.Timeout;
     }
@@ -282,7 +262,7 @@ pub fn probeSession(
         }
 
         // No complete message available, wait for more data
-        const more = lib_posix.poll(&poll_fds, 50) catch break;
+        const more = events_posix.poll(&poll_fds, 50) catch break;
         if (more == 0) break;
         const n_read = sb.read(fd) catch break;
         if (n_read == 0) break;
@@ -338,7 +318,7 @@ pub fn roundTripForTag(
     send(fd, request_tag, payload) catch return error.Unexpected;
 
     var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
-    const poll_result = lib_posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
+    const poll_result = events_posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
     if (poll_result == 0) return error.Timeout;
 
     var sb = SocketBuffer.init(alloc) catch return error.Unexpected;

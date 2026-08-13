@@ -1,5 +1,7 @@
 const std = @import("std");
 const lib_posix = @import("posix.zig");
+const local_ipc_posix = @import("platform/local_ipc_posix.zig");
+const runtime = @import("platform/runtime.zig");
 
 pub fn getSeshPrefix() []const u8 {
     return lib_posix.getenv("ZMX_SESSION_PREFIX") orelse "";
@@ -18,13 +20,10 @@ pub fn getSeshName(alloc: std.mem.Allocator, sesh: []const u8) ![]const u8 {
     // Session names become filenames under socket_dir. Rejecting path
     // separators and dot-dot prevents socket creation and stale-socket
     // deletion from operating outside that directory.
-    if (std.mem.indexOfScalar(u8, full, '/') != null or
-        std.mem.indexOfScalar(u8, full, 0) != null or
-        std.mem.eql(u8, full, ".") or std.mem.eql(u8, full, ".."))
-    {
+    runtime.validateSessionName(full) catch {
         alloc.free(full);
         return error.InvalidSessionName;
-    }
+    };
     return full;
 }
 
@@ -67,11 +66,8 @@ pub fn parseSessionArg(alloc: std.mem.Allocator, raw: []const u8) !SessionMatch 
 }
 
 pub fn sessionConnect(sesh: []const u8) !i32 {
-    var unix_addr = try lib_posix.initUnix(sesh);
-    const socket_fd = try lib_posix.socket(lib_posix.AF.UNIX, lib_posix.SOCK.STREAM | lib_posix.SOCK.CLOEXEC, 0);
-    errdefer lib_posix.close(socket_fd);
-    try lib_posix.connect(socket_fd, &unix_addr.any, unix_addr.getOsSockLen());
-    return socket_fd;
+    const socket_fd = try local_ipc_posix.connectUnix(sesh);
+    return @intCast(local_ipc_posix.handle(socket_fd));
 }
 
 pub fn cleanupStaleSocket(io: std.Io, dir: std.Io.Dir, session_name: []const u8) void {
@@ -95,20 +91,8 @@ pub fn sessionExists(io: std.Io, dir: std.Io.Dir, name: []const u8) !bool {
 }
 
 pub fn createSocket(sesh: []const u8) !lib_posix.socket_t {
-    // AF.UNIX: Unix domain socket for local IPC with client processes
-    // SOCK.STREAM: Reliable, bidirectional communication
-    // SOCK.NONBLOCK: Set socket to non-blocking
-    const fd = try lib_posix.socket(
-        lib_posix.AF.UNIX,
-        lib_posix.SOCK.STREAM | lib_posix.SOCK.NONBLOCK | lib_posix.SOCK.CLOEXEC,
-        0,
-    );
-    errdefer lib_posix.close(fd);
-
-    var unix_addr = try lib_posix.initUnix(sesh);
-    try lib_posix.bind(fd, &unix_addr.any, unix_addr.getOsSockLen());
-    try lib_posix.listen(fd, 128);
-    return fd;
+    const fd = try local_ipc_posix.listenUnix(sesh);
+    return @intCast(local_ipc_posix.handle(fd));
 }
 
 /// Maximum number of usable bytes in a Unix domain socket path.
@@ -123,14 +107,12 @@ pub fn getSocketPath(
     socket_dir: []const u8,
     session_name: []const u8,
 ) error{ NameTooLong, OutOfMemory }![]const u8 {
-    const dir = socket_dir;
-    const path_len = dir.len + 1 + session_name.len;
-    if (path_len > max_socket_path_len) return error.NameTooLong;
-    const fname = try alloc.alloc(u8, path_len);
-    @memcpy(fname[0..dir.len], dir);
-    @memcpy(fname[dir.len .. dir.len + 1], "/");
-    @memcpy(fname[dir.len + 1 ..], session_name);
-    return fname;
+    return runtime.joinEndpointPathUnchecked(
+        alloc,
+        socket_dir,
+        session_name,
+        max_socket_path_len,
+    );
 }
 
 pub fn printSessionNameTooLong(io: std.Io, session_name: []const u8, socket_dir: []const u8) void {

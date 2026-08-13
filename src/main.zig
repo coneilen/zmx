@@ -9,6 +9,7 @@ const cross = @import("cross.zig");
 const socket = @import("socket.zig");
 const label = @import("label.zig");
 const lib_posix = @import("posix.zig");
+const events_posix = @import("platform/events_posix.zig");
 const signal = @import("signal.zig");
 const Cfg = @import("cfg.zig");
 const loop = @import("loop.zig");
@@ -604,7 +605,7 @@ fn tail(alloc: std.mem.Allocator, client_socket_fds: std.ArrayList(i32), detache
             });
         }
 
-        _ = lib_posix.poll(poll_fds.items, -1) catch |err| {
+        _ = events_posix.poll(poll_fds.items, -1) catch |err| {
             if (err == error.Interrupted) continue; // EINTR from signal, loop again
             return err;
         };
@@ -1176,7 +1177,7 @@ fn fetchHistory(
 
     while (true) {
         var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
-        const poll_result = lib_posix.poll(&poll_fds, 5000) catch return error.Timeout;
+        const poll_result = events_posix.poll(&poll_fds, 5000) catch return error.Timeout;
         if (poll_result == 0) {
             return error.Timeout;
         }
@@ -1233,7 +1234,7 @@ fn history(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []cons
 
     while (true) {
         var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
-        const poll_result = lib_posix.poll(&poll_fds, 5000) catch return;
+        const poll_result = events_posix.poll(&poll_fds, 5000) catch return;
         if (poll_result == 0) {
             std.log.err("timeout waiting for history response", .{});
             return;

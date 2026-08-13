@@ -1,5 +1,6 @@
 const std = @import("std");
 const ghostty_vt = @import("ghostty-vt");
+const platform_shell = @import("platform/shell.zig");
 const ipc = @import("ipc.zig");
 const socket = @import("socket.zig");
 const cross = @import("cross.zig");
@@ -447,7 +448,7 @@ pub fn generateTaskId(io: std.Io) [4]u8 {
 }
 
 pub fn getTaskExitMarker(buf: []u8, id_marker: [4]u8) ![]u8 {
-    return std.fmt.bufPrint(buf, "ZMX_TASK_COMPLETED:{s}:", .{id_marker});
+    return platform_shell.taskMarker(buf, id_marker);
 }
 
 pub fn findTaskExitMarker(output: []const u8, id_marker: [4]u8) !?u8 {

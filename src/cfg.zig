@@ -6,6 +6,7 @@ pub const Cfg = @This();
 const std = @import("std");
 const lib_posix = @import("posix.zig");
 const cross = @import("cross.zig");
+const runtime_posix = @import("platform/runtime_posix.zig");
 
 socket_dir: []const u8,
 log_dir: []const u8,
@@ -42,34 +43,11 @@ pub fn init(alloc: std.mem.Allocator, io: std.Io) !Cfg {
 }
 
 fn socketDir(alloc: std.mem.Allocator) ![]const u8 {
-    const tmpdir = std.mem.trimEnd(u8, lib_posix.getenv("TMPDIR") orelse "/tmp", "/");
-    const uid = lib_posix.getuid();
-
-    const socket_dir: []const u8 = if (lib_posix.getenv("ZMX_DIR")) |zmxdir|
-        try alloc.dupe(u8, zmxdir)
-    else if (lib_posix.getenv("XDG_RUNTIME_DIR")) |xdg_runtime|
-        try std.fmt.allocPrint(alloc, "{s}/zmx", .{xdg_runtime})
-    else
-        try std.fmt.allocPrint(alloc, "{s}/zmx-{d}", .{ tmpdir, uid });
-
-    return socket_dir;
+    return runtime_posix.socketDir(alloc);
 }
 
 fn logDir(alloc: std.mem.Allocator) ![]const u8 {
-    const log_dir = if (lib_posix.getenv("ZMX_DIR")) |zmxdir|
-        try std.fmt.allocPrint(alloc, "{s}/logs", .{zmxdir})
-    else if (lib_posix.getenv("XDG_STATE_HOME")) |xdg_state_home|
-        try std.fmt.allocPrint(alloc, "{s}/zmx/logs", .{xdg_state_home})
-    else if (lib_posix.getenv("HOME")) |home_dir|
-        try std.fmt.allocPrint(alloc, "{s}/.local/state/zmx/logs", .{home_dir})
-    else fallback: {
-        // This is the last resort: falling back to /tmp/$UID if HOME is unset.
-        const tmpdir = std.mem.trimEnd(u8, lib_posix.getenv("TMPDIR") orelse "/tmp", "/");
-        const uid = lib_posix.getuid();
-        break :fallback try std.fmt.allocPrint(alloc, "{s}/zmx-{d}", .{ tmpdir, uid });
-    };
-
-    return log_dir;
+    return runtime_posix.logDir(alloc);
 }
 
 pub fn deinit(self: *Cfg, alloc: std.mem.Allocator) void {

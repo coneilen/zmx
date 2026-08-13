@@ -3,7 +3,8 @@ const ghostty_vt = @import("ghostty-vt");
 const ipc = @import("ipc.zig");
 const log = @import("log.zig");
 const util = @import("util.zig");
-const cross = @import("cross.zig");
+const pty_posix = @import("platform/pty_posix.zig");
+const events_posix = @import("platform/events_posix.zig");
 const socket = @import("socket.zig");
 const label = @import("label.zig");
 const lib_posix = @import("posix.zig");
@@ -12,6 +13,7 @@ const signal = @import("signal.zig");
 const assert = std.debug.assert;
 const daemonize = @import("daemonize.zig");
 const builtin = @import("builtin");
+const platform_daemon = @import("platform/daemon.zig");
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
@@ -95,7 +97,7 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
             });
         }
 
-        _ = try lib_posix.poll(poll_fds.items, -1);
+        _ = try events_posix.poll(poll_fds.items, -1);
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
@@ -274,7 +276,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
             });
         }
 
-        _ = try lib_posix.poll(poll_fds.items, -1);
+        _ = try events_posix.poll(poll_fds.items, -1);
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
@@ -589,6 +591,7 @@ pub const Daemon = struct {
     task_ended_at: ?u64 = null, // timestamp when task exited
     pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
     shell: []const u8 = "/bin/sh",
+    lifetime: platform_daemon.Lifetime = .{},
 
     /// Create a Daemon. Caller is responsible for freeing all variables passed
     /// into the init fn.
@@ -616,6 +619,7 @@ pub const Daemon = struct {
     pub fn shutdown(self: *Daemon, gpa: std.mem.Allocator) void {
         std.log.info("shutting down daemon session={s}", .{self.session_name});
         self.running = false;
+        self.lifetime.stop(.requested);
 
         for (self.clients.items) |client| {
             client.deinit();
@@ -755,6 +759,7 @@ pub const Daemon = struct {
         // =======
 
         self.pid = pty_info.pid;
+        self.lifetime.started();
 
         var threaded: std.Io.Threaded = .init_single_threaded;
         defer threaded.deinit();
@@ -803,6 +808,7 @@ pub const Daemon = struct {
             self.deinit(gpa);
             lib_posix.close(pty_info.master_fd);
             _ = lib_posix.waitpid(self.pid, 0);
+            self.lifetime.stopped();
         }
 
         try daemonLoop(self, gpa, new_io, server_sock_fd, pty_info.master_fd);
@@ -1069,13 +1075,7 @@ pub const Daemon = struct {
         // only resize if leader
         if (self.leader_client_fd == client.socket_fd) {
             const resize = std.mem.bytesToValue(ipc.Resize, payload);
-            var ws: cross.c.struct_winsize = .{
-                .ws_row = resize.rows,
-                .ws_col = resize.cols,
-                .ws_xpixel = resize.xpixel,
-                .ws_ypixel = resize.ypixel,
-            };
-            _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
+            pty_posix.resizeMaster(pty_fd, resize);
             // Disable prompt_redraw before resize. The daemon's internal terminal
             // would otherwise clear prompt lines expecting the shell to redraw them,
             // but the shell's redraw goes to the PTY (forwarded to clients), not to
@@ -1113,13 +1113,7 @@ pub const Daemon = struct {
         if (self.leader_client_fd != client.socket_fd) return;
 
         const resize = std.mem.bytesToValue(ipc.Resize, payload);
-        var ws: cross.c.struct_winsize = .{
-            .ws_row = resize.rows,
-            .ws_col = resize.cols,
-            .ws_xpixel = resize.xpixel,
-            .ws_ypixel = resize.ypixel,
-        };
-        _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
+        pty_posix.resizeMaster(pty_fd, resize);
         // Disable prompt_redraw before resize (same rationale as handleInit).
         const saved_prompt_redraw = term.flags.shell_redraws_prompt;
         term.flags.shell_redraws_prompt = .false;

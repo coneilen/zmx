@@ -1,5 +1,6 @@
 const std = @import("std");
 const lib_posix = @import("posix.zig");
+const events_posix = @import("platform/events_posix.zig");
 
 /// Self-pipe woken by signal handlers. std.posix.poll loops on .INTR internally
 /// (PollError has no Interrupted member), so a signal that lands during poll()
@@ -34,13 +35,9 @@ pub fn ignoreSigpipe() void {
 }
 
 pub fn openSignalPipe() !void {
-    sig_pipe = try lib_posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+    sig_pipe = try events_posix.openCancellationPipe();
 }
 
 pub fn drainSignalPipe() void {
-    var b: [16]u8 = undefined;
-    while (true) {
-        const n = lib_posix.read(sig_pipe[0], &b) catch return;
-        if (n == 0) return;
-    }
+    events_posix.drainCancellationPipe(sig_pipe);
 }
