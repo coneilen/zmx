@@ -47,12 +47,18 @@ extern "kernel32" fn GetNamedPipeServerProcessId(
     process_id: *windows.DWORD,
 ) callconv(.winapi) c_int;
 extern "kernel32" fn LocalFree(memory: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GetTempPathW(
+    buffer_length: windows.DWORD,
+    buffer: [*]u16,
+) callconv(.winapi) windows.DWORD;
 
 pub const Error = runtime.PathError || error{
     AccessDenied,
     InvalidRecord,
     Unexpected,
 } || std.mem.Allocator.Error;
+
+const lease_allocator = std.heap.page_allocator;
 
 const token_query: windows.DWORD = 0x0008;
 const token_user_information: windows.DWORD = 1;
@@ -144,12 +150,9 @@ pub fn socketDir(alloc: std.mem.Allocator) Error![]u8 {
 }
 
 pub fn logDir(alloc: std.mem.Allocator) Error![]u8 {
-    if ((std.process.Environ{ .block = .global }).getAlloc(alloc, "LOCALAPPDATA")) |base| {
-        defer alloc.free(base);
-        return std.fmt.allocPrint(alloc, "{s}\\zmx\\logs", .{base});
-    } else |_| {
-        return std.fmt.allocPrint(alloc, "{s}\\logs", .{pipe_prefix});
-    }
+    const base = try filesystemBase(alloc);
+    defer alloc.free(base);
+    return std.fmt.allocPrint(alloc, "{s}\\zmx\\logs", .{base});
 }
 
 pub fn endpointPath(
@@ -177,20 +180,29 @@ fn hexEncode(alloc: std.mem.Allocator, bytes: []const u8) Error![]u8 {
     return result;
 }
 
+fn filesystemBase(alloc: std.mem.Allocator) Error![]u8 {
+    inline for (.{ "LOCALAPPDATA", "USERPROFILE", "TEMP", "TMP" }) |name| {
+        if ((std.process.Environ{ .block = .global }).getAlloc(alloc, name)) |base| {
+            if (base.len > 0) return base;
+            alloc.free(base);
+        } else |_| {}
+    }
+
+    var utf16: [32768]u16 = undefined;
+    const length = GetTempPathW(@intCast(utf16.len), &utf16);
+    if (length == 0 or length >= utf16.len) return error.AccessDenied;
+    return std.unicode.utf16LeToUtf8Alloc(alloc, utf16[0..length]) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.Unexpected,
+    };
+}
+
 fn rendezvousBase(alloc: std.mem.Allocator) Error![]u8 {
-    if ((std.process.Environ{ .block = .global }).getAlloc(alloc, "LOCALAPPDATA")) |base| {
-        defer alloc.free(base);
-        return std.fmt.allocPrint(alloc, "{s}\\zmx\\ipc", .{base}) catch |err| switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-        };
-    } else |_| {}
-    if ((std.process.Environ{ .block = .global }).getAlloc(alloc, "TEMP")) |base| {
-        defer alloc.free(base);
-        return std.fmt.allocPrint(alloc, "{s}\\zmx-ipc", .{base}) catch |err| switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-        };
-    } else |_| {}
-    return alloc.dupe(u8, "C:\\Windows\\Temp\\zmx-ipc");
+    const base = try filesystemBase(alloc);
+    defer alloc.free(base);
+    return std.fmt.allocPrint(alloc, "{s}\\zmx\\ipc", .{base}) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+    };
 }
 
 fn rendezvousDirectory(
@@ -216,6 +228,12 @@ fn rendezvousRecordPath(
     return std.fmt.allocPrint(alloc, "{s}\\{s}.endpoint", .{ directory, encoded });
 }
 
+fn rendezvousLeasePath(alloc: std.mem.Allocator, session_name: []const u8) Error![]u8 {
+    const record_path = try rendezvousRecordPath(alloc, session_name);
+    defer alloc.free(record_path);
+    return std.fmt.allocPrint(alloc, "{s}.lease", .{record_path});
+}
+
 fn mkdirAll(io: std.Io, path_name: []const u8) !void {
     var it = std.fs.path.componentIterator(path_name);
     var component = it.last() orelse return error.BadPathName;
@@ -230,6 +248,61 @@ fn mkdirAll(io: std.Io, path_name: []const u8) !void {
         };
         component = it.next() orelse return;
     }
+}
+
+pub const SessionLease = struct {
+    file: std.Io.File,
+    path: []u8,
+    io: std.Io,
+
+    pub fn release(self: *SessionLease) void {
+        self.file.close(self.io);
+        std.Io.Dir.deleteFileAbsolute(self.io, self.path) catch {};
+        lease_allocator.free(self.path);
+        lease_allocator.destroy(self);
+    }
+};
+
+/// Acquire a cross-process, per-session lease. The lock is held for the
+/// lifetime of the server, while the file itself is reusable after a crashed
+/// owner because Windows releases the lock when its handle disappears.
+pub fn acquireSessionLease(
+    io: std.Io,
+    session_name: []const u8,
+) Error!*SessionLease {
+    try validateSessionName(session_name);
+    const path = try rendezvousLeasePath(lease_allocator, session_name);
+    errdefer lease_allocator.free(path);
+    mkdirAll(io, std.fs.path.dirname(path) orelse return error.Unexpected) catch return error.AccessDenied;
+
+    const file = std.Io.Dir.createFileAbsolute(io, path, .{
+        .read = true,
+        .exclusive = true,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+        .permissions = .default_file,
+    }) catch |create_err| switch (create_err) {
+        error.PathAlreadyExists => std.Io.Dir.openFileAbsolute(io, path, .{
+            .mode = .read_write,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        }) catch |open_err| switch (open_err) {
+            error.WouldBlock => return error.AccessDenied,
+            else => return error.AccessDenied,
+        },
+        else => return error.AccessDenied,
+    };
+
+    const lease = lease_allocator.create(SessionLease) catch {
+        file.close(io);
+        return error.OutOfMemory;
+    };
+    lease.* = .{
+        .file = file,
+        .path = path,
+        .io = io,
+    };
+    return lease;
 }
 
 /// Publish an owner-created rendezvous record. The directory is under the
@@ -462,4 +535,21 @@ test "Windows session endpoints recover with a fresh nonce" {
     try std.testing.expect(!std.mem.eql(u8, first, second));
     try std.testing.expect(std.mem.startsWith(u8, first, pipe_prefix));
     try std.testing.expect(std.mem.startsWith(u8, second, pipe_prefix));
+}
+
+test "Windows fallback log paths are filesystem paths" {
+    const alloc = std.testing.allocator;
+    const path = try logDir(alloc);
+    defer alloc.free(path);
+    try std.testing.expect(!std.mem.startsWith(u8, path, pipe_prefix));
+    try std.testing.expect(std.mem.indexOf(u8, path, "\\logs") != null);
+}
+
+test "Windows session lease excludes a second owner" {
+    const first = try acquireSessionLease(std.testing.io, "lease-exclusion");
+    defer first.release();
+    try std.testing.expectError(
+        error.AccessDenied,
+        acquireSessionLease(std.testing.io, "lease-exclusion"),
+    );
 }
