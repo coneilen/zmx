@@ -937,6 +937,7 @@ pub const InputClassifier = struct {
                     self.mouse_prefix = .none;
                     seq_start = null;
                     sequence_from_carry = false;
+                    self.emitted_prefix = false;
                     sequence_kind = .other;
                     self.kitty_capture_active = false;
                     self.kitty_capture_len = 0;
