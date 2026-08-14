@@ -1133,11 +1133,17 @@ fn claimLeaderIfVacant(session: *Session, client: *Client) u64 {
     return generation;
 }
 
+const LeaderWriteResult = struct {
+    accepted: bool,
+    generation: u64,
+    changed: bool,
+};
+
 fn claimLeaderAndWrite(
     session: *Session,
     client: *Client,
     bytes: []const u8,
-) bool {
+) LeaderWriteResult {
     var changed = false;
     var generation: u64 = undefined;
     session.lock();
@@ -1149,7 +1155,11 @@ fn claimLeaderAndWrite(
     generation = session.leader_generation;
     session.unlock();
     if (changed) client.enqueue(.Resize, &.{}) catch client.eject();
-    return writePtyIfLeader(session, client, generation, bytes);
+    return .{
+        .accepted = writePtyIfLeader(session, client, generation, bytes),
+        .generation = generation,
+        .changed = changed,
+    };
 }
 
 fn claimLeaderAndWriteIfGeneration(
@@ -1157,13 +1167,17 @@ fn claimLeaderAndWriteIfGeneration(
     client: *Client,
     expected_generation: u64,
     bytes: []const u8,
-) bool {
+) LeaderWriteResult {
     var changed = false;
     var generation: u64 = undefined;
     session.lock();
     if (session.leader_generation != expected_generation) {
         session.unlock();
-        return false;
+        return .{
+            .accepted = false,
+            .generation = expected_generation,
+            .changed = false,
+        };
     }
     if (session.leader != client) {
         session.leader = client;
@@ -1173,7 +1187,30 @@ fn claimLeaderAndWriteIfGeneration(
     generation = session.leader_generation;
     session.unlock();
     if (changed) client.enqueue(.Resize, &.{}) catch client.eject();
-    return writePtyIfLeader(session, client, generation, bytes);
+    return .{
+        .accepted = writePtyIfLeader(session, client, generation, bytes),
+        .generation = generation,
+        .changed = changed,
+    };
+}
+
+fn timerGenerationForInput(
+    receipt_generation: u64,
+    leader_write: ?LeaderWriteResult,
+) u64 {
+    if (leader_write) |result| {
+        if (result.changed) return result.generation;
+    }
+    return receipt_generation;
+}
+
+fn pinReplacementLocked(session: *Session, departing: *Client) ?*Client {
+    for (session.clients.items) |other| {
+        if (other == departing or other.closed.load(.acquire)) continue;
+        _ = other.broadcast_refs.fetchAdd(1, .acq_rel);
+        return other;
+    }
+    return null;
 }
 
 fn flushPendingEscape(client: *Client, expected_generation: ?u64) void {
@@ -1186,11 +1223,11 @@ fn flushPendingEscape(client: *Client, expected_generation: ?u64) void {
     client.unlockInput();
     defer client.session.alloc.free(result.bytes);
     if (result.bytes.len == 0) return;
-    const accepted = if (expected_generation) |generation|
+    const write = if (expected_generation) |generation|
         claimLeaderAndWriteIfGeneration(client.session, client, generation, result.bytes)
     else
         claimLeaderAndWrite(client.session, client, result.bytes);
-    if (accepted) {
+    if (write.accepted) {
         updateSessionCwd(client, result.bytes, false);
     }
 }
@@ -1217,17 +1254,13 @@ fn releaseLeader(session: *Session, client: *Client) void {
     session.lock();
     if (session.leader == client) {
         session.leader = null;
-        for (session.clients.items) |other| {
-            if (other != client and !other.closed.load(.acquire)) {
-                replacement = other;
-                break;
-            }
-        }
+        replacement = pinReplacementLocked(session, client);
         session.leader = replacement;
         session.leader_generation +%= 1;
     }
     session.unlock();
     if (replacement) |next| {
+        defer _ = next.broadcast_refs.fetchSub(1, .acq_rel);
         next.enqueue(.Resize, &.{}) catch next.eject();
     }
 }
@@ -1273,15 +1306,20 @@ fn clientMain(client: *Client) void {
                     const pending_lone_escape = client.input.hasPendingEscape();
                     client.unlockInput();
                     defer session.alloc.free(result.bytes);
+                    var leader_write: ?LeaderWriteResult = null;
                     const accepted = if (result.bytes.len == 0)
                         true
-                    else if (result.claims_leadership)
-                        claimLeaderAndWrite(session, client, result.bytes)
-                    else
-                        writePtyIfGeneration(session, snapshot.generation, result.bytes);
+                    else if (result.claims_leadership) blk: {
+                        const write = claimLeaderAndWrite(session, client, result.bytes);
+                        leader_write = write;
+                        break :blk write.accepted;
+                    } else writePtyIfGeneration(session, snapshot.generation, result.bytes);
                     if (accepted) updateSessionCwd(client, result.bytes, false);
                     if (pending_lone_escape) {
-                        const timer_generation = leaderSnapshot(session, client).generation;
+                        const timer_generation = timerGenerationForInput(
+                            snapshot.generation,
+                            leader_write,
+                        );
                         client.esc_timer_generation.store(timer_generation, .release);
                         if (lone_escape_thread != null and
                             !client.esc_timer_active.load(.acquire))
@@ -1298,7 +1336,7 @@ fn clientMain(client: *Client) void {
                                 .{client},
                             ) catch blk: {
                                 client.esc_timer_active.store(false, .release);
-                                flushPendingEscape(client, snapshot.generation);
+                                flushPendingEscape(client, timer_generation);
                                 break :blk null;
                             };
                         }
@@ -2213,4 +2251,64 @@ test "Windows stale leader token rejects PTY operation after transfer" {
         @ptrCast(&marker),
     ));
     try std.testing.expectEqual(@as(u32, 0), marker.value);
+}
+
+test "Windows ESC timer keeps receipt generation across preemption" {
+    const receipt_generation = 21;
+    const claim = LeaderWriteResult{
+        .accepted = true,
+        .generation = 22,
+        .changed = true,
+    };
+    const timer_generation = timerGenerationForInput(receipt_generation, claim);
+
+    // A competing client may claim immediately after the atomic write/claim.
+    // The timer must retain this operation's generation rather than adopting
+    // the competing generation.
+    try std.testing.expectEqual(@as(u64, 22), timer_generation);
+    try std.testing.expectEqual(
+        @as(u64, 21),
+        timerGenerationForInput(receipt_generation, null),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 21),
+        timerGenerationForInput(receipt_generation, .{
+            .accepted = false,
+            .generation = 22,
+            .changed = false,
+        }),
+    );
+}
+
+test "Windows replacement pin survives reap check until resize enqueue completes" {
+    var session: Session = undefined;
+    session.lock_word = .init(0);
+    session.clients = .empty;
+    defer session.clients.deinit(std.testing.allocator);
+
+    var departing: Client = undefined;
+    departing.closed = .init(true);
+    departing.broadcast_refs = .init(0);
+    var replacement: Client = undefined;
+    replacement.closed = .init(false);
+    replacement.broadcast_refs = .init(0);
+    try session.clients.append(std.testing.allocator, &departing);
+    try session.clients.append(std.testing.allocator, &replacement);
+
+    session.lock();
+    const pinned = pinReplacementLocked(&session, &departing);
+    session.unlock();
+    try std.testing.expectEqual(@as(?*Client, &replacement), pinned);
+    try std.testing.expectEqual(@as(usize, 1), replacement.broadcast_refs.load(.acquire));
+
+    // Reaping must leave a pinned replacement in the client list even if it
+    // disconnects while the unlocked resize enqueue is in progress.
+    replacement.closed.store(true, .release);
+    session.lock();
+    const reap_allowed = replacement.broadcast_refs.load(.acquire) == 0;
+    session.unlock();
+    try std.testing.expect(!reap_allowed);
+
+    _ = replacement.broadcast_refs.fetchSub(1, .acq_rel);
+    try std.testing.expectEqual(@as(usize, 0), replacement.broadcast_refs.load(.acquire));
 }
