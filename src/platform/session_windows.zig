@@ -4,6 +4,7 @@ const local_ipc = @import("local_ipc.zig");
 const local_ipc_windows = @import("local_ipc_windows.zig");
 const runtime_windows = @import("runtime_windows.zig");
 const wire = @import("session_wire.zig");
+const resize = @import("resize.zig");
 
 comptime {
     if (builtin.os.tag != .windows) @compileError("session_windows requires a Windows target");
@@ -40,6 +41,7 @@ pub const HostSpec = struct {
     shell: []const u8,
     task_mode: bool = false,
     command: ?[]const []const u8 = null,
+    initial_size: ?resize.Size = null,
 };
 
 pub const AttachSpec = struct {

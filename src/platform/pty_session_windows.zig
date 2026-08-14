@@ -65,6 +65,8 @@ const enableProcessedInput: windows.DWORD = 0x0001;
 const enableLineInput: windows.DWORD = 0x0002;
 const enableEchoInput: windows.DWORD = 0x0004;
 const cp_utf8: windows.UINT = 65001;
+const history_chunk_bytes: usize = 64 * 1024;
+const foreground_init = "zmx-foreground-history";
 
 const SMALL_RECT = extern struct {
     Left: windows.SHORT,
@@ -81,7 +83,7 @@ const CONSOLE_SCREEN_BUFFER_INFO = extern struct {
     dwMaximumWindowSize: windows.COORD,
 };
 
-fn currentConsoleSize() ?resize.Size {
+pub fn currentConsoleSize() ?resize.Size {
     const output = kernel32.GetStdHandle(std_output_handle);
     var info: CONSOLE_SCREEN_BUFFER_INFO = undefined;
     if (@intFromEnum(kernel32.GetConsoleScreenBufferInfo(output, &info)) == 0) return null;
@@ -142,6 +144,7 @@ const Client = struct {
     writer_thread: ?std.Thread = null,
     data_event: ?windows.HANDLE = null,
     space_event: ?windows.HANDLE = null,
+    broadcast_refs: std.atomic.Value(usize) = .init(0),
     output_lock: std.atomic.Value(u8) = .init(0),
     output: std.ArrayList(u8) = .empty,
     output_closed: bool = false,
@@ -200,6 +203,40 @@ const Client = struct {
         self.output.appendSliceAssumeCapacity(std.mem.asBytes(&header));
         self.output.appendSliceAssumeCapacity(payload);
         if (self.data_event) |event| _ = kernel32.SetEvent(event);
+    }
+
+    fn enqueueBlocking(self: *Client, tag: wire.Tag, payload: []const u8) !void {
+        const frame_len = @sizeOf(wire.Header) + payload.len;
+        if (payload.len > max_output_bytes - @sizeOf(wire.Header)) {
+            return error.FrameTooLarge;
+        }
+        while (true) {
+            self.lockOutput();
+            if (self.output_closed) {
+                self.unlockOutput();
+                return error.BrokenPipe;
+            }
+            if (frame_len <= max_output_bytes - self.output.items.len) {
+                self.output.ensureUnusedCapacity(self.session.alloc, frame_len) catch |err| {
+                    self.unlockOutput();
+                    return err;
+                };
+                const header = wire.Header{ .tag = tag, .len = @intCast(payload.len) };
+                self.output.appendSliceAssumeCapacity(std.mem.asBytes(&header));
+                self.output.appendSliceAssumeCapacity(payload);
+                self.unlockOutput();
+                if (self.data_event) |event| _ = kernel32.SetEvent(event);
+                return;
+            }
+            self.unlockOutput();
+            if (self.space_event) |event| {
+                if (kernel32.WaitForSingleObject(event, output_wait_ms) == 0x00000102) {
+                    return error.WouldBlock;
+                }
+            } else {
+                return error.WouldBlock;
+            }
+        }
     }
 
     fn enqueueOutput(self: *Client, payload: []const u8) !void {
@@ -301,6 +338,7 @@ pub fn attachForeground(
     spec: session_windows.AttachSpec,
     connection: local_ipc.Connection,
 ) !u8 {
+    try wire.writeFrame(connection, .Init, foreground_init);
     return (try attachLoopResult(spec, connection)) orelse error.SessionEnded;
 }
 
@@ -308,9 +346,19 @@ pub fn tail(
     spec: session_windows.AttachSpec,
     connection: local_ipc.Connection,
 ) !u8 {
-    try wire.writeFrame(connection, .History, &.{});
     var output_buffer: [16 * 1024]u8 = undefined;
     var writer = std.Io.File.stdout().writer(spec.io, &output_buffer);
+    var output_lock = std.atomic.Value(u8).init(0);
+    return tailToWriter(spec, connection, &writer.interface, &output_lock);
+}
+
+pub fn tailToWriter(
+    spec: session_windows.AttachSpec,
+    connection: local_ipc.Connection,
+    writer: *std.Io.Writer,
+    output_lock: *std.atomic.Value(u8),
+) !u8 {
+    try wire.writeFrame(connection, .History, &.{});
     var task_exit_code: ?u8 = null;
     var history_received = false;
     while (true) {
@@ -321,13 +369,20 @@ pub fn tail(
         defer frame.deinit(spec.alloc);
         switch (frame.header.tag) {
             .Output => {
-                try writer.interface.writeAll(frame.payload);
-                try writer.interface.flush();
+                lockOutput(output_lock);
+                defer unlockOutput(output_lock);
+                try writer.writeAll(frame.payload);
+                try writer.flush();
             },
             .History => {
-                try writer.interface.writeAll(frame.payload);
-                try writer.interface.flush();
-                history_received = true;
+                if (frame.payload.len != 0) {
+                    lockOutput(output_lock);
+                    defer unlockOutput(output_lock);
+                    try writer.writeAll(frame.payload);
+                    try writer.flush();
+                } else {
+                    history_received = true;
+                }
                 if (task_exit_code) |exit_code| return exit_code;
             },
             .TaskComplete => {
@@ -339,6 +394,16 @@ pub fn tail(
     }
 }
 
+fn lockOutput(lock: *std.atomic.Value(u8)) void {
+    while (lock.cmpxchgStrong(0, 1, .acquire, .monotonic) != null) {
+        std.atomic.spinLoopHint();
+    }
+}
+
+fn unlockOutput(lock: *std.atomic.Value(u8)) void {
+    lock.store(0, .release);
+}
+
 fn createSession(spec: session_windows.HostSpec, server: local_ipc.Server) !*Session {
     const session = try spec.alloc.create(Session);
     errdefer spec.alloc.destroy(session);
@@ -348,7 +413,8 @@ fn createSession(spec: session_windows.HostSpec, server: local_ipc.Server) !*Ses
     const cwd_len = std.process.currentPath(spec.io, &cwd_buffer) catch 0;
     const cwd = try spec.alloc.dupe(u8, cwd_buffer[0..cwd_len]);
     errdefer spec.alloc.free(cwd);
-    const initial_size = currentConsoleSize() orelse resize.Size{ .rows = 24, .cols = 80 };
+    const initial_size = spec.initial_size orelse
+        currentConsoleSize() orelse resize.Size{ .rows = 24, .cols = 80 };
     const spawned = try runtime.spawn(.{
         .session_name = spec.session_name,
         .shell = spec.shell,
@@ -445,6 +511,7 @@ fn reapClients(session: *Session) void {
         var found: ?*Client = null;
         for (session.clients.items, 0..) |client, index| {
             if (!client.closed.load(.acquire)) continue;
+            if (client.broadcast_refs.load(.acquire) != 0) continue;
             found = client;
             _ = session.clients.swapRemove(index);
             break;
@@ -561,14 +628,34 @@ fn recordHistory(session: *Session, payload: []const u8) void {
 }
 
 fn broadcast(session: *Session, tag: wire.Tag, payload: []const u8) void {
+    var clients: std.ArrayList(*Client) = .empty;
     session.lock();
-    defer session.unlock();
+    for (session.clients.items) |client| {
+        if (client.closed.load(.acquire)) continue;
+        _ = client.broadcast_refs.fetchAdd(1, .acq_rel);
+        clients.append(session.alloc, client) catch {
+            _ = client.broadcast_refs.fetchSub(1, .acq_rel);
+            for (clients.items) |held| {
+                _ = held.broadcast_refs.fetchSub(1, .acq_rel);
+            }
+            clients.deinit(session.alloc);
+            session.unlock();
+            return;
+        };
+    }
+    session.unlock();
+    defer {
+        for (clients.items) |client| {
+            _ = client.broadcast_refs.fetchSub(1, .acq_rel);
+        }
+        clients.deinit(session.alloc);
+    }
     const max_payload = Client.max_output_bytes - @sizeOf(wire.Header);
     var offset: usize = 0;
     while (offset < payload.len or (payload.len == 0 and offset == 0)) {
         const amount = @min(payload.len -| offset, max_payload);
         const chunk = payload[offset .. offset + amount];
-        for (session.clients.items) |client| {
+        for (clients.items) |client| {
             if (client.closed.load(.acquire)) continue;
             switch (tag) {
                 .Output => client.enqueueOutput(chunk) catch client.eject(),
@@ -596,9 +683,71 @@ fn writePty(session: *Session, bytes: []const u8) void {
     }
 }
 
+fn asciiStartsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
+    if (value.len < prefix.len) return false;
+    for (value[0..prefix.len], prefix) |left, right| {
+        if (std.ascii.toLower(left) != std.ascii.toLower(right)) return false;
+    }
+    return true;
+}
+
+fn updateSessionCwd(session: *Session, bytes: []const u8) void {
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        var value: ?[]const u8 = null;
+        if (asciiStartsWithIgnoreCase(line, "cd") and
+            (line.len == 2 or std.ascii.isWhitespace(line[2])))
+        {
+            value = std.mem.trim(u8, line[2..], " \t");
+            if (value.?.len >= 2 and asciiStartsWithIgnoreCase(value.?, "/d") and
+                (value.?.len == 2 or std.ascii.isWhitespace(value.?[2])))
+            {
+                value = std.mem.trim(u8, value.?[2..], " \t");
+            }
+        } else if (asciiStartsWithIgnoreCase(line, "chdir") and
+            (line.len == 5 or std.ascii.isWhitespace(line[5])))
+        {
+            value = std.mem.trim(u8, line[5..], " \t");
+        } else if (asciiStartsWithIgnoreCase(line, "pushd") and
+            (line.len == 5 or std.ascii.isWhitespace(line[5])))
+        {
+            value = std.mem.trim(u8, line[5..], " \t");
+        }
+        const raw_value = value orelse continue;
+        if (raw_value.len == 0) continue;
+        const path_value = if (raw_value.len >= 2 and
+            raw_value[0] == '"' and raw_value[raw_value.len - 1] == '"')
+            raw_value[1 .. raw_value.len - 1]
+        else
+            raw_value;
+        var candidate: []u8 = undefined;
+        if (std.fs.path.isAbsolute(path_value)) {
+            candidate = session.alloc.dupe(u8, path_value) catch continue;
+        } else {
+            session.lock();
+            const current = session.cwd;
+            candidate = std.fs.path.join(session.alloc, &.{ current, path_value }) catch {
+                session.unlock();
+                continue;
+            };
+            session.unlock();
+        }
+        var directory = std.Io.Dir.openDirAbsolute(session.spec.io, candidate, .{}) catch {
+            session.alloc.free(candidate);
+            continue;
+        };
+        directory.close(session.spec.io);
+        session.lock();
+        const previous = session.cwd;
+        session.cwd = candidate;
+        session.unlock();
+        session.alloc.free(previous);
+    }
+}
+
 fn clientMain(client: *Client) void {
     const session = client.session;
-    if (session.task_complete.load(.acquire)) sendTaskComplete(client);
     defer {
         client.closed.store(true, .release);
         client.closeOutput();
@@ -609,13 +758,27 @@ fn clientMain(client: *Client) void {
         var frame = wire.readFrame(session.alloc, client.connection) catch break;
         defer frame.deinit(session.alloc);
         switch (frame.header.tag) {
-            .Input, .Send => writePty(session, frame.payload),
+            .Input, .Send => {
+                updateSessionCwd(session, frame.payload);
+                writePty(session, frame.payload);
+            },
             .Output => {
                 recordHistory(session, frame.payload);
                 broadcast(session, .Output, frame.payload);
             },
-            .Resize, .Init => {
+            .Resize => {
                 if (frame.payload.len == @sizeOf(wire.Resize)) {
+                    const size = std.mem.bytesToValue(wire.Resize, frame.payload);
+                    session.runtime.resize(session.master, size) catch {};
+                }
+            },
+            .Init => {
+                if (std.mem.eql(u8, frame.payload, foreground_init) and
+                    session.task_complete.load(.acquire))
+                {
+                    sendHistory(client, &.{});
+                    if (!client.closed.load(.acquire)) sendTaskComplete(client);
+                } else if (frame.payload.len == @sizeOf(wire.Resize)) {
                     const size = std.mem.bytesToValue(wire.Resize, frame.payload);
                     session.runtime.resize(session.master, size) catch {};
                 }
@@ -634,7 +797,14 @@ fn clientMain(client: *Client) void {
             .LabelGet => sendLabels(client),
             .LabelSet => setLabels(client, frame.payload),
             .LabelClear => clearLabels(client),
-            .History => sendHistory(client, frame.payload),
+            .History => {
+                sendHistory(client, frame.payload);
+                if (session.task_complete.load(.acquire) and
+                    !client.closed.load(.acquire))
+                {
+                    sendTaskComplete(client);
+                }
+            },
             .Write => writeFile(client, frame.payload) catch break,
             else => {},
         }
@@ -747,12 +917,95 @@ fn sendHistory(client: *Client, request: []const u8) void {
     };
     session.unlock();
     defer session.alloc.free(history);
-    const formatted = serializeHistory(session.alloc, history, format) catch {
-        client.eject();
-        return;
-    };
-    defer session.alloc.free(formatted);
-    client.enqueue(.History, formatted) catch client.eject();
+    const max_payload = @min(
+        Client.max_output_bytes - @sizeOf(wire.Header),
+        history_chunk_bytes,
+    );
+    switch (format) {
+        0, 1 => {
+            var offset: usize = 0;
+            while (offset < history.len) {
+                const amount = @min(history.len - offset, max_payload);
+                client.enqueueBlocking(.History, history[offset .. offset + amount]) catch {
+                    client.eject();
+                    return;
+                };
+                offset += amount;
+            }
+        },
+        2 => {
+            var chunk: std.ArrayList(u8) = .empty;
+            defer chunk.deinit(session.alloc);
+            const appendEscaped = struct {
+                fn append(
+                    list: *std.ArrayList(u8),
+                    alloc: std.mem.Allocator,
+                    byte: u8,
+                ) !void {
+                    const escaped: []const u8 = switch (byte) {
+                        '&' => "&amp;",
+                        '<' => "&lt;",
+                        '>' => "&gt;",
+                        '"' => "&quot;",
+                        else => return list.append(alloc, byte),
+                    };
+                    try list.appendSlice(alloc, escaped);
+                }
+            }.append;
+            chunk.appendSlice(session.alloc, "<pre>") catch {
+                client.eject();
+                return;
+            };
+            for (history) |byte| {
+                const before = chunk.items.len;
+                appendEscaped(&chunk, session.alloc, byte) catch {
+                    client.eject();
+                    return;
+                };
+                if (chunk.items.len > max_payload) {
+                    const amount = before;
+                    client.enqueueBlocking(.History, chunk.items[0..amount]) catch {
+                        client.eject();
+                        return;
+                    };
+                    chunk.clearRetainingCapacity();
+                    appendEscaped(&chunk, session.alloc, byte) catch {
+                        client.eject();
+                        return;
+                    };
+                }
+            }
+            for ("</pre>\n") |byte| {
+                const before = chunk.items.len;
+                chunk.append(session.alloc, byte) catch {
+                    client.eject();
+                    return;
+                };
+                if (chunk.items.len > max_payload) {
+                    client.enqueueBlocking(.History, chunk.items[0..before]) catch {
+                        client.eject();
+                        return;
+                    };
+                    chunk.clearRetainingCapacity();
+                    chunk.append(session.alloc, byte) catch {
+                        client.eject();
+                        return;
+                    };
+                }
+            }
+            if (chunk.items.len > 0) {
+                client.enqueueBlocking(.History, chunk.items) catch {
+                    client.eject();
+                    return;
+                };
+            }
+        },
+        else => {
+            client.eject();
+            return;
+        },
+    }
+    client.enqueueBlocking(.History, &.{}) catch client.eject();
 }
 
 fn serializeHistory(
@@ -833,7 +1086,19 @@ fn writeFile(client: *Client, payload: []const u8) !void {
     }
     const path = payload[@sizeOf(u32)..][0..path_len];
     const content = payload[@sizeOf(u32) + path_len ..];
-    var file = try std.Io.Dir.cwd().createFile(session.spec.io, path, .{ .truncate = true });
+    const target = if (std.fs.path.isAbsolute(path))
+        try session.alloc.dupe(u8, path)
+    else blk: {
+        session.lock();
+        const joined = std.fs.path.join(session.alloc, &.{ session.cwd, path }) catch |err| {
+            session.unlock();
+            return err;
+        };
+        session.unlock();
+        break :blk joined;
+    };
+    defer session.alloc.free(target);
+    var file = try std.Io.Dir.cwd().createFile(session.spec.io, target, .{ .truncate = true });
     defer file.close(session.spec.io);
     try file.writeStreamingAll(session.spec.io, content);
     client.enqueue(.Ack, "") catch client.eject();

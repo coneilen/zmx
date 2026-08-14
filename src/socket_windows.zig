@@ -63,9 +63,11 @@ pub fn resolveSessionOrEnv(
 ) ![]const u8 {
     const env_name = try getSeshNameFromEnvAlloc(alloc);
     defer if (env_name) |name| alloc.free(name);
-    const name = if (session_name) |value| blk: {
-        if (!std.mem.eql(u8, value, ".")) break :blk value;
-        if (env_name) |current| break :blk current;
+    if (session_name == null or std.mem.eql(u8, session_name.?, ".")) {
+        if (env_name) |current| {
+            try runtime_windows.validateSessionName(current);
+            return alloc.dupe(u8, current);
+        }
         var buffer: [4096]u8 = undefined;
         var writer = std.Io.File.stderr().writer(io, &buffer);
         writer.interface.print(
@@ -74,8 +76,8 @@ pub fn resolveSessionOrEnv(
         ) catch {};
         writer.interface.flush() catch {};
         return error.SessionNameRequired;
-    } else env_name orelse return error.SessionNameRequired;
-    return getSeshName(alloc, name);
+    }
+    return getSeshName(alloc, session_name.?);
 }
 
 pub const SessionMatch = struct {

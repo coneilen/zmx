@@ -8,6 +8,7 @@ const local_ipc = @import("platform/local_ipc.zig");
 const local_ipc_windows = @import("platform/local_ipc_windows.zig");
 const session_windows = @import("platform/session_windows.zig");
 const pty_session_windows = @import("platform/pty_session_windows.zig");
+const resize = @import("platform/resize.zig");
 const wire = @import("platform/session_wire.zig");
 const label = @import("label.zig");
 const completions = @import("completions.zig");
@@ -260,6 +261,8 @@ fn requestResponse(
     var connection = try local_ipc_windows.connect(alloc, .{ .name = endpoint });
     defer connection.close();
     try sendFrame(connection, request_tag, request_payload);
+    var history: std.ArrayList(u8) = .empty;
+    defer history.deinit(alloc);
     while (true) {
         var response = try session_windows.readFrameWithDeadline(
             alloc,
@@ -274,6 +277,15 @@ fn requestResponse(
         if (response.header.tag != response_tag) {
             response.deinit(alloc);
             return error.Unexpected;
+        }
+        if (response_tag == .History) {
+            if (response.payload.len == 0) {
+                response.deinit(alloc);
+                return history.toOwnedSlice(alloc);
+            }
+            try history.appendSlice(alloc, response.payload);
+            response.deinit(alloc);
+            continue;
         }
         return response.payload;
     }
@@ -458,10 +470,7 @@ fn listSessions(
             return std.mem.order(u8, left, right) == .lt;
         }
     }.lessThan);
-    const current_session = if (try socket.getSeshNameFromEnvAlloc(alloc)) |raw_name| blk: {
-        defer alloc.free(raw_name);
-        break :blk try socket.getSeshName(alloc, raw_name);
-    } else null;
+    const current_session = try socket.getSeshNameFromEnvAlloc(alloc);
     defer if (current_session) |name| alloc.free(name);
     if (sessions.items.len == 0) {
         if (short) return;
@@ -638,6 +647,7 @@ fn runSession(
     session_name: []const u8,
     command: ?[]const []const u8,
     detached: bool,
+    initial_size: ?resize.Size,
 ) !void {
     const spec = session_windows.HostSpec{
         .io = io,
@@ -646,6 +656,7 @@ fn runSession(
         .shell = "cmd.exe",
         .task_mode = command != null,
         .command = command,
+        .initial_size = initial_size,
     };
     if (detached) return pty_session_windows.hostDetached(spec);
     return session_windows.host(spec, pty_session_windows.provider());
@@ -690,6 +701,69 @@ fn tailSession(
     if (exit_code != 0) return error.TaskFailed;
 }
 
+const TailContext = struct {
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    output_lock: std.atomic.Value(u8) = .init(0),
+    error_lock: std.atomic.Value(u8) = .init(0),
+    first_error: ?anyerror = null,
+};
+
+fn tailWorkerMain(context: *TailContext, session_name: []const u8) void {
+    const endpoint = runtime_windows.resolveEndpointPath(
+        context.io,
+        context.alloc,
+        session_name,
+    ) catch |err| {
+        lockTailError(&context.error_lock);
+        if (context.first_error == null) context.first_error = err;
+        unlockTailError(&context.error_lock);
+        return;
+    };
+    defer context.alloc.free(endpoint);
+    var connection = local_ipc_windows.connect(
+        context.alloc,
+        .{ .name = endpoint },
+    ) catch |err| {
+        lockTailError(&context.error_lock);
+        if (context.first_error == null) context.first_error = err;
+        unlockTailError(&context.error_lock);
+        return;
+    };
+    defer connection.close();
+    const exit_code = pty_session_windows.tailToWriter(
+        .{
+            .io = context.io,
+            .alloc = context.alloc,
+            .session_name = session_name,
+        },
+        connection,
+        context.writer,
+        &context.output_lock,
+    ) catch |err| {
+        lockTailError(&context.error_lock);
+        if (context.first_error == null) context.first_error = err;
+        unlockTailError(&context.error_lock);
+        return;
+    };
+    if (exit_code != 0) {
+        lockTailError(&context.error_lock);
+        if (context.first_error == null) context.first_error = error.TaskFailed;
+        unlockTailError(&context.error_lock);
+    }
+}
+
+fn lockTailError(lock: *std.atomic.Value(u8)) void {
+    while (lock.cmpxchgStrong(0, 1, .acquire, .monotonic) != null) {
+        std.atomic.spinLoopHint();
+    }
+}
+
+fn unlockTailError(lock: *std.atomic.Value(u8)) void {
+    lock.store(0, .release);
+}
+
 fn tailSessions(
     io: std.Io,
     alloc: std.mem.Allocator,
@@ -703,8 +777,7 @@ fn tailSessions(
     if (raw_args.len == 0) {
         const current = (try socket.getSeshNameFromEnvAlloc(alloc)) orelse
             return error.SessionNameRequired;
-        defer alloc.free(current);
-        try matchers.append(alloc, try socket.parseSessionArg(alloc, current));
+        try matchers.append(alloc, .{ .name = current, .is_prefix = false });
     } else {
         for (raw_args) |raw| {
             if (std.mem.eql(u8, raw, "--help") or std.mem.eql(u8, raw, "-h")) {
@@ -713,8 +786,7 @@ fn tailSessions(
             if (std.mem.eql(u8, raw, ".")) {
                 const current = (try socket.getSeshNameFromEnvAlloc(alloc)) orelse
                     return error.SessionNameRequired;
-                defer alloc.free(current);
-                try matchers.append(alloc, try socket.parseSessionArg(alloc, current));
+                try matchers.append(alloc, .{ .name = current, .is_prefix = false });
             } else {
                 try matchers.append(alloc, try socket.parseSessionArg(alloc, raw));
             }
@@ -759,13 +831,34 @@ fn tailSessions(
     }
     if (targets.items.len == 0) return error.NoMatchingSessions;
 
-    var first_error: ?anyerror = null;
+    if (targets.items.len == 1) {
+        return tailSession(io, alloc, targets.items[0]);
+    }
+
+    var output_buffer: [16 * 1024]u8 = undefined;
+    var writer = std.Io.File.stdout().writer(io, &output_buffer);
+    var context = TailContext{
+        .io = io,
+        .alloc = alloc,
+        .writer = &writer.interface,
+    };
+    var threads: std.ArrayList(std.Thread) = .empty;
+    defer threads.deinit(alloc);
     for (targets.items) |target| {
-        tailSession(io, alloc, target) catch |err| {
-            if (first_error == null) first_error = err;
+        threads.append(
+            alloc,
+            std.Thread.spawn(.{}, tailWorkerMain, .{ &context, target }) catch |err| {
+                for (threads.items) |thread| thread.join();
+                return err;
+            },
+        ) catch |err| {
+            for (threads.items) |thread| thread.join();
+            return err;
         };
     }
-    if (first_error) |err| return err;
+    for (threads.items) |thread| thread.join();
+    if (context.first_error) |err| return err;
+    try writer.interface.flush();
 }
 
 fn runForegroundSession(
@@ -851,6 +944,16 @@ fn spawnDetached(
     try argv.append(alloc, program);
     try argv.append(alloc, "--daemon");
     try argv.append(alloc, session_name);
+    var initial_size_arg: ?[]u8 = null;
+    defer if (initial_size_arg) |value| alloc.free(value);
+    if (pty_session_windows.currentConsoleSize()) |size| {
+        initial_size_arg = try std.fmt.allocPrint(
+            alloc,
+            "--zmx-initial-size={d}x{d}",
+            .{ size.cols, size.rows },
+        );
+        try argv.append(alloc, initial_size_arg.?);
+    }
     if (command) |parts| try argv.appendSlice(alloc, parts);
     var child = try std.process.spawn(io, .{
         .argv = argv.items,
@@ -961,10 +1064,23 @@ pub fn main(init: std.process.Init) !void {
         try runtime_windows.validateSessionName(session_name);
         var command_args: std.ArrayList([]const u8) = .empty;
         defer command_args.deinit(gpa);
+        var initial_size: ?resize.Size = null;
         while (args.next()) |part| try command_args.append(gpa, part);
+        if (command_args.items.len > 0 and
+            std.mem.startsWith(u8, command_args.items[0], "--zmx-initial-size="))
+        {
+            const encoded = command_args.orderedRemove(0)["--zmx-initial-size=".len..];
+            const separator = std.mem.indexOfScalar(u8, encoded, 'x') orelse
+                return error.InvalidSize;
+            initial_size = .{
+                .cols = try std.fmt.parseInt(u16, encoded[0..separator], 10),
+                .rows = try std.fmt.parseInt(u16, encoded[separator + 1 ..], 10),
+            };
+            if (!resize.isUsable(initial_size.?)) return error.InvalidSize;
+        }
         const command_slice: ?[]const []const u8 =
             if (command_args.items.len == 0) null else command_args.items;
-        return runSession(io, gpa, session_name, command_slice, false);
+        return runSession(io, gpa, session_name, command_slice, false, initial_size);
     }
 
     if (std.mem.eql(u8, command, "run") or std.mem.eql(u8, command, "r")) {
