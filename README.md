@@ -218,6 +218,15 @@ if command -v zmx &> /dev/null; then
 fi
 ```
 
+## Windows coding-agent matrix
+
+Native Windows compatibility coverage for Claude Code, GitHub Copilot CLI, and
+Codex is provided by
+`test/windows-agent-matrix.ps1`. It runs public, credential-free prompts
+through real zmx ConPTY sessions and emits explicit skips for unavailable or
+unsupported capabilities. See
+[`docs/windows-agent-matrix.md`](docs/windows-agent-matrix.md).
+
 ### zsh
 
 Add this to your `.zshrc` file:
