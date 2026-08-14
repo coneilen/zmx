@@ -190,6 +190,9 @@ const Client = struct {
     output_closed: bool = false,
     cwd_input: std.ArrayList(u8) = .empty,
     input: input_classifier.InputClassifier = undefined,
+    input_lock: std.atomic.Value(u8) = .init(0),
+    esc_timer_cancel: std.atomic.Value(bool) = .init(false),
+    esc_timer_active: std.atomic.Value(bool) = .init(false),
 
     const max_output_bytes = 256 * 1024;
     const max_cwd_input_bytes = 4096;
@@ -203,6 +206,16 @@ const Client = struct {
 
     fn unlockOutput(self: *Client) void {
         self.output_lock.store(0, .release);
+    }
+
+    fn lockInput(self: *Client) void {
+        while (self.input_lock.cmpxchgStrong(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn unlockInput(self: *Client) void {
+        self.input_lock.store(0, .release);
     }
 
     fn closeOutput(self: *Client) void {
@@ -820,25 +833,75 @@ fn sendForegroundHistory(client: *Client, blocking: bool) void {
     }
 }
 
-fn writePtyLocked(session: *Session, bytes: []const u8) void {
+const pty_retry_ms: windows.DWORD = 1;
+
+fn writePtyCancellable(
+    session: *Session,
+    client: ?*Client,
+    generation: ?u64,
+    bytes: []const u8,
+) bool {
     var offset: usize = 0;
-    while (offset < bytes.len and session.alive.load(.acquire)) {
-        const amount = session.runtime.write(session.master, bytes[offset..]) catch |err| switch (err) {
-            error.WouldBlock => {
-                session.runtime.waitWritable(session.master) catch return;
-                continue;
-            },
-            else => return,
+    while (offset < bytes.len) {
+        session.lock();
+        const invalid_client = if (client) |owner|
+            owner.closed.load(.acquire) or session.leader != owner
+        else
+            false;
+        const invalid_generation = if (generation) |expected|
+            session.leader_generation != expected
+        else
+            false;
+        if (!session.alive.load(.acquire) or invalid_client or invalid_generation) {
+            session.unlock();
+            return false;
+        }
+        session.unlock();
+
+        // PTY serialization is independent from session state. Never wait
+        // for another PTY operation while holding the session-wide lock.
+        session.lockPty();
+        session.lock();
+        const retry_invalid_client = if (client) |owner|
+            owner.closed.load(.acquire) or session.leader != owner
+        else
+            false;
+        const retry_invalid_generation = if (generation) |expected|
+            session.leader_generation != expected
+        else
+            false;
+        if (!session.alive.load(.acquire) or
+            retry_invalid_client or
+            retry_invalid_generation)
+        {
+            session.unlock();
+            session.unlockPty();
+            return false;
+        }
+        // The session lock only covers this single non-blocking queue push.
+        // A full ConPTY input queue releases both locks before retrying so
+        // leadership, detach, reconnect, output, and kill remain responsive.
+        const amount = session.runtime.write(session.master, bytes[offset..]) catch |err| {
+            session.unlock();
+            session.unlockPty();
+            switch (err) {
+                error.WouldBlock => {
+                    kernel32.Sleep(pty_retry_ms);
+                    continue;
+                },
+                else => return false,
+            }
         };
-        if (amount == 0) return;
+        session.unlock();
+        session.unlockPty();
+        if (amount == 0) return false;
         offset += amount;
     }
+    return true;
 }
 
 fn writePty(session: *Session, bytes: []const u8) void {
-    session.lockPty();
-    defer session.unlockPty();
-    writePtyLocked(session, bytes);
+    _ = writePtyCancellable(session, null, null, bytes);
 }
 
 fn withLeaderPtyOperation(
@@ -849,11 +912,19 @@ fn withLeaderPtyOperation(
     context: *anyopaque,
 ) bool {
     session.lock();
-    defer session.unlock();
-    if (session.leader != client or session.leader_generation != generation) return false;
+    const valid = session.leader == client and session.leader_generation == generation;
+    session.unlock();
+    if (!valid) return false;
     session.lockPty();
-    defer session.unlockPty();
+    session.lock();
+    if (session.leader != client or session.leader_generation != generation) {
+        session.unlock();
+        session.unlockPty();
+        return false;
+    }
     operation(context);
+    session.unlock();
+    session.unlockPty();
     return true;
 }
 
@@ -864,22 +935,20 @@ fn withGenerationPtyOperation(
     context: *anyopaque,
 ) bool {
     session.lock();
-    defer session.unlock();
-    if (session.leader_generation != generation) return false;
+    const valid = session.leader_generation == generation;
+    session.unlock();
+    if (!valid) return false;
     session.lockPty();
-    defer session.unlockPty();
+    session.lock();
+    if (session.leader_generation != generation) {
+        session.unlock();
+        session.unlockPty();
+        return false;
+    }
     operation(context);
+    session.unlock();
+    session.unlockPty();
     return true;
-}
-
-const WritePtyContext = struct {
-    session: *Session,
-    bytes: []const u8,
-};
-
-fn writePtyOperation(context: *anyopaque) void {
-    const write_context: *WritePtyContext = @ptrCast(@alignCast(context));
-    writePtyLocked(write_context.session, write_context.bytes);
 }
 
 fn leaderSnapshot(session: *Session, client: *Client) struct {
@@ -900,17 +969,7 @@ fn writePtyIfLeader(
     generation: u64,
     bytes: []const u8,
 ) bool {
-    var context = WritePtyContext{
-        .session = session,
-        .bytes = bytes,
-    };
-    return withLeaderPtyOperation(
-        session,
-        client,
-        generation,
-        writePtyOperation,
-        @ptrCast(&context),
-    );
+    return writePtyCancellable(session, client, generation, bytes);
 }
 
 fn writePtyIfGeneration(
@@ -918,16 +977,7 @@ fn writePtyIfGeneration(
     generation: u64,
     bytes: []const u8,
 ) bool {
-    var context = WritePtyContext{
-        .session = session,
-        .bytes = bytes,
-    };
-    return withGenerationPtyOperation(
-        session,
-        generation,
-        writePtyOperation,
-        @ptrCast(&context),
-    );
+    return writePtyCancellable(session, null, generation, bytes);
 }
 
 fn resizePtyLocked(session: *Session, size: resize.Size) void {
@@ -1082,18 +1132,44 @@ fn claimLeaderAndWrite(
     bytes: []const u8,
 ) bool {
     var changed = false;
+    var generation: u64 = undefined;
     session.lock();
     if (session.leader != client) {
         session.leader = client;
         session.leader_generation +%= 1;
         changed = true;
     }
-    session.lockPty();
-    writePtyLocked(session, bytes);
-    session.unlockPty();
+    generation = session.leader_generation;
     session.unlock();
     if (changed) client.enqueue(.Resize, &.{}) catch client.eject();
-    return true;
+    return writePtyIfLeader(session, client, generation, bytes);
+}
+
+fn flushLoneEscape(client: *Client) void {
+    client.lockInput();
+    const result = client.input.flushLoneEsc() catch {
+        client.unlockInput();
+        client.eject();
+        return;
+    };
+    client.unlockInput();
+    defer client.session.alloc.free(result.bytes);
+    if (result.bytes.len == 0) return;
+    if (claimLeaderAndWrite(client.session, client, result.bytes)) {
+        updateSessionCwd(client, result.bytes, false);
+    }
+}
+
+fn loneEscapeTimerMain(client: *Client) void {
+    defer client.esc_timer_active.store(false, .release);
+    kernel32.Sleep(@intCast(input_classifier.InputClassifier.lone_esc_timeout_ms));
+    if (client.esc_timer_cancel.load(.acquire) or
+        client.closed.load(.acquire) or
+        !client.session.alive.load(.acquire))
+    {
+        return;
+    }
+    flushLoneEscape(client);
 }
 
 fn releaseLeader(session: *Session, client: *Client) void {
@@ -1118,9 +1194,12 @@ fn releaseLeader(session: *Session, client: *Client) void {
 
 fn clientMain(client: *Client) void {
     const session = client.session;
+    var lone_escape_thread: ?std.Thread = null;
     defer {
-        releaseLeader(session, client);
+        client.esc_timer_cancel.store(true, .release);
         client.closed.store(true, .release);
+        if (lone_escape_thread) |thread| thread.join();
+        releaseLeader(session, client);
         client.closeOutput();
         client.closeConnection();
         _ = session.active_clients.fetchSub(1, .acq_rel);
@@ -1133,7 +1212,12 @@ fn clientMain(client: *Client) void {
             .Input => {
                 const snapshot = leaderSnapshot(session, client);
                 if (snapshot.is_leader) {
-                    const bytes = client.input.observeLeader(frame.payload) catch break;
+                    client.lockInput();
+                    const bytes = client.input.observeLeader(frame.payload) catch {
+                        client.unlockInput();
+                        break;
+                    };
+                    client.unlockInput();
                     defer session.alloc.free(bytes);
                     if (bytes.len == 0 or
                         writePtyIfLeader(session, client, snapshot.generation, bytes))
@@ -1141,7 +1225,13 @@ fn clientMain(client: *Client) void {
                         updateSessionCwd(client, bytes, false);
                     }
                 } else {
-                    const result = client.input.filterNonLeader(frame.payload) catch break;
+                    client.lockInput();
+                    const result = client.input.filterNonLeader(frame.payload) catch {
+                        client.unlockInput();
+                        break;
+                    };
+                    const pending_lone_escape = client.input.hasPendingLoneEsc();
+                    client.unlockInput();
                     defer session.alloc.free(result.bytes);
                     const accepted = if (result.bytes.len == 0)
                         true
@@ -1150,6 +1240,27 @@ fn clientMain(client: *Client) void {
                     else
                         writePtyIfGeneration(session, snapshot.generation, result.bytes);
                     if (accepted) updateSessionCwd(client, result.bytes, false);
+                    if (pending_lone_escape) {
+                        if (lone_escape_thread != null and
+                            !client.esc_timer_active.load(.acquire))
+                        {
+                            lone_escape_thread.?.join();
+                            lone_escape_thread = null;
+                        }
+                        if (lone_escape_thread == null) {
+                            client.esc_timer_cancel.store(false, .release);
+                            client.esc_timer_active.store(true, .release);
+                            lone_escape_thread = std.Thread.spawn(
+                                .{},
+                                loneEscapeTimerMain,
+                                .{client},
+                            ) catch blk: {
+                                client.esc_timer_active.store(false, .release);
+                                flushLoneEscape(client);
+                                break :blk null;
+                            };
+                        }
+                    }
                 }
             },
             .Send => {

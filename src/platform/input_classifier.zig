@@ -15,6 +15,7 @@ pub const InputClassifier = struct {
     // keyboard reports can be larger, but they still must not make a client
     // retain or repeatedly rescan an unbounded suffix across frames.
     pub const max_carry_bytes: usize = 64 * 1024;
+    pub const lone_esc_timeout_ms: u64 = 50;
 
     pub const Result = struct {
         bytes: []u8,
@@ -36,6 +37,25 @@ pub const InputClassifier = struct {
 
     pub fn filterNonLeader(self: *InputClassifier, payload: []const u8) !Result {
         return self.analyze(payload, false);
+    }
+
+    pub fn hasPendingLoneEsc(self: *const InputClassifier) bool {
+        return !self.quarantined and
+            !self.carry_emitted and
+            !self.carry_from_leader and
+            self.carry.items.len == 1 and
+            self.carry.items[0] == 0x1b;
+    }
+
+    pub fn flushLoneEsc(self: *InputClassifier) !Result {
+        if (!self.hasPendingLoneEsc()) return self.emptyResult();
+        self.carry.clearRetainingCapacity();
+        self.carry_emitted = false;
+        self.carry_from_leader = false;
+        return .{
+            .bytes = try self.alloc.dupe(u8, &.{0x1b}),
+            .claims_leadership = true,
+        };
     }
 
     fn quarantine(self: *InputClassifier) void {
@@ -322,4 +342,32 @@ test "Windows attach classifier quarantines oversized escape carry" {
     defer std.testing.allocator.free(recovered.bytes);
     try std.testing.expectEqualStrings("y", recovered.bytes);
     try std.testing.expect(recovered.claims_leadership);
+}
+
+test "Windows attach classifier bounds a non-leader lone escape" {
+    var classifier = InputClassifier.init(std.testing.allocator);
+    defer classifier.deinit();
+    const held = try classifier.filterNonLeader("\x1b");
+    defer std.testing.allocator.free(held.bytes);
+    try std.testing.expectEqual(@as(usize, 0), held.bytes.len);
+    try std.testing.expect(!held.claims_leadership);
+    try std.testing.expect(classifier.hasPendingLoneEsc());
+
+    const flushed = try classifier.flushLoneEsc();
+    defer std.testing.allocator.free(flushed.bytes);
+    try std.testing.expectEqualSlices(u8, &.{0x1b}, flushed.bytes);
+    try std.testing.expect(flushed.claims_leadership);
+    try std.testing.expect(!classifier.hasPendingLoneEsc());
+}
+
+test "Windows attach classifier keeps continuation before lone escape timeout" {
+    var classifier = InputClassifier.init(std.testing.allocator);
+    defer classifier.deinit();
+    const held = try classifier.filterNonLeader("\x1b");
+    defer std.testing.allocator.free(held.bytes);
+    const result = try classifier.filterNonLeader("[A");
+    defer std.testing.allocator.free(result.bytes);
+    try std.testing.expectEqualStrings("\x1b[A", result.bytes);
+    try std.testing.expect(result.claims_leadership);
+    try std.testing.expect(!classifier.hasPendingLoneEsc());
 }
