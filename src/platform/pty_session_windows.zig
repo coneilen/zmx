@@ -365,7 +365,7 @@ fn writerMain(client: *Client) void {
 fn sendInfo(client: *Client) void {
     var info = std.mem.zeroes(wire.Info);
     info.pid = @intCast(client.session.process);
-    info.clients_len = client.session.active_clients.load(.acquire);
+    info.clients_len = client.session.active_clients.load(.acquire) -| 1;
     const command = client.session.spec.command orelse &[_][]const u8{};
     var command_len: usize = 0;
     for (command, 0..) |part, index| {
