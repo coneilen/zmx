@@ -10,6 +10,7 @@ const session_windows = @import("platform/session_windows.zig");
 const pty_session_windows = @import("platform/pty_session_windows.zig");
 const wire = @import("platform/session_wire.zig");
 const label = @import("label.zig");
+const completions = @import("completions.zig");
 
 const WireTag = wire.Tag;
 const WireHeader = wire.Header;
@@ -501,6 +502,43 @@ fn unsupported(io: std.Io, command: []const u8) !void {
     return error.UnsupportedCommand;
 }
 
+fn printHelp(io: std.Io) !void {
+    var buffer: [4096]u8 = undefined;
+    var writer = std.Io.File.stdout().writer(io, &buffer);
+    try writer.interface.writeAll(
+        \\Usage: zmx <command> [session] [args...]
+        \\
+        \\Commands:
+        \\  run, r       Run a task (use -d/--detach to detach)
+        \\  attach, a    Attach to a session, creating it if needed
+        \\  tail, t      Follow session output
+        \\  send, s      Send input to the PTY
+        \\  print, p     Broadcast output to attached clients and history
+        \\  write, wr    Write stdin to a file through the session
+        \\  list, ls     List sessions (bare `zmx` does the same)
+        \\  kill, k      Kill one or more sessions (--force accepted)
+        \\  detach, d   Detach all clients
+        \\  wait, w      Wait for task completion
+        \\  resize       Resize a session
+        \\  history      Show session history (--vt or --html)
+        \\  get, set     Read or set labels
+        \\  unset        Remove labels
+        \\  clear        Clear all labels
+        \\  completions  Print shell completions
+        \\  version      Show version
+        \\
+    );
+    try writer.interface.flush();
+}
+
+fn printCompletions(io: std.Io, shell_name: []const u8) !void {
+    const shell = completions.Shell.fromString(shell_name) orelse return error.UnsupportedCommand;
+    var buffer: [16 * 1024]u8 = undefined;
+    var writer = std.Io.File.stdout().writer(io, &buffer);
+    try writer.interface.writeAll(shell.getCompletionScript());
+    try writer.interface.flush();
+}
+
 fn waitForTasks(
     io: std.Io,
     alloc: std.mem.Allocator,
@@ -610,6 +648,104 @@ fn runSession(
     return session_windows.host(spec, pty_session_windows.provider());
 }
 
+fn attachTaskSession(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    session_name: []const u8,
+) !u8 {
+    const endpoint = try runtime_windows.resolveEndpointPath(io, alloc, session_name);
+    defer alloc.free(endpoint);
+    var connection = try local_ipc_windows.connect(alloc, .{ .name = endpoint });
+    defer connection.close();
+    return pty_session_windows.attachForeground(
+        .{
+            .io = io,
+            .alloc = alloc,
+            .session_name = session_name,
+        },
+        connection,
+    );
+}
+
+fn tailSession(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    session_name: []const u8,
+) !void {
+    const endpoint = try runtime_windows.resolveEndpointPath(io, alloc, session_name);
+    defer alloc.free(endpoint);
+    var connection = try local_ipc_windows.connect(alloc, .{ .name = endpoint });
+    defer connection.close();
+    const exit_code = try pty_session_windows.tail(
+        .{
+            .io = io,
+            .alloc = alloc,
+            .session_name = session_name,
+        },
+        connection,
+    );
+    if (exit_code != 0) return error.TaskFailed;
+}
+
+fn runForegroundSession(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    program: []const u8,
+    session_name: []const u8,
+    command: ?[]const []const u8,
+) !void {
+    try spawnDetached(io, program, alloc, session_name, command);
+    const exit_code = try attachTaskSession(io, alloc, session_name);
+    if (exit_code != 0) return error.TaskFailed;
+}
+
+fn killSessions(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    cfg: *const Cfg,
+    raw_args: []const []const u8,
+) !void {
+    var matchers: std.ArrayList(socket.SessionMatch) = .empty;
+    defer {
+        for (matchers.items) |matcher| alloc.free(matcher.name);
+        matchers.deinit(alloc);
+    }
+    var force = false;
+    for (raw_args) |arg| {
+        if (std.mem.eql(u8, arg, "--force")) {
+            force = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            return printHelp(io);
+        }
+        try matchers.append(alloc, try socket.parseSessionArg(alloc, arg));
+    }
+    if (matchers.items.len == 0) return error.SessionNameRequired;
+
+    var sessions = try runtime_windows.listSessionNames(io, alloc);
+    defer {
+        for (sessions.items) |name| alloc.free(name);
+        sessions.deinit(alloc);
+    }
+    var matched_count: usize = 0;
+    for (sessions.items) |session_name| {
+        var matched = false;
+        for (matchers.items) |matcher| {
+            if (matcher.matches(session_name)) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) continue;
+        matched_count += 1;
+        sendPayload(io, alloc, cfg, session_name, .Kill, &.{}) catch |err| {
+            if (!force) return err;
+        };
+    }
+    if (matched_count == 0) return error.NoMatchingSessions;
+}
+
 fn spawnDetached(
     io: std.Io,
     program: []const u8,
@@ -717,6 +853,12 @@ pub fn main(init: std.process.Init) !void {
     const command = args.next() orelse {
         return listSessions(io, gpa, &cfg, &.{});
     };
+    if (std.mem.eql(u8, command, "help") or
+        std.mem.eql(u8, command, "-h") or
+        std.mem.eql(u8, command, "--help"))
+    {
+        return printHelp(io);
+    }
     if (std.mem.eql(u8, command, "version") or
         std.mem.eql(u8, command, "v") or
         std.mem.eql(u8, command, "-v") or
@@ -745,6 +887,9 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, command, "run") or std.mem.eql(u8, command, "r")) {
         const session_name = args.next() orelse return error.SessionNameRequired;
+        if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
+            return printHelp(io);
+        }
         try runtime_windows.validateSessionName(session_name);
         var command_args: std.ArrayList([]const u8) = .empty;
         defer command_args.deinit(gpa);
@@ -764,11 +909,17 @@ pub fn main(init: std.process.Init) !void {
         const command_slice: ?[]const []const u8 =
             if (command_args.items.len == 0) null else command_args.items;
         if (detached) return spawnDetached(io, program, gpa, session_name, command_slice);
-        return runSession(io, gpa, session_name, command_slice, false);
+        return runForegroundSession(io, gpa, program, session_name, command_slice);
     }
 
     if (std.mem.eql(u8, command, "attach") or std.mem.eql(u8, command, "a")) {
-        const session_name = try socket.resolveSessionOrEnv(gpa, io, args.next());
+        const raw_session_name = args.next();
+        if (raw_session_name) |name| {
+            if (std.mem.eql(u8, name, "--help") or std.mem.eql(u8, name, "-h")) {
+                return printHelp(io);
+            }
+        }
+        const session_name = try socket.resolveSessionOrEnv(gpa, io, raw_session_name);
         defer gpa.free(session_name);
         var command_args: std.ArrayList([]const u8) = .empty;
         defer command_args.deinit(gpa);
@@ -791,6 +942,19 @@ pub fn main(init: std.process.Init) !void {
             };
         }
         return attachSession(io, gpa, session_name);
+    }
+
+    if (std.mem.eql(u8, command, "tail") or std.mem.eql(u8, command, "t")) {
+        const raw_session_name = args.next();
+        if (raw_session_name) |name| {
+            if (std.mem.eql(u8, name, "--help") or std.mem.eql(u8, name, "-h")) {
+                return printHelp(io);
+            }
+        }
+        const session_name = try socket.resolveSessionOrEnv(gpa, io, raw_session_name);
+        defer gpa.free(session_name);
+        if (args.next() != null) return error.UnsupportedCommand;
+        return tailSession(io, gpa, session_name);
     }
 
     if (std.mem.eql(u8, command, "list") or
@@ -821,7 +985,7 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, session_arg, "--help") or
                 std.mem.eql(u8, session_arg, "-h"))
             {
-                return error.UnsupportedCommand;
+                return printHelp(io);
             }
             try session_args.append(gpa, session_arg);
         }
@@ -838,6 +1002,41 @@ pub fn main(init: std.process.Init) !void {
             .rows = try std.fmt.parseInt(u16, rows_text, 10),
         };
         return sendPayload(io, gpa, &cfg, session_name, .Resize, std.mem.asBytes(&size));
+    }
+
+    if (std.mem.eql(u8, command, "kill") or std.mem.eql(u8, command, "k")) {
+        var kill_args: std.ArrayList([]const u8) = .empty;
+        defer kill_args.deinit(gpa);
+        while (args.next()) |part| try kill_args.append(gpa, part);
+        return killSessions(io, gpa, &cfg, kill_args.items);
+    }
+
+    if (std.mem.eql(u8, command, "unset")) {
+        const session_name = try socket.resolveSessionOrEnv(gpa, io, args.next());
+        defer gpa.free(session_name);
+        var keys: std.ArrayList([]const u8) = .empty;
+        defer keys.deinit(gpa);
+        while (args.next()) |key| {
+            if (std.mem.eql(u8, key, "--help") or std.mem.eql(u8, key, "-h")) {
+                return printHelp(io);
+            }
+            try keys.append(gpa, key);
+        }
+        if (keys.items.len == 0) return error.TextRequired;
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(gpa);
+        for (keys.items, 0..) |key, index| {
+            if (index != 0) try payload.append(gpa, ' ');
+            try payload.appendSlice(gpa, key);
+            try payload.append(gpa, '=');
+        }
+        return sendPayload(io, gpa, &cfg, session_name, .LabelSet, payload.items);
+    }
+
+    if (std.mem.eql(u8, command, "completions")) {
+        const shell_name = args.next() orelse return error.UnsupportedCommand;
+        if (args.next() != null) return error.UnsupportedCommand;
+        return printCompletions(io, shell_name);
     }
 
     if (wireTagForCommand(command)) |tag| {

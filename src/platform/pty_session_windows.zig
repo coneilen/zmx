@@ -62,6 +62,8 @@ const Session = struct {
     reader_thread: ?std.Thread = null,
     labels: std.StringHashMapUnmanaged([]const u8) = .empty,
     history: std.ArrayList(u8) = .empty,
+    created_at: u64 = 0,
+    cwd: []u8 = &.{},
     task_ended_at: u64 = 0,
     task_exit_code: u8 = 0,
 
@@ -169,11 +171,57 @@ fn attachThunk(
     return attachLoop(spec, connection);
 }
 
+pub fn attachForeground(
+    spec: session_windows.AttachSpec,
+    connection: local_ipc.Connection,
+) !u8 {
+    return (try attachLoopResult(spec, connection)) orelse error.SessionEnded;
+}
+
+pub fn tail(
+    spec: session_windows.AttachSpec,
+    connection: local_ipc.Connection,
+) !u8 {
+    try wire.writeFrame(connection, .History, &.{});
+    var output_buffer: [16 * 1024]u8 = undefined;
+    var writer = std.Io.File.stdout().writer(spec.io, &output_buffer);
+    var task_exit_code: ?u8 = null;
+    var history_received = false;
+    while (true) {
+        var frame = wire.readFrame(spec.alloc, connection) catch |err| switch (err) {
+            error.BrokenPipe, error.ConnectionResetByPeer => return error.SessionEnded,
+            else => return err,
+        };
+        defer frame.deinit(spec.alloc);
+        switch (frame.header.tag) {
+            .Output => {
+                try writer.interface.writeAll(frame.payload);
+                try writer.interface.flush();
+            },
+            .History => {
+                try writer.interface.writeAll(frame.payload);
+                try writer.interface.flush();
+                history_received = true;
+                if (task_exit_code) |exit_code| return exit_code;
+            },
+            .TaskComplete => {
+                task_exit_code = if (frame.payload.len == 0) 0 else frame.payload[0];
+                if (history_received) return task_exit_code.?;
+            },
+            else => {},
+        }
+    }
+}
+
 fn createSession(spec: session_windows.HostSpec, server: local_ipc.Server) !*Session {
     const session = try spec.alloc.create(Session);
     errdefer spec.alloc.destroy(session);
     var runtime = pty_runtime.Runtime.init(spec.alloc);
     errdefer runtime.deinit();
+    var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = std.process.currentPath(spec.io, &cwd_buffer) catch 0;
+    const cwd = try spec.alloc.dupe(u8, cwd_buffer[0..cwd_len]);
+    errdefer spec.alloc.free(cwd);
     const spawned = try runtime.spawn(.{
         .session_name = spec.session_name,
         .shell = spec.shell,
@@ -188,6 +236,8 @@ fn createSession(spec: session_windows.HostSpec, server: local_ipc.Server) !*Ses
         .runtime = runtime,
         .master = spawned.master,
         .process = spawned.process,
+        .created_at = @intCast(std.Io.Timestamp.now(spec.io, .real).toSeconds()),
+        .cwd = cwd,
     };
     session.reader_thread = try std.Thread.spawn(.{}, readerMain, .{session});
     return session;
@@ -281,6 +331,7 @@ fn destroySession(session: *Session) void {
     }
     session.clients.deinit(session.alloc);
     session.history.deinit(session.alloc);
+    session.alloc.free(session.cwd);
     var labels = session.labels;
     var label_it = labels.iterator();
     while (label_it.next()) |entry| {
@@ -451,6 +502,9 @@ fn sendInfo(client: *Client) void {
     info.pid = @intCast(client.session.process);
     info.clients_len = client.session.active_clients.load(.acquire) -| 1;
     client.session.lock();
+    info.created_at = client.session.created_at;
+    info.cwd_len = @intCast(@min(client.session.cwd.len, info.cwd.len));
+    @memcpy(info.cwd[0..info.cwd_len], client.session.cwd[0..info.cwd_len]);
     info.task_ended_at = client.session.task_ended_at;
     info.task_exit_code = client.session.task_exit_code;
     client.session.unlock();
@@ -603,6 +657,10 @@ fn writeFile(client: *Client, payload: []const u8) !void {
 }
 
 fn attachLoop(spec: session_windows.AttachSpec, connection: local_ipc.Connection) !void {
+    _ = try attachLoopResult(spec, connection);
+}
+
+fn attachLoopResult(spec: session_windows.AttachSpec, connection: local_ipc.Connection) !?u8 {
     var stop = std.atomic.Value(bool).init(false);
     const stdin_file = std.Io.File.stdin();
     const stdin_handle = kernel32.GetStdHandle(std_input_handle);
@@ -610,11 +668,16 @@ fn attachLoop(spec: session_windows.AttachSpec, connection: local_ipc.Connection
     var console_input = false;
     var mode: windows.DWORD = 0;
     if (@intFromEnum(kernel32.GetConsoleMode(stdin_handle, &mode)) != 0) {
-        original_console_mode = mode;
         console_input = true;
         const raw_mode = mode & ~enableProcessedInput & ~enableLineInput & ~enableEchoInput;
-        _ = kernel32.SetConsoleMode(stdin_handle, raw_mode);
+        if (@intFromEnum(kernel32.SetConsoleMode(stdin_handle, raw_mode)) != 0) {
+            original_console_mode = mode;
+        }
     }
+    defer if (original_console_mode) |restore_mode| {
+        _ = kernel32.SetConsoleMode(stdin_handle, restore_mode);
+        original_console_mode = null;
+    };
     var input = AttachInput{
         .io = spec.io,
         .alloc = spec.alloc,
@@ -630,12 +693,14 @@ fn attachLoop(spec: session_windows.AttachSpec, connection: local_ipc.Connection
         input_thread.join();
         if (original_console_mode) |restore_mode| {
             _ = kernel32.SetConsoleMode(stdin_handle, restore_mode);
+            original_console_mode = null;
         }
         stdin_file.close(spec.io);
     }
 
     var output_buffer: [16 * 1024]u8 = undefined;
     var writer = std.Io.File.stdout().writer(spec.io, &output_buffer);
+    var task_exit_code: ?u8 = null;
     while (!stop.load(.acquire)) {
         var frame = wire.readFrame(spec.alloc, connection) catch break;
         defer frame.deinit(spec.alloc);
@@ -644,10 +709,14 @@ fn attachLoop(spec: session_windows.AttachSpec, connection: local_ipc.Connection
                 try writer.interface.writeAll(frame.payload);
                 try writer.interface.flush();
             },
-            .TaskComplete => stop.store(true, .release),
+            .TaskComplete => {
+                task_exit_code = if (frame.payload.len == 0) 0 else frame.payload[0];
+                stop.store(true, .release);
+            },
             else => {},
         }
     }
+    return task_exit_code;
 }
 
 const AttachInput = struct {
