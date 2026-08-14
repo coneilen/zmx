@@ -1084,7 +1084,7 @@ fn updateSessionCwdLine(session: *Session, bytes: []const u8) void {
     }
 }
 
-fn updateSessionCwd(client: *Client, bytes: []const u8, flush: bool) void {
+fn updateSessionCwdLocked(client: *Client, bytes: []const u8, flush: bool) void {
     const session = client.session;
     for (bytes) |byte| {
         switch (byte) {
@@ -1113,6 +1113,12 @@ fn updateSessionCwd(client: *Client, bytes: []const u8, flush: bool) void {
         updateSessionCwdLine(session, client.cwd_input.items);
         client.cwd_input.clearRetainingCapacity();
     }
+}
+
+fn updateSessionCwd(client: *Client, bytes: []const u8, flush: bool) void {
+    client.lockInput();
+    defer client.unlockInput();
+    updateSessionCwdLocked(client, bytes, flush);
 }
 
 fn claimLeaderIfVacant(session: *Session, client: *Client) u64 {
@@ -1922,6 +1928,23 @@ fn markLeaderOperation(context: *anyopaque) void {
     marker.value += 1;
 }
 
+const CwdMutationProbe = struct {
+    client: *Client,
+    started: std.atomic.Value(bool) = .init(false),
+    finished: std.atomic.Value(bool) = .init(false),
+    iterations: usize,
+};
+
+fn cwdMutationWorker(probe: *CwdMutationProbe) void {
+    var payload: [512]u8 = undefined;
+    @memset(&payload, 'x');
+    probe.started.store(true, .release);
+    for (0..probe.iterations) |_| {
+        updateSessionCwd(probe.client, &payload, false);
+    }
+    probe.finished.store(true, .release);
+}
+
 test "Windows PTY session provider exposes the frozen provider shape" {
     const value = provider();
     try std.testing.expect(@intFromPtr(value.host_fn) != 0);
@@ -2030,6 +2053,7 @@ test "Windows fragmented input updates session cwd at line termination" {
     var client: Client = undefined;
     client.session = &session;
     client.cwd_input = .empty;
+    client.input_lock = .init(0);
     defer client.cwd_input.deinit(std.testing.allocator);
 
     const command = "cd C:\\Windows";
@@ -2045,6 +2069,45 @@ test "Windows fragmented input updates session cwd at line termination" {
     }
     updateSessionCwd(&client, "\r", false);
     try std.testing.expectEqualStrings("C:\\", client.session.cwd);
+}
+
+test "Windows cwd input mutations serialize with ESC timer-like reallocation" {
+    var session: Session = undefined;
+    session.alloc = std.testing.allocator;
+
+    var client: Client = undefined;
+    client.session = &session;
+    client.cwd_input = .empty;
+    client.input_lock = .init(0);
+    defer client.cwd_input.deinit(std.testing.allocator);
+
+    client.lockInput();
+    var blocked = CwdMutationProbe{
+        .client = &client,
+        .iterations = 1,
+    };
+    const blocked_thread = try std.Thread.spawn(.{}, cwdMutationWorker, .{&blocked});
+    while (!blocked.started.load(.acquire)) kernel32.Sleep(1);
+    kernel32.Sleep(1);
+    try std.testing.expect(!blocked.finished.load(.acquire));
+    client.unlockInput();
+    blocked_thread.join();
+    try std.testing.expect(blocked.finished.load(.acquire));
+
+    var left = CwdMutationProbe{
+        .client = &client,
+        .iterations = 256,
+    };
+    var right = CwdMutationProbe{
+        .client = &client,
+        .iterations = 256,
+    };
+    const left_thread = try std.Thread.spawn(.{}, cwdMutationWorker, .{&left});
+    const right_thread = try std.Thread.spawn(.{}, cwdMutationWorker, .{&right});
+    left_thread.join();
+    right_thread.join();
+    try std.testing.expect(client.cwd_input.items.len <= Client.max_cwd_input_bytes);
+    try std.testing.expect(client.cwd_input.items.len > 0);
 }
 
 test "Windows leader operation holds validation through a competing claim" {

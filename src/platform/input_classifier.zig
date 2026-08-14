@@ -107,6 +107,26 @@ pub const InputClassifier = struct {
         return colon + 1 < rest.len and rest[colon + 1] == '3';
     }
 
+    fn isKeyboardModifierBody(body: []const u8) bool {
+        if (body.len < 3 or body[0] != '1' or body[1] != ';') return false;
+        const modifier = std.fmt.parseInt(u8, body[2..], 10) catch return false;
+        return modifier >= 2 and modifier <= 16;
+    }
+
+    fn isKeyboardCsi(body: []const u8, final: u8) bool {
+        return switch (final) {
+            'A', 'B', 'C', 'D', '~', 'u' => true,
+            // Unmodified Home/End/Shift-Tab use CSI H/F/Z. Modified
+            // variants use the standard CSI 1;<modifier> form.
+            'H', 'F', 'Z' => body.len == 0 or isKeyboardModifierBody(body),
+            // F1-F4 use SS3 P-S without modifiers and CSI 1;<modifier>
+            // P-S when modifiers are present. Restricting these finals to
+            // that shape avoids treating cursor-position reports as keys.
+            'P', 'Q', 'R', 'S' => isKeyboardModifierBody(body),
+            else => false,
+        };
+    }
+
     fn analyze(self: *InputClassifier, payload: []const u8, raw_owner: bool) !Result {
         if (self.quarantined) {
             self.quarantined = false;
@@ -206,9 +226,10 @@ pub const InputClassifier = struct {
                         }
                     } else if (final == 'M' or final == 'm') {
                         is_mouse = combined.items[i + 2] == '<';
-                    } else if (final == 'A' or final == 'B' or
-                        final == 'C' or final == 'D' or final == '~')
-                    {
+                    } else if (isKeyboardCsi(
+                        combined.items[i + 2 .. final_index.?],
+                        final,
+                    )) {
                         is_keyboard = true;
                     } else if (final == 'u') {
                         is_keyboard = !csiEventIsRelease(
@@ -370,4 +391,47 @@ test "Windows attach classifier keeps continuation before lone escape timeout" {
     try std.testing.expectEqualStrings("\x1b[A", result.bytes);
     try std.testing.expect(result.claims_leadership);
     try std.testing.expect(!classifier.hasPendingLoneEsc());
+}
+
+test "Windows attach classifier recognizes Home End Shift-Tab and modified function keys" {
+    const keys = [_][]const u8{
+        "\x1b[H",
+        "\x1b[F",
+        "\x1b[Z",
+        "\x1b[1;2H",
+        "\x1b[1;5F",
+        "\x1b[1;2Z",
+        "\x1b[1;5P",
+        "\x1b[1;5Q",
+        "\x1b[1;5R",
+        "\x1b[1;5S",
+        "\x1b[15;2~",
+    };
+    for (keys) |key| {
+        var classifier = InputClassifier.init(std.testing.allocator);
+        defer classifier.deinit();
+        const result = try classifier.filterNonLeader(key);
+        defer std.testing.allocator.free(result.bytes);
+        try std.testing.expectEqualStrings(key, result.bytes);
+        try std.testing.expect(result.claims_leadership);
+    }
+}
+
+test "Windows attach classifier rejects terminal replies and cursor commands" {
+    const replies = [_][]const u8{
+        "\x1b[2;1H",
+        "\x1b[12;34R",
+        "\x1b[?25l",
+        "\x1b[1;2c",
+        "\x1b[6n",
+        "\x1b[1;2t",
+    };
+    for (replies) |reply| {
+        var classifier = InputClassifier.init(std.testing.allocator);
+        defer classifier.deinit();
+        const result = try classifier.filterNonLeader(reply);
+        defer std.testing.allocator.free(result.bytes);
+        try std.testing.expectEqual(@as(usize, 0), result.bytes.len);
+        try std.testing.expect(!result.claims_leadership);
+    }
 }
