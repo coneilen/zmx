@@ -22,8 +22,13 @@ pub const Error = error{
 /// Quote one UTF-8 argument using the CommandLineToArgvW/CreateProcess
 /// backslash rules. The command line is converted to UTF-16 only after all
 /// quoting has been applied, so non-ASCII bytes are never lossy.
-pub fn appendWindowsArg(list: *std.ArrayList(u8), alloc: std.mem.Allocator, arg: []const u8) !void {
-    const needs_quotes = arg.len == 0 or
+fn appendWindowsArgImpl(
+    list: *std.ArrayList(u8),
+    alloc: std.mem.Allocator,
+    arg: []const u8,
+    force_quotes: bool,
+) !void {
+    const needs_quotes = force_quotes or arg.len == 0 or
         std.mem.indexOfAny(u8, arg, " \t\"") != null;
     if (!needs_quotes) {
         try list.appendSlice(alloc, arg);
@@ -53,6 +58,10 @@ pub fn appendWindowsArg(list: *std.ArrayList(u8), alloc: std.mem.Allocator, arg:
     try list.append(alloc, '"');
 }
 
+pub fn appendWindowsArg(list: *std.ArrayList(u8), alloc: std.mem.Allocator, arg: []const u8) !void {
+    return appendWindowsArgImpl(list, alloc, arg, false);
+}
+
 fn appendRepeated(list: *std.ArrayList(u8), alloc: std.mem.Allocator, byte: u8, count: usize) !void {
     try list.ensureUnusedCapacity(alloc, count);
     for (0..count) |_| list.appendAssumeCapacity(byte);
@@ -74,7 +83,13 @@ fn isCmdOperator(arg: []const u8) bool {
 
 fn needsCmdQuotes(arg: []const u8) bool {
     if (arg.len == 0) return true;
-    return std.mem.indexOfAny(u8, arg, " \t\"&|<>()^") != null;
+    for (arg) |byte| {
+        switch (byte) {
+            ' ', '\t', '"', '&', '|', '<', '>', '(', ')', '^' => return true,
+            else => {},
+        }
+    }
+    return false;
 }
 
 fn appendCmdArg(list: *std.ArrayList(u8), alloc: std.mem.Allocator, arg: []const u8) !void {
@@ -85,7 +100,7 @@ fn appendCmdArg(list: *std.ArrayList(u8), alloc: std.mem.Allocator, arg: []const
     if (isCmdOperator(arg)) {
         try list.appendSlice(alloc, arg);
     } else if (needsCmdQuotes(arg)) {
-        try appendWindowsArg(list, alloc, arg);
+        try appendWindowsArgImpl(list, alloc, arg, true);
     } else {
         try list.appendSlice(alloc, arg);
     }
@@ -1240,6 +1255,7 @@ test "Windows task command line uses cmd shell semantics" {
         "&&",
         "dir",
         "C:\\path\\",
+        "a&b",
         "日本語",
     };
     const line = try buildCommandLine(alloc, .{
@@ -1251,7 +1267,7 @@ test "Windows task command line uses cmd shell semantics" {
     });
     defer alloc.free(line);
     try std.testing.expectEqualStrings(
-        "cmd.exe /d /c echo \"hello world\" > C:\\path\\ && dir C:\\path\\ 日本語",
+        "cmd.exe /d /c echo \"hello world\" > C:\\path\\ && dir C:\\path\\ \"a&b\" 日本語",
         line,
     );
 }
