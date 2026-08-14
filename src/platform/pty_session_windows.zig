@@ -1151,9 +1151,9 @@ fn claimLeaderAndWrite(
     return writePtyIfLeader(session, client, generation, bytes);
 }
 
-fn flushLoneEscape(client: *Client) void {
+fn flushPendingEscape(client: *Client) void {
     client.lockInput();
-    const result = client.input.flushLoneEsc() catch {
+    const result = client.input.flushPendingEscape() catch {
         client.unlockInput();
         client.eject();
         return;
@@ -1175,7 +1175,7 @@ fn loneEscapeTimerMain(client: *Client) void {
     {
         return;
     }
-    flushLoneEscape(client);
+    flushPendingEscape(client);
 }
 
 fn releaseLeader(session: *Session, client: *Client) void {
@@ -1236,7 +1236,7 @@ fn clientMain(client: *Client) void {
                         client.unlockInput();
                         break;
                     };
-                    const pending_lone_escape = client.input.hasPendingLoneEsc();
+                    const pending_lone_escape = client.input.hasPendingEscape();
                     client.unlockInput();
                     defer session.alloc.free(result.bytes);
                     const accepted = if (result.bytes.len == 0)
@@ -1262,7 +1262,7 @@ fn clientMain(client: *Client) void {
                                 .{client},
                             ) catch blk: {
                                 client.esc_timer_active.store(false, .release);
-                                flushLoneEscape(client);
+                                flushPendingEscape(client);
                                 break :blk null;
                             };
                         }
