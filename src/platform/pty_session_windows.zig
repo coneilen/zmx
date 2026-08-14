@@ -242,69 +242,8 @@ const Client = struct {
         }
     }
 
-    fn enqueueOutput(self: *Client, payload: []const u8) !void {
-        const frame_len = @sizeOf(wire.Header) + payload.len;
-        if (payload.len > max_output_bytes - @sizeOf(wire.Header)) {
-            return error.FrameTooLarge;
-        }
-        while (true) {
-            self.lockOutput();
-            if (self.output_closed) {
-                self.unlockOutput();
-                return error.BrokenPipe;
-            }
-            if (frame_len <= max_output_bytes - self.output.items.len) {
-                self.output.ensureUnusedCapacity(self.session.alloc, frame_len) catch |err| {
-                    self.unlockOutput();
-                    return err;
-                };
-                const header = wire.Header{ .tag = .Output, .len = @intCast(payload.len) };
-                self.output.appendSliceAssumeCapacity(std.mem.asBytes(&header));
-                self.output.appendSliceAssumeCapacity(payload);
-                self.unlockOutput();
-                if (self.data_event) |event| _ = kernel32.SetEvent(event);
-                return;
-            }
-            self.unlockOutput();
-            if (self.space_event) |event| {
-                if (kernel32.WaitForSingleObject(event, output_wait_ms) == 0x00000102) {
-                    return error.WouldBlock;
-                }
-            } else {
-                return error.WouldBlock;
-            }
-        }
-    }
-
     fn enqueueTaskComplete(self: *Client, payload: []const u8) !void {
-        const frame_len = @sizeOf(wire.Header) + payload.len;
-        while (true) {
-            self.lockOutput();
-            if (self.output_closed) {
-                self.unlockOutput();
-                return error.BrokenPipe;
-            }
-            if (frame_len <= max_output_bytes - self.output.items.len) {
-                self.output.ensureUnusedCapacity(self.session.alloc, frame_len) catch |err| {
-                    self.unlockOutput();
-                    return err;
-                };
-                const header = wire.Header{ .tag = .TaskComplete, .len = @intCast(payload.len) };
-                self.output.appendSliceAssumeCapacity(std.mem.asBytes(&header));
-                self.output.appendSliceAssumeCapacity(payload);
-                self.unlockOutput();
-                if (self.data_event) |event| _ = kernel32.SetEvent(event);
-                return;
-            }
-            self.unlockOutput();
-            if (self.space_event) |event| {
-                if (kernel32.WaitForSingleObject(event, output_wait_ms) == 0x00000102) {
-                    return error.WouldBlock;
-                }
-            } else {
-                return error.WouldBlock;
-            }
-        }
+        return self.enqueue(.TaskComplete, payload);
     }
 };
 
@@ -665,7 +604,10 @@ fn broadcast(session: *Session, tag: wire.Tag, payload: []const u8) void {
                     if (client.foreground.load(.acquire)) {
                         client.foreground_output_seen.store(true, .release);
                     }
-                    client.enqueueOutput(chunk) catch client.eject();
+                    // PTY output must never wait behind a slow reader.  The
+                    // bounded enqueue either succeeds immediately or ejects
+                    // the client before the next reader chunk is processed.
+                    client.enqueue(.Output, chunk) catch client.eject();
                 },
                 .TaskComplete => client.enqueueTaskComplete(chunk) catch client.eject(),
                 else => client.enqueue(tag, chunk) catch client.eject(),
@@ -705,16 +647,16 @@ fn broadcastTaskComplete(session: *Session, payload: []const u8) void {
         if (client.foreground.load(.acquire) and
             !client.foreground_output_seen.load(.acquire))
         {
-            sendForegroundHistory(client);
+            sendForegroundHistory(client, false);
             if (client.closed.load(.acquire)) continue;
         }
         client.enqueueTaskComplete(payload) catch client.eject();
     }
 }
 
-fn sendForegroundHistory(client: *Client) void {
+fn sendForegroundHistory(client: *Client, blocking: bool) void {
     if (client.foreground_history_sent.cmpxchgStrong(false, true, .acq_rel, .monotonic) == null) {
-        sendHistory(client, &.{});
+        sendHistory(client, &.{}, blocking);
     }
 }
 
@@ -826,7 +768,7 @@ fn clientMain(client: *Client) void {
                 if (std.mem.eql(u8, frame.payload, foreground_init)) {
                     client.foreground.store(true, .release);
                     if (session.task_complete.load(.acquire)) {
-                        sendForegroundHistory(client);
+                        sendForegroundHistory(client, true);
                         if (!client.closed.load(.acquire)) sendTaskComplete(client);
                     }
                 } else if (frame.payload.len == @sizeOf(wire.Resize)) {
@@ -849,7 +791,7 @@ fn clientMain(client: *Client) void {
             .LabelSet => setLabels(client, frame.payload),
             .LabelClear => clearLabels(client),
             .History => {
-                sendHistory(client, frame.payload);
+                sendHistory(client, frame.payload, true);
                 if (session.task_complete.load(.acquire) and
                     !client.closed.load(.acquire))
                 {
@@ -957,7 +899,7 @@ fn sendTaskComplete(client: *Client) void {
     client.enqueue(.TaskComplete, &payload) catch client.eject();
 }
 
-fn sendHistory(client: *Client, request: []const u8) void {
+fn sendHistory(client: *Client, request: []const u8, blocking: bool) void {
     const session = client.session;
     const format: u8 = if (request.len == 0) 0 else request[0];
     session.lock();
@@ -972,12 +914,18 @@ fn sendHistory(client: *Client, request: []const u8) void {
         Client.max_output_bytes - @sizeOf(wire.Header),
         history_chunk_bytes,
     );
+    const enqueue_history = struct {
+        fn enqueue(target: *Client, payload: []const u8, should_block: bool) !void {
+            if (should_block) return target.enqueueBlocking(.History, payload);
+            return target.enqueue(.History, payload);
+        }
+    }.enqueue;
     switch (format) {
         0, 1 => {
             var offset: usize = 0;
             while (offset < history.len) {
                 const amount = @min(history.len - offset, max_payload);
-                client.enqueueBlocking(.History, history[offset .. offset + amount]) catch {
+                enqueue_history(client, history[offset .. offset + amount], blocking) catch {
                     client.eject();
                     return;
                 };
@@ -1015,7 +963,7 @@ fn sendHistory(client: *Client, request: []const u8) void {
                 };
                 if (chunk.items.len > max_payload) {
                     const amount = before;
-                    client.enqueueBlocking(.History, chunk.items[0..amount]) catch {
+                    enqueue_history(client, chunk.items[0..amount], blocking) catch {
                         client.eject();
                         return;
                     };
@@ -1033,7 +981,7 @@ fn sendHistory(client: *Client, request: []const u8) void {
                     return;
                 };
                 if (chunk.items.len > max_payload) {
-                    client.enqueueBlocking(.History, chunk.items[0..before]) catch {
+                    enqueue_history(client, chunk.items[0..before], blocking) catch {
                         client.eject();
                         return;
                     };
@@ -1045,7 +993,7 @@ fn sendHistory(client: *Client, request: []const u8) void {
                 }
             }
             if (chunk.items.len > 0) {
-                client.enqueueBlocking(.History, chunk.items) catch {
+                enqueue_history(client, chunk.items, blocking) catch {
                     client.eject();
                     return;
                 };
@@ -1056,7 +1004,7 @@ fn sendHistory(client: *Client, request: []const u8) void {
             return;
         },
     }
-    client.enqueueBlocking(.History, &.{}) catch client.eject();
+    enqueue_history(client, &.{}, blocking) catch client.eject();
 }
 
 fn serializeHistory(

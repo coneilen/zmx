@@ -569,7 +569,10 @@ fn waitForTasks(
     if (raw_session_names.len == 0) {
         const current_session = try socket.resolveSessionOrEnv(alloc, io, null);
         defer alloc.free(current_session);
-        try matchers.append(alloc, try socket.parseSessionArg(alloc, current_session));
+        try matchers.append(alloc, .{
+            .name = try alloc.dupe(u8, current_session),
+            .is_prefix = false,
+        });
     } else {
         for (raw_session_names) |raw_name| {
             try matchers.append(alloc, try socket.parseSessionArg(alloc, raw_name));
@@ -632,7 +635,7 @@ fn waitForTasks(
                 );
             }
             try writer.interface.flush();
-            if (aggregate_exit_code != 0) return error.TaskFailed;
+            if (aggregate_exit_code != 0) std.process.exit(aggregate_exit_code);
             return;
         }
         if (total == 0) {
@@ -702,7 +705,7 @@ fn tailSession(
         },
         connection,
     );
-    if (exit_code != 0) return error.TaskFailed;
+    if (exit_code != 0) std.process.exit(exit_code);
 }
 
 const TailContext = struct {
@@ -712,6 +715,7 @@ const TailContext = struct {
     output_lock: std.atomic.Value(u8) = .init(0),
     error_lock: std.atomic.Value(u8) = .init(0),
     first_error: ?anyerror = null,
+    first_exit_code: ?u8 = null,
 };
 
 fn tailWorkerMain(context: *TailContext, session_name: []const u8) void {
@@ -753,7 +757,7 @@ fn tailWorkerMain(context: *TailContext, session_name: []const u8) void {
     };
     if (exit_code != 0) {
         lockTailError(&context.error_lock);
-        if (context.first_error == null) context.first_error = error.TaskFailed;
+        if (context.first_exit_code == null) context.first_exit_code = exit_code;
         unlockTailError(&context.error_lock);
     }
 }
@@ -862,6 +866,7 @@ fn tailSessions(
     }
     for (threads.items) |thread| thread.join();
     if (context.first_error) |err| return err;
+    if (context.first_exit_code) |exit_code| std.process.exit(exit_code);
     try writer.interface.flush();
 }
 
@@ -874,7 +879,7 @@ fn runForegroundSession(
 ) !void {
     try spawnDetached(io, program, alloc, session_name, command);
     const exit_code = try attachTaskSession(io, alloc, session_name);
-    if (exit_code != 0) return error.TaskFailed;
+    if (exit_code != 0) std.process.exit(exit_code);
 }
 
 fn killSessions(
@@ -931,17 +936,20 @@ fn spawnDetached(
     session_name: []const u8,
     command: ?[]const []const u8,
 ) !void {
-    const endpoint = try runtime_windows.resolveEndpointPath(io, alloc, session_name);
-    defer alloc.free(endpoint);
-    if (local_ipc_windows.reconnect(
-        alloc,
-        .{ .name = endpoint },
-        @import("platform/events_windows.zig").Deadline.afterMs(1000),
-        null,
-    )) |existing| {
-        existing.close();
-        return error.SessionAlreadyExists;
-    } else |_| {}
+    if (runtime_windows.hasRendezvous(io, alloc, session_name) catch false) {
+        if (runtime_windows.resolveEndpointPath(io, alloc, session_name)) |endpoint| {
+            defer alloc.free(endpoint);
+            if (local_ipc_windows.reconnect(
+                alloc,
+                .{ .name = endpoint },
+                @import("platform/events_windows.zig").Deadline.afterMs(1000),
+                null,
+            )) |existing| {
+                existing.close();
+                return error.SessionAlreadyExists;
+            } else |_| {}
+        } else |_| {}
+    }
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(alloc);
@@ -973,6 +981,10 @@ fn spawnDetached(
     std.os.windows.CloseHandle(child.thread_handle);
 
     for (0..30) |_| {
+        if (!(runtime_windows.hasRendezvous(io, alloc, session_name) catch false)) {
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .real) catch {};
+            continue;
+        }
         const probe_endpoint = runtime_windows.resolveEndpointPath(io, alloc, session_name) catch {
             std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .real) catch {};
             continue;
@@ -1013,6 +1025,7 @@ fn sessionIsReachable(
     alloc: std.mem.Allocator,
     session_name: []const u8,
 ) !bool {
+    if (!(runtime_windows.hasRendezvous(io, alloc, session_name) catch false)) return false;
     const endpoint = try runtime_windows.resolveEndpointPath(io, alloc, session_name);
     defer alloc.free(endpoint);
     var connection = local_ipc_windows.reconnect(
