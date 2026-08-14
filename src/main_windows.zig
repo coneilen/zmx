@@ -154,14 +154,18 @@ fn awaitResponse(
     connection: local_ipc.Connection,
     expected_tag: WireTag,
 ) !void {
-    var response = try session_windows.readFrameWithDeadline(
-        alloc,
-        connection,
-        session_windows.Deadline.afterMs(5000),
-        null,
-    );
-    defer response.deinit(alloc);
-    if (response.header.tag != expected_tag) return error.Unexpected;
+    while (true) {
+        var response = try session_windows.readFrameWithDeadline(
+            alloc,
+            connection,
+            session_windows.Deadline.afterMs(5000),
+            null,
+        );
+        defer response.deinit(alloc);
+        if (response.header.tag == expected_tag) return;
+        if (response.header.tag == .Output or response.header.tag == .TaskComplete) continue;
+        return error.Unexpected;
+    }
 }
 
 pub fn encodeWritePayload(
@@ -270,7 +274,7 @@ fn requestResponse(
             session_windows.Deadline.afterMs(5000),
             null,
         );
-        if (response.header.tag == .TaskComplete) {
+        if (response.header.tag == .Output or response.header.tag == .TaskComplete) {
             response.deinit(alloc);
             continue;
         }

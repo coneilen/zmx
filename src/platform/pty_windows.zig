@@ -58,15 +58,58 @@ fn appendRepeated(list: *std.ArrayList(u8), alloc: std.mem.Allocator, byte: u8, 
     for (0..count) |_| list.appendAssumeCapacity(byte);
 }
 
+fn isCmdOperator(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "&") or
+        std.mem.eql(u8, arg, "&&") or
+        std.mem.eql(u8, arg, "||") or
+        std.mem.eql(u8, arg, "|") or
+        std.mem.eql(u8, arg, ">") or
+        std.mem.eql(u8, arg, ">>") or
+        std.mem.eql(u8, arg, "<") or
+        std.mem.eql(u8, arg, "2>") or
+        std.mem.eql(u8, arg, "2>>") or
+        std.mem.eql(u8, arg, "(") or
+        std.mem.eql(u8, arg, ")");
+}
+
+fn needsCmdQuotes(arg: []const u8) bool {
+    if (arg.len == 0) return true;
+    return std.mem.indexOfAny(u8, arg, " \t\"&|<>()^") != null;
+}
+
+fn appendCmdArg(list: *std.ArrayList(u8), alloc: std.mem.Allocator, arg: []const u8) !void {
+    // Keep standalone command operators active so callers can use the normal
+    // argv-based CLI for redirection and command chaining.  All other parts
+    // use CreateProcess quoting, which protects spaces, quotes, and trailing
+    // backslashes from cmd.exe's command-line parser.
+    if (isCmdOperator(arg)) {
+        try list.appendSlice(alloc, arg);
+    } else if (needsCmdQuotes(arg)) {
+        try appendWindowsArg(list, alloc, arg);
+    } else {
+        try list.appendSlice(alloc, arg);
+    }
+}
+
 pub fn buildCommandLine(alloc: std.mem.Allocator, spec: pty.SpawnSpec) ![]u8 {
     var line: std.ArrayList(u8) = .empty;
     errdefer line.deinit(alloc);
 
     if (spec.command) |command| {
         if (command.len == 0) return error.InvalidCommand;
-        for (command, 0..) |arg, index| {
-            if (index != 0) try line.append(alloc, ' ');
-            try appendWindowsArg(&line, alloc, arg);
+        if (spec.task_mode) {
+            const shell = if (spec.shell.len == 0) "cmd.exe" else spec.shell;
+            try appendWindowsArg(&line, alloc, shell);
+            try line.appendSlice(alloc, " /d /c ");
+            for (command, 0..) |arg, index| {
+                if (index != 0) try line.append(alloc, ' ');
+                try appendCmdArg(&line, alloc, arg);
+            }
+        } else {
+            for (command, 0..) |arg, index| {
+                if (index != 0) try line.append(alloc, ' ');
+                try appendWindowsArg(&line, alloc, arg);
+            }
         }
     } else {
         const shell = if (spec.shell.len == 0) "cmd.exe" else spec.shell;
@@ -1187,13 +1230,16 @@ const windows_impl = struct {
     const Self = @This();
 };
 
-test "Windows command line quoting preserves Unicode and backslashes" {
+test "Windows task command line uses cmd shell semantics" {
     const alloc = std.testing.allocator;
     const args = [_][]const u8{
-        "cmd.exe",
+        "echo",
         "hello world",
+        ">",
         "C:\\path\\",
-        "quote\"value",
+        "&&",
+        "dir",
+        "C:\\path\\",
         "日本語",
     };
     const line = try buildCommandLine(alloc, .{
@@ -1205,7 +1251,24 @@ test "Windows command line quoting preserves Unicode and backslashes" {
     });
     defer alloc.free(line);
     try std.testing.expectEqualStrings(
-        "cmd.exe \"hello world\" C:\\path\\ \"quote\\\"value\" 日本語",
+        "cmd.exe /d /c echo \"hello world\" > C:\\path\\ && dir C:\\path\\ 日本語",
+        line,
+    );
+}
+
+test "Windows interactive command line keeps direct argv shape" {
+    const alloc = std.testing.allocator;
+    const args = [_][]const u8{ "cmd.exe", "hello world", "C:\\path\\", "日本語" };
+    const line = try buildCommandLine(alloc, .{
+        .session_name = "interactive",
+        .shell = "cmd.exe",
+        .task_mode = false,
+        .command = args[0..],
+        .size = .{ .rows = 24, .cols = 80 },
+    });
+    defer alloc.free(line);
+    try std.testing.expectEqualStrings(
+        "cmd.exe \"hello world\" C:\\path\\ 日本語",
         line,
     );
 }

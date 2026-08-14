@@ -140,6 +140,9 @@ const Client = struct {
     connection: local_ipc.Connection,
     closed: std.atomic.Value(bool) = .init(false),
     connection_closed: std.atomic.Value(bool) = .init(false),
+    foreground: std.atomic.Value(bool) = .init(false),
+    foreground_output_seen: std.atomic.Value(bool) = .init(false),
+    foreground_history_sent: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
     writer_thread: ?std.Thread = null,
     data_event: ?windows.HANDLE = null,
@@ -602,7 +605,7 @@ fn readerMain(session: *Session) void {
         const task_exit_code = session.task_exit_code;
         session.unlock();
         const payload = [_]u8{task_exit_code};
-        broadcast(session, .TaskComplete, &payload);
+        broadcastTaskComplete(session, &payload);
         return;
     }
 
@@ -658,13 +661,60 @@ fn broadcast(session: *Session, tag: wire.Tag, payload: []const u8) void {
         for (clients.items) |client| {
             if (client.closed.load(.acquire)) continue;
             switch (tag) {
-                .Output => client.enqueueOutput(chunk) catch client.eject(),
+                .Output => {
+                    if (client.foreground.load(.acquire)) {
+                        client.foreground_output_seen.store(true, .release);
+                    }
+                    client.enqueueOutput(chunk) catch client.eject();
+                },
                 .TaskComplete => client.enqueueTaskComplete(chunk) catch client.eject(),
                 else => client.enqueue(tag, chunk) catch client.eject(),
             }
         }
         if (payload.len == 0) break;
         offset += amount;
+    }
+}
+
+fn broadcastTaskComplete(session: *Session, payload: []const u8) void {
+    var clients: std.ArrayList(*Client) = .empty;
+    session.lock();
+    for (session.clients.items) |client| {
+        if (client.closed.load(.acquire)) continue;
+        _ = client.broadcast_refs.fetchAdd(1, .acq_rel);
+        clients.append(session.alloc, client) catch {
+            _ = client.broadcast_refs.fetchSub(1, .acq_rel);
+            for (clients.items) |held| {
+                _ = held.broadcast_refs.fetchSub(1, .acq_rel);
+            }
+            clients.deinit(session.alloc);
+            session.unlock();
+            return;
+        };
+    }
+    session.unlock();
+    defer {
+        for (clients.items) |client| {
+            _ = client.broadcast_refs.fetchSub(1, .acq_rel);
+        }
+        clients.deinit(session.alloc);
+    }
+
+    for (clients.items) |client| {
+        if (client.closed.load(.acquire)) continue;
+        if (client.foreground.load(.acquire) and
+            !client.foreground_output_seen.load(.acquire))
+        {
+            sendForegroundHistory(client);
+            if (client.closed.load(.acquire)) continue;
+        }
+        client.enqueueTaskComplete(payload) catch client.eject();
+    }
+}
+
+fn sendForegroundHistory(client: *Client) void {
+    if (client.foreground_history_sent.cmpxchgStrong(false, true, .acq_rel, .monotonic) == null) {
+        sendHistory(client, &.{});
     }
 }
 
@@ -773,11 +823,12 @@ fn clientMain(client: *Client) void {
                 }
             },
             .Init => {
-                if (std.mem.eql(u8, frame.payload, foreground_init) and
-                    session.task_complete.load(.acquire))
-                {
-                    sendHistory(client, &.{});
-                    if (!client.closed.load(.acquire)) sendTaskComplete(client);
+                if (std.mem.eql(u8, frame.payload, foreground_init)) {
+                    client.foreground.store(true, .release);
+                    if (session.task_complete.load(.acquire)) {
+                        sendForegroundHistory(client);
+                        if (!client.closed.load(.acquire)) sendTaskComplete(client);
+                    }
                 } else if (frame.payload.len == @sizeOf(wire.Resize)) {
                     const size = std.mem.bytesToValue(wire.Resize, frame.payload);
                     session.runtime.resize(session.master, size) catch {};
@@ -1221,17 +1272,39 @@ fn attachLoopResult(spec: session_windows.AttachSpec, connection: local_ipc.Conn
     var output_buffer: [16 * 1024]u8 = undefined;
     var writer = std.Io.File.stdout().writer(spec.io, &output_buffer);
     var task_exit_code: ?u8 = null;
+    var saw_output = false;
+    var saw_history = false;
+    var history_requested = false;
     while (!stop.load(.acquire)) {
         var frame = wire.readFrame(spec.alloc, connection) catch break;
         defer frame.deinit(spec.alloc);
         switch (frame.header.tag) {
             .Output => {
+                saw_output = true;
                 try writer.interface.writeAll(frame.payload);
                 try writer.interface.flush();
             },
+            .History => {
+                saw_history = true;
+                // A completed foreground task sends its buffered history
+                // before TaskComplete.  Render fragments in arrival order;
+                // the empty frame is the history terminator.
+                if (frame.payload.len > 0) {
+                    try writer.interface.writeAll(frame.payload);
+                    try writer.interface.flush();
+                }
+            },
             .TaskComplete => {
                 task_exit_code = if (frame.payload.len == 0) 0 else frame.payload[0];
-                stop.store(true, .release);
+                if (saw_output or saw_history or history_requested) {
+                    stop.store(true, .release);
+                } else {
+                    // The task may have completed before the attach
+                    // worker's Init was processed.  Ask once for the
+                    // buffered history so fast commands are not silent.
+                    try writeWireFrame(&wire_lock, connection, .Init, foreground_init);
+                    history_requested = true;
+                }
             },
             else => {},
         }
