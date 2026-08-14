@@ -151,8 +151,10 @@ const Client = struct {
     output_lock: std.atomic.Value(u8) = .init(0),
     output: std.ArrayList(u8) = .empty,
     output_closed: bool = false,
+    cwd_input: std.ArrayList(u8) = .empty,
 
     const max_output_bytes = 256 * 1024;
+    const max_cwd_input_bytes = 4096;
     const output_wait_ms: windows.DWORD = 1000;
 
     fn lockOutput(self: *Client) void {
@@ -472,6 +474,7 @@ fn reapClients(session: *Session) void {
             client.data_event = null;
         }
         client.output.deinit(session.alloc);
+        client.cwd_input.deinit(session.alloc);
         session.alloc.destroy(client);
     }
 }
@@ -683,7 +686,7 @@ fn asciiStartsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
     return true;
 }
 
-fn updateSessionCwd(session: *Session, bytes: []const u8) void {
+fn updateSessionCwdLine(session: *Session, bytes: []const u8) void {
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r");
@@ -738,6 +741,37 @@ fn updateSessionCwd(session: *Session, bytes: []const u8) void {
     }
 }
 
+fn updateSessionCwd(client: *Client, bytes: []const u8, flush: bool) void {
+    const session = client.session;
+    for (bytes) |byte| {
+        switch (byte) {
+            '\r', '\n' => {
+                if (client.cwd_input.items.len > 0) {
+                    updateSessionCwdLine(session, client.cwd_input.items);
+                    client.cwd_input.clearRetainingCapacity();
+                }
+            },
+            0x08, 0x7f => {
+                if (client.cwd_input.items.len > 0) {
+                    _ = client.cwd_input.pop();
+                }
+            },
+            else => {
+                if (client.cwd_input.items.len >= Client.max_cwd_input_bytes) {
+                    client.cwd_input.clearRetainingCapacity();
+                }
+                client.cwd_input.append(session.alloc, byte) catch {
+                    client.cwd_input.clearRetainingCapacity();
+                };
+            },
+        }
+    }
+    if (flush and client.cwd_input.items.len > 0) {
+        updateSessionCwdLine(session, client.cwd_input.items);
+        client.cwd_input.clearRetainingCapacity();
+    }
+}
+
 fn clientMain(client: *Client) void {
     const session = client.session;
     defer {
@@ -750,8 +784,12 @@ fn clientMain(client: *Client) void {
         var frame = wire.readFrame(session.alloc, client.connection) catch break;
         defer frame.deinit(session.alloc);
         switch (frame.header.tag) {
-            .Input, .Send => {
-                updateSessionCwd(session, frame.payload);
+            .Input => {
+                updateSessionCwd(client, frame.payload, false);
+                writePty(session, frame.payload);
+            },
+            .Send => {
+                updateSessionCwd(client, frame.payload, true);
                 writePty(session, frame.payload);
             },
             .Output => {
@@ -1359,4 +1397,31 @@ test "Windows history serializers preserve plain VT and HTML formats" {
         error.UnsupportedHistoryFormat,
         serializeHistory(std.testing.allocator, raw, 3),
     );
+}
+
+test "Windows fragmented input updates session cwd at line termination" {
+    var session: Session = undefined;
+    session.alloc = std.testing.allocator;
+    session.spec = .{
+        .io = std.testing.io,
+        .alloc = std.testing.allocator,
+        .session_name = "cwd-test",
+        .shell = "cmd.exe",
+    };
+    session.lock_word = .init(0);
+    session.cwd = try std.testing.allocator.dupe(u8, "C:\\");
+    defer std.testing.allocator.free(session.cwd);
+
+    var client: Client = undefined;
+    client.session = &session;
+    client.cwd_input = .empty;
+    defer client.cwd_input.deinit(std.testing.allocator);
+
+    const command = "cd C:\\Windows";
+    for (command) |byte| {
+        updateSessionCwd(&client, &.{byte}, false);
+    }
+    try std.testing.expectEqualStrings("C:\\", client.session.cwd);
+    updateSessionCwd(&client, "\r", false);
+    try std.testing.expectEqualStrings("C:\\Windows", client.session.cwd);
 }

@@ -496,6 +496,7 @@ const windows_impl = struct {
         input_queue: SpscQueue = undefined,
         output_queue: SpscQueue = undefined,
         input_push_lock: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+        pseudo_console_lock: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
         stop_workers: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         process_exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         stop_event: ?HANDLE = null,
@@ -963,29 +964,57 @@ const windows_impl = struct {
         }
     }
 
+    fn takePseudoConsole(session: *Session) ?HPCON {
+        while (session.pseudo_console_lock.cmpxchgStrong(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+        defer session.pseudo_console_lock.store(0, .release);
+        const pseudo_console = session.pseudo_console;
+        session.pseudo_console = null;
+        return pseudo_console;
+    }
+
     fn closeIo(session: *Session) void {
         if (session.io_closed) return;
         session.io_closed = true;
-        session.stop_workers.store(true, .release);
-        if (session.stop_event) |event| _ = kernel32.SetEvent(event);
         session.input_queue.close();
-        session.output_queue.close();
 
         if (session.writer_thread) |writer| {
             _ = kernel32.CancelSynchronousIo(writer.getHandle());
             writer.join();
             session.writer_thread = null;
         }
+
+        // Closing the pseudo console is what releases a synchronous output
+        // read after the process exits. Do this while the reader is still
+        // alive so ClosePseudoConsole and the pipe drain can make progress
+        // concurrently.
+        if (takePseudoConsole(session)) |pseudo_console| {
+            _ = kernel32.ClosePseudoConsole(pseudo_console);
+        }
+
+        const process_done = session.process_exited.load(.acquire) or
+            if (session.process) |process|
+                kernel32.WaitForSingleObject(process, 0) == WAIT_OBJECT_0
+            else
+                false;
         if (session.reader_thread) |reader| {
-            _ = kernel32.CancelSynchronousIo(reader.getHandle());
+            if (!process_done) {
+                session.stop_workers.store(true, .release);
+                session.output_queue.close();
+                _ = kernel32.CancelSynchronousIo(reader.getHandle());
+            }
             reader.join();
             session.reader_thread = null;
         }
         if (session.process_wait_thread) |waiter| {
+            if (session.stop_event) |event| _ = kernel32.SetEvent(event);
             waiter.join();
             session.process_wait_thread = null;
         }
 
+        session.stop_workers.store(true, .release);
+        session.output_queue.close();
         if (session.output) |output| {
             drainOutput(output);
             _ = kernel32.CloseHandle(output);
@@ -995,9 +1024,8 @@ const windows_impl = struct {
             _ = kernel32.CloseHandle(input);
             session.input = null;
         }
-        if (session.pseudo_console) |pseudo_console| {
+        if (takePseudoConsole(session)) |pseudo_console| {
             _ = kernel32.ClosePseudoConsole(pseudo_console);
-            session.pseudo_console = null;
         }
         session.input_queue.deinit();
         session.output_queue.deinit();
@@ -1073,12 +1101,11 @@ const windows_impl = struct {
         );
         if (result != WAIT_OBJECT_0 or session.stop_workers.load(.acquire)) return;
         session.process_exited.store(true, .release);
-        kernel32.Sleep(10);
-        if (session.reader_thread) |reader| {
-            _ = kernel32.CancelSynchronousIo(reader.getHandle());
-        }
-        if (session.writer_thread) |writer| {
-            _ = kernel32.CancelSynchronousIo(writer.getHandle());
+        // The reader owns the ConPTY output drain.  Let its synchronous
+        // ReadFile run to EOF so bytes written immediately before process exit
+        // are delivered instead of being cut off by a timed cancellation.
+        if (takePseudoConsole(session)) |pseudo_console| {
+            _ = kernel32.ClosePseudoConsole(pseudo_console);
         }
     }
 
@@ -1349,6 +1376,66 @@ test "real ConPTY preserves UTF-8 output and Ctrl+C" {
     _ = try wait(&state, spawned.process);
     try std.testing.expect(std.mem.indexOf(u8, output[0..total], "hello") != null);
     try std.testing.expect(std.mem.indexOf(u8, output[0..total], "日本語") != null);
+}
+
+test "real ConPTY drains final output after process exit" {
+    if (builtin.os.tag != .windows) return;
+
+    var state = init(std.testing.allocator);
+    defer deinit(&state);
+    const command = [_][]const u8{
+        "cmd.exe",
+        "/d",
+        "/c",
+        "echo final-output",
+    };
+    const spawned = try spawn(&state, .{
+        .session_name = "conpty-final-output",
+        .shell = "cmd.exe",
+        .task_mode = true,
+        .command = command[0..],
+        .size = .{ .rows = 24, .cols = 80 },
+    });
+    defer reap(&state, spawned.process);
+
+    _ = try wait(&state, spawned.process);
+    var output: [4096]u8 = undefined;
+    var total: usize = 0;
+    var eof = false;
+    for (0..200) |_| {
+        const count = read(&state, spawned.master, output[total..]) catch |err| switch (err) {
+            error.WouldBlock => {
+                sleepNs(5 * std.time.ns_per_ms);
+                continue;
+            },
+            else => return err,
+        };
+        total += count;
+        if (count == 0) {
+            eof = true;
+            break;
+        }
+        if (std.mem.indexOf(u8, output[0..total], "final-output") != null) {
+            for (0..200) |_| {
+                const trailing = read(&state, spawned.master, output[total..]) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        sleepNs(5 * std.time.ns_per_ms);
+                        continue;
+                    },
+                    else => return err,
+                };
+                total += trailing;
+                if (trailing == 0) {
+                    eof = true;
+                    break;
+                }
+            }
+            break;
+        }
+        sleepNs(5 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(eof);
+    try std.testing.expect(std.mem.indexOf(u8, output[0..total], "final-output") != null);
 }
 
 test "real ConPTY sends Ctrl+C to the attached process" {

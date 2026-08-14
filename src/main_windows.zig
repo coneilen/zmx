@@ -580,6 +580,7 @@ fn waitForTasks(
     }
 
     var no_match_iterations: usize = 0;
+    var max_matched_count: usize = 0;
     while (true) {
         var sessions = try runtime_windows.listSessionNames(io, alloc);
         defer {
@@ -610,8 +611,11 @@ fn waitForTasks(
                 &.{},
                 .Info,
             ) catch {
-                aggregate_exit_code = 1;
-                done += 1;
+                // A listed endpoint that no longer accepts Info is a
+                // disappeared task, not a completed task with exit status 1.
+                // Remove it from this sample so max_matched_count below
+                // reports the same failure as POSIX wait.
+                total -= 1;
                 continue;
             };
             defer alloc.free(payload);
@@ -622,6 +626,18 @@ fn waitForTasks(
                 if (info.task_exit_code != 0) aggregate_exit_code = info.task_exit_code;
             }
         }
+
+        if (total < max_matched_count) {
+            var buffer: [1024]u8 = undefined;
+            var writer = std.Io.File.stderr().writer(io, &buffer);
+            try writer.interface.print(
+                "error: {d} session(s) disappeared before completing\n",
+                .{max_matched_count - total},
+            );
+            try writer.interface.flush();
+            std.process.exit(1);
+        }
+        if (total > max_matched_count) max_matched_count = total;
 
         if (total > 0 and total == done) {
             var buffer: [1024]u8 = undefined;
