@@ -35,22 +35,17 @@ pub fn build(b: *std.Build) void {
     });
     exe_mod.addOptions("build_options", options);
 
-    if (target.result.os.tag != .windows) {
-        const dep = b.dependency("ghostty", .{
-            .target = target,
-            .optimize = optimize,
-            .@"emit-lib-vt" = true,
-            // Not redundant: in lib-vt mode emit-xcframework defaults to "xcodebuild
-            // on PATH" (true even via the CLT stub), which pulls in the iOS SDK at
-            // configure time and breaks builds without full Xcode.
-            .@"emit-xcframework" = false,
-            .@"emit-macos-app" = false,
-        });
-        exe_mod.addImport(
-            "ghostty-vt",
-            dep.module("ghostty-vt"),
-        );
-    }
+    const dep = b.dependency("ghostty", .{
+        .target = target,
+        .optimize = optimize,
+        .@"emit-lib-vt" = true,
+        // Not redundant: in lib-vt mode emit-xcframework defaults to "xcodebuild
+        // on PATH" (true even via the CLT stub), which pulls in the iOS SDK at
+        // configure time and breaks builds without full Xcode.
+        .@"emit-xcframework" = false,
+        .@"emit-macos-app" = false,
+    });
+    exe_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
 
     // Run
     {
@@ -78,19 +73,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         });
-        if (target.result.os.tag != .windows) {
-            const test_dep = b.dependency("ghostty", .{
-                .target = target,
-                .optimize = optimize,
-                .@"emit-lib-vt" = true,
-                .@"emit-xcframework" = false,
-                .@"emit-macos-app" = false,
-            });
-            test_module.addImport(
-                "ghostty-vt",
-                test_dep.module("ghostty-vt"),
-            );
-        }
+        test_module.addImport("ghostty-vt", dep.module("ghostty-vt"));
         const exe_unit_tests = b.addTest(.{
             .root_module = test_module,
             // .use_llvm = true,
@@ -143,16 +126,14 @@ pub fn build(b: *std.Build) void {
             });
             release_mod.addOptions("build_options", options);
 
-            if (resolved.result.os.tag != .windows) {
-                if (b.lazyDependency("ghostty", .{
-                    .target = resolved,
-                    .optimize = .ReleaseSafe,
-                    .@"emit-lib-vt" = true,
-                    .@"emit-xcframework" = false,
-                    .@"emit-macos-app" = false,
-                })) |release_dep| {
-                    release_mod.addImport("ghostty-vt", release_dep.module("ghostty-vt"));
-                }
+            if (b.lazyDependency("ghostty", .{
+                .target = resolved,
+                .optimize = .ReleaseSafe,
+                .@"emit-lib-vt" = true,
+                .@"emit-xcframework" = false,
+                .@"emit-macos-app" = false,
+            })) |release_dep| {
+                release_mod.addImport("ghostty-vt", release_dep.module("ghostty-vt"));
             }
 
             // const is_local_macos = resolved.result.os.tag == .macos;

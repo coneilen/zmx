@@ -1,5 +1,6 @@
 const builtin = @import("builtin");
 const std = @import("std");
+const ghostty_vt = @import("ghostty-vt");
 const pty = @import("pty.zig");
 const pty_runtime = @import("pty_runtime.zig");
 const resize = @import("resize.zig");
@@ -8,6 +9,8 @@ const local_ipc_windows = @import("local_ipc_windows.zig");
 const runtime_windows = @import("runtime_windows.zig");
 const session_windows = @import("session_windows.zig");
 const wire = @import("session_wire.zig");
+const input_classifier = @import("input_classifier.zig");
+const terminal_state = @import("terminal_state.zig");
 const windows = std.os.windows;
 
 const kernel32 = struct {
@@ -83,6 +86,8 @@ const CONSOLE_SCREEN_BUFFER_INFO = extern struct {
     dwMaximumWindowSize: windows.COORD,
 };
 
+const TerminalStream = @TypeOf((@as(*ghostty_vt.Terminal, undefined)).vtStream());
+
 pub fn currentConsoleSize() ?resize.Size {
     const output = kernel32.GetStdHandle(std_output_handle);
     var info: CONSOLE_SCREEN_BUFFER_INFO = undefined;
@@ -109,10 +114,15 @@ const Session = struct {
     runtime: pty_runtime.Runtime,
     master: pty.Handle,
     process: pty.ProcessId,
+    terminal: ghostty_vt.Terminal,
+    vt_stream: TerminalStream,
     alive: std.atomic.Value(bool) = .init(true),
     task_complete: std.atomic.Value(bool) = .init(false),
     active_clients: std.atomic.Value(u64) = .init(0),
     lock_word: std.atomic.Value(u8) = .init(0),
+    terminal_lock_word: std.atomic.Value(u8) = .init(0),
+    pty_lock_word: std.atomic.Value(u8) = .init(0),
+    leader: ?*Client = null,
     clients: std.ArrayList(*Client) = .empty,
     reader_thread: ?std.Thread = null,
     labels: std.StringHashMapUnmanaged([]const u8) = .empty,
@@ -136,6 +146,26 @@ const Session = struct {
     fn unlock(self: *Session) void {
         self.lock_word.store(0, .release);
     }
+
+    fn lockTerminal(self: *Session) void {
+        while (self.terminal_lock_word.cmpxchgStrong(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn unlockTerminal(self: *Session) void {
+        self.terminal_lock_word.store(0, .release);
+    }
+
+    fn lockPty(self: *Session) void {
+        while (self.pty_lock_word.cmpxchgStrong(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn unlockPty(self: *Session) void {
+        self.pty_lock_word.store(0, .release);
+    }
 };
 
 const Client = struct {
@@ -158,6 +188,7 @@ const Client = struct {
     output: std.ArrayList(u8) = .empty,
     output_closed: bool = false,
     cwd_input: std.ArrayList(u8) = .empty,
+    input: input_classifier.InputClassifier = undefined,
 
     const max_output_bytes = 256 * 1024;
     const max_cwd_input_bytes = 4096;
@@ -372,6 +403,12 @@ fn createSession(spec: session_windows.HostSpec, server: local_ipc.Server) !*Ses
         .command = spec.command,
         .size = initial_size,
     });
+    var terminal = try ghostty_vt.Terminal.init(spec.io, spec.alloc, .{
+        .cols = initial_size.cols,
+        .rows = initial_size.rows,
+        .max_scrollback_lines = 2_000,
+    });
+    errdefer terminal.deinit(spec.alloc);
     session.* = .{
         .alloc = spec.alloc,
         .spec = spec,
@@ -379,9 +416,12 @@ fn createSession(spec: session_windows.HostSpec, server: local_ipc.Server) !*Ses
         .runtime = runtime,
         .master = spawned.master,
         .process = spawned.process,
+        .terminal = terminal,
+        .vt_stream = undefined,
         .created_at = @intCast(std.Io.Timestamp.now(spec.io, .real).toSeconds()),
         .cwd = cwd,
     };
+    session.vt_stream = session.terminal.vtStream();
     session.reader_thread = try std.Thread.spawn(.{}, readerMain, .{session});
     return session;
 }
@@ -406,7 +446,11 @@ fn sessionMain(session: *Session) void {
             connection.close();
             continue;
         };
-        client.* = .{ .session = session, .connection = connection };
+        client.* = .{
+            .session = session,
+            .connection = connection,
+            .input = input_classifier.InputClassifier.init(session.alloc),
+        };
         client.data_event = kernel32.CreateEventW(
             null,
             @enumFromInt(0),
@@ -414,6 +458,7 @@ fn sessionMain(session: *Session) void {
             null,
         ) orelse {
             connection.close();
+            client.input.deinit();
             session.alloc.destroy(client);
             continue;
         };
@@ -425,6 +470,7 @@ fn sessionMain(session: *Session) void {
         ) orelse {
             connection.close();
             _ = kernel32.CloseHandle(client.data_event.?);
+            client.input.deinit();
             session.alloc.destroy(client);
             continue;
         };
@@ -434,6 +480,7 @@ fn sessionMain(session: *Session) void {
             connection.close();
             _ = kernel32.CloseHandle(client.data_event.?);
             _ = kernel32.CloseHandle(client.space_event.?);
+            client.input.deinit();
             session.alloc.destroy(client);
             continue;
         };
@@ -481,6 +528,7 @@ fn reapClients(session: *Session) void {
         }
         client.output.deinit(session.alloc);
         client.cwd_input.deinit(session.alloc);
+        client.input.deinit();
         session.alloc.destroy(client);
     }
 }
@@ -511,10 +559,13 @@ fn destroySession(session: *Session) void {
             client.data_event = null;
         }
         client.output.deinit(session.alloc);
+        client.input.deinit();
         session.alloc.destroy(client);
     }
     session.clients.deinit(session.alloc);
     session.history.deinit(session.alloc);
+    session.vt_stream.deinit();
+    session.terminal.deinit(session.alloc);
     session.alloc.free(session.cwd);
     var labels = session.labels;
     var label_it = labels.iterator();
@@ -540,6 +591,12 @@ fn readerMain(session: *Session) void {
             else => break,
         };
         if (amount == 0) break;
+        session.lock();
+        session.lockTerminal();
+        session.vt_stream.nextSlice(buffer[0..amount]);
+        recordHistoryLocked(session, buffer[0..amount]);
+        session.unlockTerminal();
+        session.unlock();
         broadcast(session, .Output, buffer[0..amount]);
     }
 
@@ -578,7 +635,6 @@ fn recordHistoryLocked(session: *Session, payload: []const u8) void {
 fn broadcast(session: *Session, tag: wire.Tag, payload: []const u8) void {
     var clients: std.ArrayList(*Client) = .empty;
     session.lock();
-    if (tag == .Output) recordHistoryLocked(session, payload);
     for (session.clients.items) |client| {
         if (client.closed.load(.acquire)) continue;
         if (tag == .Output and
@@ -692,6 +748,23 @@ fn enqueueHistoryFrames(client: *Client, payload: []const u8, blocking: bool) bo
     return true;
 }
 
+fn enqueueTerminalState(client: *Client, payload: []const u8, blocking: bool) bool {
+    var offset: usize = 0;
+    while (offset < payload.len) {
+        const amount = @min(payload.len - offset, history_chunk_bytes);
+        const result = if (blocking)
+            client.enqueueBlocking(.Output, payload[offset .. offset + amount])
+        else
+            client.enqueue(.Output, payload[offset .. offset + amount]);
+        result catch {
+            client.eject();
+            return false;
+        };
+        offset += amount;
+    }
+    return true;
+}
+
 fn sendForegroundHistory(client: *Client, blocking: bool) void {
     const session = client.session;
     session.lock();
@@ -703,15 +776,15 @@ fn sendForegroundHistory(client: *Client, blocking: bool) void {
     }
     client.foreground.store(true, .release);
     client.history_cursor = session.history_start + session.history.items.len;
-    const history = session.alloc.dupe(u8, session.history.items) catch {
-        session.unlock();
-        client.eject();
-        return;
-    };
+    session.lockTerminal();
+    const state = terminal_state.serialize(session.alloc, &session.terminal);
+    session.unlockTerminal();
     session.unlock();
-    defer session.alloc.free(history);
 
-    if (!enqueueHistoryFrames(client, history, blocking)) return;
+    if (state) |snapshot| {
+        defer session.alloc.free(snapshot);
+        if (!enqueueTerminalState(client, snapshot, blocking)) return;
+    }
 
     while (!client.closed.load(.acquire)) {
         session.lock();
@@ -747,6 +820,8 @@ fn sendForegroundHistory(client: *Client, blocking: bool) void {
 }
 
 fn writePty(session: *Session, bytes: []const u8) void {
+    session.lockPty();
+    defer session.unlockPty();
     var offset: usize = 0;
     while (offset < bytes.len and session.alive.load(.acquire)) {
         const amount = session.runtime.write(session.master, bytes[offset..]) catch |err| switch (err) {
@@ -759,6 +834,18 @@ fn writePty(session: *Session, bytes: []const u8) void {
         if (amount == 0) return;
         offset += amount;
     }
+}
+
+fn resizePty(session: *Session, size: resize.Size) void {
+    session.lockPty();
+    session.runtime.resize(session.master, size) catch {};
+    session.lockTerminal();
+    session.terminal.resize(session.alloc, .{
+        .cols = size.cols,
+        .rows = size.rows,
+    }) catch {};
+    session.unlockTerminal();
+    session.unlockPty();
 }
 
 fn asciiStartsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
@@ -857,9 +944,53 @@ fn updateSessionCwd(client: *Client, bytes: []const u8, flush: bool) void {
     }
 }
 
+fn isLeader(session: *Session, client: *Client) bool {
+    session.lock();
+    const result = session.leader == client;
+    session.unlock();
+    return result;
+}
+
+fn claimLeaderIfVacant(session: *Session, client: *Client) void {
+    session.lock();
+    if (session.leader == null) session.leader = client;
+    session.unlock();
+}
+
+fn claimLeader(session: *Session, client: *Client) void {
+    var changed = false;
+    session.lock();
+    if (session.leader != client) {
+        session.leader = client;
+        changed = true;
+    }
+    session.unlock();
+    if (changed) client.enqueue(.Resize, &.{}) catch client.eject();
+}
+
+fn releaseLeader(session: *Session, client: *Client) void {
+    var replacement: ?*Client = null;
+    session.lock();
+    if (session.leader == client) {
+        session.leader = null;
+        for (session.clients.items) |other| {
+            if (other != client and !other.closed.load(.acquire)) {
+                replacement = other;
+                break;
+            }
+        }
+        session.leader = replacement;
+    }
+    session.unlock();
+    if (replacement) |next| {
+        next.enqueue(.Resize, &.{}) catch next.eject();
+    }
+}
+
 fn clientMain(client: *Client) void {
     const session = client.session;
     defer {
+        releaseLeader(session, client);
         client.closed.store(true, .release);
         client.closeOutput();
         client.closeConnection();
@@ -871,35 +1002,54 @@ fn clientMain(client: *Client) void {
         client.request_seen.store(true, .release);
         switch (frame.header.tag) {
             .Input => {
-                updateSessionCwd(client, frame.payload, false);
-                writePty(session, frame.payload);
+                if (isLeader(session, client)) {
+                    const bytes = client.input.observeLeader(frame.payload) catch break;
+                    defer session.alloc.free(bytes);
+                    updateSessionCwd(client, bytes, false);
+                    writePty(session, bytes);
+                } else {
+                    const result = client.input.filterNonLeader(frame.payload) catch break;
+                    defer session.alloc.free(result.bytes);
+                    if (result.claims_leadership) claimLeader(session, client);
+                    updateSessionCwd(client, result.bytes, false);
+                    writePty(session, result.bytes);
+                }
             },
             .Send => {
                 updateSessionCwd(client, frame.payload, true);
                 writePty(session, frame.payload);
             },
             .Output => {
+                session.lock();
+                session.lockTerminal();
+                session.vt_stream.nextSlice(frame.payload);
+                recordHistoryLocked(session, frame.payload);
+                session.unlockTerminal();
+                session.unlock();
                 broadcast(session, .Output, frame.payload);
             },
             .Resize => {
                 if (frame.payload.len == @sizeOf(wire.Resize)) {
                     const size = std.mem.bytesToValue(wire.Resize, frame.payload);
-                    session.runtime.resize(session.master, size) catch {};
+                    if (isLeader(session, client)) resizePty(session, size);
                 }
             },
             .Init => {
                 if (std.mem.eql(u8, frame.payload, foreground_init)) {
+                    claimLeaderIfVacant(session, client);
                     sendForegroundHistory(client, true);
                     if (session.task_complete.load(.acquire)) {
                         if (!client.closed.load(.acquire)) sendTaskComplete(client);
                     }
                 } else if (frame.payload.len == @sizeOf(wire.Resize)) {
                     const size = std.mem.bytesToValue(wire.Resize, frame.payload);
-                    session.runtime.resize(session.master, size) catch {};
+                    if (isLeader(session, client)) resizePty(session, size);
                 }
             },
             .Kill => {
+                session.lockPty();
                 session.runtime.signal(session.process, .kill) catch {};
+                session.unlockPty();
                 session.alive.store(false, .release);
                 break;
             },
@@ -927,13 +1077,22 @@ fn clientMain(client: *Client) void {
 }
 
 fn detachAll(session: *Session) void {
+    var clients: std.ArrayList(*Client) = .empty;
     session.lock();
-    defer session.unlock();
     for (session.clients.items) |other| {
         other.closed.store(true, .release);
+        _ = other.broadcast_refs.fetchAdd(1, .acq_rel);
+        clients.append(session.alloc, other) catch {
+            _ = other.broadcast_refs.fetchSub(1, .acq_rel);
+        };
+    }
+    session.unlock();
+    for (clients.items) |other| {
         other.closeOutput();
         other.closeConnection();
+        _ = other.broadcast_refs.fetchSub(1, .acq_rel);
     }
+    clients.deinit(session.alloc);
 }
 
 fn writerMain(client: *Client) void {
@@ -1227,6 +1386,7 @@ fn writeFile(client: *Client, payload: []const u8) !void {
 }
 
 fn attachLoop(spec: session_windows.AttachSpec, connection: local_ipc.Connection) !void {
+    try wire.writeFrame(connection, .Init, foreground_init);
     _ = try attachLoopResult(spec, connection);
 }
 
@@ -1355,6 +1515,13 @@ fn attachLoopResult(spec: session_windows.AttachSpec, connection: local_ipc.Conn
                 try writer.interface.writeAll(frame.payload);
                 try writer.interface.flush();
             },
+            .Resize => {
+                if (frame.payload.len == 0) {
+                    if (currentConsoleSize()) |size| {
+                        try writeWireFrame(&wire_lock, connection, .Resize, std.mem.asBytes(&size));
+                    }
+                }
+            },
             .History => {
                 saw_history = true;
                 // A completed foreground task sends its buffered history
@@ -1425,7 +1592,15 @@ fn attachInputMain(input: *AttachInput) void {
             @intCast(input_buffer.len),
             &amount,
             null,
-        )) == 0 or amount == 0) break;
+        )) == 0) break;
+        if (amount == 0) {
+            writeWireFrame(input.wire_lock, input.connection, .Detach, "") catch {};
+            break;
+        }
+        if (input_buffer[0] == 0x1c) {
+            writeWireFrame(input.wire_lock, input.connection, .Detach, "") catch {};
+            break;
+        }
         writeWireFrame(
             input.wire_lock,
             input.connection,
@@ -1495,6 +1670,16 @@ test "Windows foreground history cursor precedes later live output" {
     var session: Session = undefined;
     session.alloc = std.testing.allocator;
     session.lock_word = .init(0);
+    session.terminal_lock_word = .init(0);
+    session.terminal = try ghostty_vt.Terminal.init(std.testing.io, std.testing.allocator, .{
+        .cols = 80,
+        .rows = 24,
+        .max_scrollback_lines = 2_000,
+    });
+    session.vt_stream = session.terminal.vtStream();
+    defer session.vt_stream.deinit();
+    defer session.terminal.deinit(std.testing.allocator);
+    session.vt_stream.nextSlice("old");
     session.history = .empty;
     session.history_start = 0;
     session.clients = .empty;
@@ -1523,24 +1708,22 @@ test "Windows foreground history cursor precedes later live output" {
     try std.testing.expect(client.foreground_history_ready.load(.acquire));
     broadcast(&session, .Output, "new");
 
-    try std.testing.expectEqual(@as(usize, 3 * @sizeOf(wire.Header) + 6), client.output.items.len);
-    const first = std.mem.bytesToValue(wire.Header, client.output.items[0..@sizeOf(wire.Header)]);
-    try std.testing.expectEqual(wire.Tag.History, first.tag);
-    try std.testing.expectEqual(@as(u32, 3), first.len);
-    const second_offset = @sizeOf(wire.Header) + 3;
-    const second = std.mem.bytesToValue(
-        wire.Header,
-        client.output.items[second_offset .. second_offset + @sizeOf(wire.Header)],
-    );
-    try std.testing.expectEqual(wire.Tag.History, second.tag);
-    try std.testing.expectEqual(@as(u32, 0), second.len);
-    const third_offset = second_offset + @sizeOf(wire.Header);
-    const third = std.mem.bytesToValue(
-        wire.Header,
-        client.output.items[third_offset .. third_offset + @sizeOf(wire.Header)],
-    );
-    try std.testing.expectEqual(wire.Tag.Output, third.tag);
-    try std.testing.expectEqual(@as(u32, 3), third.len);
+    var offset: usize = 0;
+    var frame_count: usize = 0;
+    var last_payload: []const u8 = &.{};
+    while (offset < client.output.items.len) {
+        const header = std.mem.bytesToValue(
+            wire.Header,
+            client.output.items[offset .. offset + @sizeOf(wire.Header)],
+        );
+        try std.testing.expectEqual(wire.Tag.Output, header.tag);
+        const start = offset + @sizeOf(wire.Header);
+        last_payload = client.output.items[start .. start + header.len];
+        offset = start + header.len;
+        frame_count += 1;
+    }
+    try std.testing.expect(frame_count >= 2);
+    try std.testing.expectEqualStrings("new", last_payload);
 }
 
 test "Windows fragmented input updates session cwd at line termination" {
