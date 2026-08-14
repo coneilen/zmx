@@ -501,41 +501,91 @@ fn unsupported(io: std.Io, command: []const u8) !void {
     return error.UnsupportedCommand;
 }
 
-fn waitForTask(
+fn waitForTasks(
     io: std.Io,
     alloc: std.mem.Allocator,
     cfg: *const Cfg,
-    raw_session_name: ?[]const u8,
+    raw_session_names: []const []const u8,
 ) !void {
-    const session_name = try socket.resolveSessionOrEnv(alloc, io, raw_session_name);
-    defer alloc.free(session_name);
+    var matchers: std.ArrayList(socket.SessionMatch) = .empty;
+    defer {
+        for (matchers.items) |matcher| alloc.free(matcher.name);
+        matchers.deinit(alloc);
+    }
+    if (raw_session_names.len == 0) {
+        const current_session = try socket.resolveSessionOrEnv(alloc, io, null);
+        defer alloc.free(current_session);
+        try matchers.append(alloc, try socket.parseSessionArg(alloc, current_session));
+    } else {
+        for (raw_session_names) |raw_name| {
+            try matchers.append(alloc, try socket.parseSessionArg(alloc, raw_name));
+        }
+    }
+
+    var no_match_iterations: usize = 0;
     while (true) {
-        const payload = try requestResponse(
-            io,
-            alloc,
-            cfg,
-            session_name,
-            .Info,
-            &.{},
-            .Info,
-        );
-        defer alloc.free(payload);
-        if (payload.len != @sizeOf(wire.Info)) return error.Unexpected;
-        const info = std.mem.bytesToValue(wire.Info, payload);
-        if (info.task_ended_at != 0) {
+        var sessions = try runtime_windows.listSessionNames(io, alloc);
+        defer {
+            for (sessions.items) |name| alloc.free(name);
+            sessions.deinit(alloc);
+        }
+
+        var total: usize = 0;
+        var done: usize = 0;
+        var aggregate_exit_code: u8 = 0;
+        for (sessions.items) |session_name| {
+            var matched = false;
+            for (matchers.items) |matcher| {
+                if (matcher.matches(session_name)) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) continue;
+
+            total += 1;
+            const payload = requestResponse(
+                io,
+                alloc,
+                cfg,
+                session_name,
+                .Info,
+                &.{},
+                .Info,
+            ) catch {
+                aggregate_exit_code = 1;
+                done += 1;
+                continue;
+            };
+            defer alloc.free(payload);
+            if (payload.len != @sizeOf(wire.Info)) return error.Unexpected;
+            const info = std.mem.bytesToValue(wire.Info, payload);
+            if (info.task_ended_at != 0) {
+                done += 1;
+                if (info.task_exit_code != 0) aggregate_exit_code = info.task_exit_code;
+            }
+        }
+
+        if (total > 0 and total == done) {
             var buffer: [1024]u8 = undefined;
             var writer = std.Io.File.stdout().writer(io, &buffer);
-            if (info.task_exit_code == 0) {
+            if (aggregate_exit_code == 0) {
                 try writer.interface.print("task(s) completed!\n", .{});
             } else {
                 try writer.interface.print(
                     "task(s) failed! exit_code={d}\n",
-                    .{info.task_exit_code},
+                    .{aggregate_exit_code},
                 );
             }
             try writer.interface.flush();
-            if (info.task_exit_code != 0) return error.TaskFailed;
+            if (aggregate_exit_code != 0) return error.TaskFailed;
             return;
+        }
+        if (total == 0) {
+            no_match_iterations += 1;
+            if (no_match_iterations >= 5) return error.NoMatchingSessions;
+        } else {
+            no_match_iterations = 0;
         }
         std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .real) catch {};
     }
@@ -572,7 +622,7 @@ fn spawnDetached(
     if (local_ipc_windows.reconnect(
         alloc,
         .{ .name = endpoint },
-        @import("platform/events_windows.zig").Deadline.afterMs(100),
+        @import("platform/events_windows.zig").Deadline.afterMs(1000),
         null,
     )) |existing| {
         existing.close();
@@ -598,19 +648,25 @@ fn spawnDetached(
     }
     std.os.windows.CloseHandle(child.thread_handle);
 
-    for (0..50) |_| {
+    for (0..30) |_| {
+        const probe_endpoint = runtime_windows.resolveEndpointPath(io, alloc, session_name) catch {
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .real) catch {};
+            continue;
+        };
+        defer alloc.free(probe_endpoint);
         var probe = local_ipc_windows.reconnect(
             alloc,
-            .{ .name = endpoint },
-            @import("platform/events_windows.zig").Deadline.afterMs(100),
+            .{ .name = probe_endpoint },
+            @import("platform/events_windows.zig").Deadline.afterMs(1000),
             null,
         ) catch {
-            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(20), .real) catch {};
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .real) catch {};
             continue;
         };
         probe.close();
         return;
     }
+    return error.SessionStartupTimeout;
 }
 
 fn attachSession(
@@ -626,6 +682,23 @@ fn attachSession(
         },
         pty_session_windows.provider(),
     );
+}
+
+fn sessionIsReachable(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    session_name: []const u8,
+) !bool {
+    const endpoint = try runtime_windows.resolveEndpointPath(io, alloc, session_name);
+    defer alloc.free(endpoint);
+    var connection = local_ipc_windows.reconnect(
+        alloc,
+        .{ .name = endpoint },
+        @import("platform/events_windows.zig").Deadline.afterMs(1000),
+        null,
+    ) catch return false;
+    connection.close();
+    return true;
 }
 
 /// Windows production entry point. Session creation and attach use the
@@ -697,6 +770,26 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, command, "attach") or std.mem.eql(u8, command, "a")) {
         const session_name = try socket.resolveSessionOrEnv(gpa, io, args.next());
         defer gpa.free(session_name);
+        var command_args: std.ArrayList([]const u8) = .empty;
+        defer command_args.deinit(gpa);
+        while (args.next()) |part| try command_args.append(gpa, part);
+        if (command_args.items.len > 0 and
+            std.mem.eql(u8, command_args.items[0], "cmd/pwsh"))
+        {
+            command_args.items[0] = "pwsh";
+        }
+        if (!try sessionIsReachable(io, gpa, session_name)) {
+            spawnDetached(
+                io,
+                program,
+                gpa,
+                session_name,
+                if (command_args.items.len == 0) null else command_args.items,
+            ) catch |err| switch (err) {
+                error.SessionAlreadyExists => {},
+                else => return err,
+            };
+        }
         return attachSession(io, gpa, session_name);
     }
 
@@ -722,9 +815,17 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, command, "wait") or std.mem.eql(u8, command, "w")) {
-        const session_arg = args.next();
-        if (args.next() != null) return error.UnsupportedCommand;
-        return waitForTask(io, gpa, &cfg, session_arg);
+        var session_args: std.ArrayList([]const u8) = .empty;
+        defer session_args.deinit(gpa);
+        while (args.next()) |session_arg| {
+            if (std.mem.eql(u8, session_arg, "--help") or
+                std.mem.eql(u8, session_arg, "-h"))
+            {
+                return error.UnsupportedCommand;
+            }
+            try session_args.append(gpa, session_arg);
+        }
+        return waitForTasks(io, gpa, &cfg, session_args.items);
     }
 
     if (std.mem.eql(u8, command, "resize")) {

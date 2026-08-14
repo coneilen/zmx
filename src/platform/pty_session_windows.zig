@@ -11,6 +11,10 @@ const windows = std.os.windows;
 
 const kernel32 = struct {
     extern "kernel32" fn CancelSynchronousIo(thread: windows.HANDLE) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn GetConsoleMode(
+        console: windows.HANDLE,
+        mode: *windows.DWORD,
+    ) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn GetStdHandle(which: windows.DWORD) callconv(.winapi) windows.HANDLE;
     extern "kernel32" fn PeekNamedPipe(
         pipe: windows.HANDLE,
@@ -27,10 +31,17 @@ const kernel32 = struct {
         read: *windows.DWORD,
         overlapped: ?*anyopaque,
     ) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn SetConsoleMode(
+        console: windows.HANDLE,
+        mode: windows.DWORD,
+    ) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn Sleep(milliseconds: windows.DWORD) callconv(.winapi) void;
 };
 
 const std_input_handle: windows.DWORD = @bitCast(@as(i32, -10));
+const enableProcessedInput: windows.DWORD = 0x0001;
+const enableLineInput: windows.DWORD = 0x0002;
+const enableEchoInput: windows.DWORD = 0x0004;
 
 comptime {
     if (builtin.os.tag != .windows) @compileError("pty_session_windows requires a Windows target");
@@ -370,7 +381,10 @@ fn clientMain(client: *Client) void {
         defer frame.deinit(session.alloc);
         switch (frame.header.tag) {
             .Input, .Send => writePty(session, frame.payload),
-            .Output => {},
+            .Output => {
+                recordHistory(session, frame.payload);
+                broadcast(session, .Output, frame.payload);
+            },
             .Resize, .Init => {
                 if (frame.payload.len == @sizeOf(wire.Resize)) {
                     const size = std.mem.bytesToValue(wire.Resize, frame.payload);
@@ -392,7 +406,7 @@ fn clientMain(client: *Client) void {
             .LabelSet => setLabels(client, frame.payload),
             .LabelClear => clearLabels(client),
             .History => sendHistory(client, frame.payload),
-            .Write => writeFile(client, frame.payload),
+            .Write => writeFile(client, frame.payload) catch break,
             else => {},
         }
     }
@@ -537,6 +551,13 @@ fn setLabels(client: *Client, payload: []const u8) void {
         const eq = std.mem.indexOfScalar(u8, part, '=') orelse continue;
         const key = part[0..eq];
         const value = part[eq + 1 ..];
+        if (value.len == 0) {
+            if (session.labels.fetchRemove(key)) |old| {
+                session.alloc.free(old.key);
+                session.alloc.free(old.value);
+            }
+            continue;
+        }
         const owned_key = session.alloc.dupe(u8, key) catch continue;
         const owned_value = session.alloc.dupe(u8, value) catch {
             session.alloc.free(owned_key);
@@ -564,44 +585,53 @@ fn clearLabels(client: *Client) void {
     client.enqueue(.Ack, "") catch client.eject();
 }
 
-fn writeFile(client: *Client, payload: []const u8) void {
+fn writeFile(client: *Client, payload: []const u8) !void {
     const session = client.session;
     if (payload.len < @sizeOf(u32)) {
-        client.enqueue(.Ack, "") catch client.eject();
-        return;
+        return error.InvalidWritePayload;
     }
     const path_len = std.mem.bytesToValue(u32, payload[0..@sizeOf(u32)]);
     if (payload.len < @sizeOf(u32) + path_len) {
-        client.enqueue(.Ack, "") catch client.eject();
-        return;
+        return error.InvalidWritePayload;
     }
     const path = payload[@sizeOf(u32)..][0..path_len];
     const content = payload[@sizeOf(u32) + path_len ..];
-    var file = std.Io.Dir.cwd().createFile(session.spec.io, path, .{ .truncate = true }) catch {
-        client.enqueue(.Ack, "") catch client.eject();
-        return;
-    };
+    var file = try std.Io.Dir.cwd().createFile(session.spec.io, path, .{ .truncate = true });
     defer file.close(session.spec.io);
-    _ = file.writeStreamingAll(session.spec.io, content) catch {};
+    try file.writeStreamingAll(session.spec.io, content);
     client.enqueue(.Ack, "") catch client.eject();
 }
 
 fn attachLoop(spec: session_windows.AttachSpec, connection: local_ipc.Connection) !void {
     var stop = std.atomic.Value(bool).init(false);
     const stdin_file = std.Io.File.stdin();
+    const stdin_handle = kernel32.GetStdHandle(std_input_handle);
+    var original_console_mode: ?windows.DWORD = null;
+    var console_input = false;
+    var mode: windows.DWORD = 0;
+    if (@intFromEnum(kernel32.GetConsoleMode(stdin_handle, &mode)) != 0) {
+        original_console_mode = mode;
+        console_input = true;
+        const raw_mode = mode & ~enableProcessedInput & ~enableLineInput & ~enableEchoInput;
+        _ = kernel32.SetConsoleMode(stdin_handle, raw_mode);
+    }
     var input = AttachInput{
         .io = spec.io,
         .alloc = spec.alloc,
         .connection = connection,
         .stdin_file = stdin_file,
         .stop = &stop,
+        .console_input = console_input,
     };
     const input_thread = try std.Thread.spawn(.{}, attachInputMain, .{&input});
     defer {
         stop.store(true, .release);
         _ = kernel32.CancelSynchronousIo(input_thread.getHandle());
-        stdin_file.close(spec.io);
         input_thread.join();
+        if (original_console_mode) |restore_mode| {
+            _ = kernel32.SetConsoleMode(stdin_handle, restore_mode);
+        }
+        stdin_file.close(spec.io);
     }
 
     var output_buffer: [16 * 1024]u8 = undefined;
@@ -626,23 +656,26 @@ const AttachInput = struct {
     connection: local_ipc.Connection,
     stdin_file: std.Io.File,
     stop: *std.atomic.Value(bool),
+    console_input: bool,
 };
 
 fn attachInputMain(input: *AttachInput) void {
     var input_buffer: [4096]u8 = undefined;
     const stdin_handle = kernel32.GetStdHandle(std_input_handle);
     while (!input.stop.load(.acquire)) {
-        var available: windows.DWORD = 0;
-        if (@intFromEnum(kernel32.PeekNamedPipe(
-            stdin_handle,
-            null,
-            0,
-            null,
-            &available,
-            null,
-        )) != 0 and available == 0) {
-            kernel32.Sleep(10);
-            continue;
+        if (!input.console_input) {
+            var available: windows.DWORD = 0;
+            if (@intFromEnum(kernel32.PeekNamedPipe(
+                stdin_handle,
+                null,
+                0,
+                null,
+                &available,
+                null,
+            )) != 0 and available == 0) {
+                kernel32.Sleep(10);
+                continue;
+            }
         }
         var amount: windows.DWORD = 0;
         if (@intFromEnum(kernel32.ReadFile(
