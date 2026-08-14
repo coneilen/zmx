@@ -9,6 +9,12 @@ pub const InputClassifier = struct {
     carry: std.ArrayList(u8) = .empty,
     carry_emitted: bool = false,
     carry_from_leader: bool = false,
+    quarantined: bool = false,
+
+    // A terminal escape sequence is normally a few dozen bytes. Kitty
+    // keyboard reports can be larger, but they still must not make a client
+    // retain or repeatedly rescan an unbounded suffix across frames.
+    pub const max_carry_bytes: usize = 64 * 1024;
 
     pub const Result = struct {
         bytes: []u8,
@@ -32,16 +38,38 @@ pub const InputClassifier = struct {
         return self.analyze(payload, false);
     }
 
+    fn quarantine(self: *InputClassifier) void {
+        self.carry.clearRetainingCapacity();
+        self.carry_emitted = false;
+        self.carry_from_leader = false;
+        self.quarantined = true;
+    }
+
+    fn emptyResult(self: *InputClassifier) !Result {
+        return .{
+            .bytes = try self.alloc.dupe(u8, &.{}),
+            .claims_leadership = false,
+        };
+    }
+
     fn appendCarry(
         self: *InputClassifier,
         bytes: []const u8,
         emitted: bool,
         from_leader: bool,
-    ) !void {
+    ) bool {
+        if (bytes.len > max_carry_bytes) {
+            self.quarantine();
+            return false;
+        }
         self.carry.clearRetainingCapacity();
-        try self.carry.appendSlice(self.alloc, bytes);
+        self.carry.appendSlice(self.alloc, bytes) catch {
+            self.quarantine();
+            return false;
+        };
         self.carry_emitted = emitted;
         self.carry_from_leader = from_leader;
+        return true;
     }
 
     fn appendOutput(
@@ -60,6 +88,11 @@ pub const InputClassifier = struct {
     }
 
     fn analyze(self: *InputClassifier, payload: []const u8, raw_owner: bool) !Result {
+        if (self.quarantined) {
+            self.quarantined = false;
+            return self.emptyResult();
+        }
+
         const lone_esc_already_emitted = raw_owner and
             self.carry_emitted and
             self.carry.items.len == 1 and
@@ -89,8 +122,11 @@ pub const InputClassifier = struct {
             const from_leader = from_carry and carried_from_leader;
 
             if (byte != 0x1b) {
-                const is_keyboard = byte >= 0x20 or
-                    byte == '\r' or byte == '\n' or byte == '\t' or byte == 0x08;
+                // All standalone bytes except ESC are intentional terminal
+                // input, including C0 controls such as Ctrl+C/D/Z. Protocol
+                // replies, focus events, and mouse reports are classified as
+                // escape sequences below and remain filtered as appropriate.
+                const is_keyboard = true;
                 if (raw_owner or (is_keyboard and !emitted and !from_leader)) {
                     try appendOutput(&output, self.alloc, combined.items[i .. i + 1]);
                 }
@@ -104,9 +140,19 @@ pub const InputClassifier = struct {
                     // A lone ESC is itself a key. Preserve its provenance so a
                     // later continuation cannot retake leadership.
                     try appendOutput(&output, self.alloc, combined.items[i .. i + 1]);
-                    try self.appendCarry(combined.items[i..], true, true);
+                    if (!self.appendCarry(combined.items[i..], true, true)) {
+                        return .{
+                            .bytes = try output.toOwnedSlice(self.alloc),
+                            .claims_leadership = claims_leadership,
+                        };
+                    }
                 } else {
-                    try self.appendCarry(combined.items[i..], emitted, raw_owner or from_leader);
+                    if (!self.appendCarry(combined.items[i..], emitted, raw_owner or from_leader)) {
+                        return .{
+                            .bytes = try output.toOwnedSlice(self.alloc),
+                            .claims_leadership = claims_leadership,
+                        };
+                    }
                 }
                 break;
             }
@@ -163,7 +209,12 @@ pub const InputClassifier = struct {
             }
 
             if (incomplete) {
-                try self.appendCarry(combined.items[i..], emitted, raw_owner or from_leader);
+                if (!self.appendCarry(combined.items[i..], emitted, raw_owner or from_leader)) {
+                    return .{
+                        .bytes = try output.toOwnedSlice(self.alloc),
+                        .claims_leadership = claims_leadership,
+                    };
+                }
                 if (raw_owner and i > 0) {
                     output.clearRetainingCapacity();
                     try appendOutput(&output, self.alloc, combined.items[0..i]);
@@ -203,6 +254,27 @@ test "Windows attach classifier transfers leadership for keyboard input" {
     try std.testing.expect(result.claims_leadership);
 }
 
+test "Windows attach classifier transfers leadership for intentional C0 controls" {
+    const controls = [_]u8{ 0x03, 0x04, 0x1a };
+    for (controls) |control| {
+        var classifier = InputClassifier.init(std.testing.allocator);
+        defer classifier.deinit();
+        const result = try classifier.filterNonLeader(&.{control});
+        defer std.testing.allocator.free(result.bytes);
+        try std.testing.expectEqualSlices(u8, &.{control}, result.bytes);
+        try std.testing.expect(result.claims_leadership);
+    }
+}
+
+test "Windows attach classifier filters protocol events while accepting C0 input" {
+    var classifier = InputClassifier.init(std.testing.allocator);
+    defer classifier.deinit();
+    const result = try classifier.filterNonLeader("\x07\x1b[I\x1b[?1;2c");
+    defer std.testing.allocator.free(result.bytes);
+    try std.testing.expectEqualSlices(u8, &.{0x07}, result.bytes);
+    try std.testing.expect(result.claims_leadership);
+}
+
 test "Windows attach classifier keeps split mouse atomic across takeover" {
     var classifier = InputClassifier.init(std.testing.allocator);
     defer classifier.deinit();
@@ -224,4 +296,30 @@ test "Windows attach classifier suppresses former leader keyboard continuation" 
     defer std.testing.allocator.free(result.bytes);
     try std.testing.expectEqualStrings("", result.bytes);
     try std.testing.expect(!result.claims_leadership);
+}
+
+test "Windows attach classifier quarantines oversized escape carry" {
+    var classifier = InputClassifier.init(std.testing.allocator);
+    defer classifier.deinit();
+
+    const oversized = try std.testing.allocator.alloc(u8, InputClassifier.max_carry_bytes + 1);
+    defer std.testing.allocator.free(oversized);
+    @memset(oversized, ' ');
+    oversized[0] = 0x1b;
+    oversized[1] = '[';
+
+    const first = try classifier.filterNonLeader(oversized);
+    defer std.testing.allocator.free(first.bytes);
+    try std.testing.expectEqual(@as(usize, 0), first.bytes.len);
+    try std.testing.expect(!first.claims_leadership);
+
+    const suffix = try classifier.filterNonLeader("x");
+    defer std.testing.allocator.free(suffix.bytes);
+    try std.testing.expectEqual(@as(usize, 0), suffix.bytes.len);
+    try std.testing.expect(!suffix.claims_leadership);
+
+    const recovered = try classifier.filterNonLeader("y");
+    defer std.testing.allocator.free(recovered.bytes);
+    try std.testing.expectEqualStrings("y", recovered.bytes);
+    try std.testing.expect(recovered.claims_leadership);
 }

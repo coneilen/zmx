@@ -123,6 +123,7 @@ const Session = struct {
     terminal_lock_word: std.atomic.Value(u8) = .init(0),
     pty_lock_word: std.atomic.Value(u8) = .init(0),
     leader: ?*Client = null,
+    leader_generation: u64 = 0,
     clients: std.ArrayList(*Client) = .empty,
     reader_thread: ?std.Thread = null,
     labels: std.StringHashMapUnmanaged([]const u8) = .empty,
@@ -819,9 +820,7 @@ fn sendForegroundHistory(client: *Client, blocking: bool) void {
     }
 }
 
-fn writePty(session: *Session, bytes: []const u8) void {
-    session.lockPty();
-    defer session.unlockPty();
+fn writePtyLocked(session: *Session, bytes: []const u8) void {
     var offset: usize = 0;
     while (offset < bytes.len and session.alive.load(.acquire)) {
         const amount = session.runtime.write(session.master, bytes[offset..]) catch |err| switch (err) {
@@ -836,8 +835,102 @@ fn writePty(session: *Session, bytes: []const u8) void {
     }
 }
 
-fn resizePty(session: *Session, size: resize.Size) void {
+fn writePty(session: *Session, bytes: []const u8) void {
     session.lockPty();
+    defer session.unlockPty();
+    writePtyLocked(session, bytes);
+}
+
+fn withLeaderPtyOperation(
+    session: *Session,
+    client: *Client,
+    generation: u64,
+    operation: *const fn (*anyopaque) void,
+    context: *anyopaque,
+) bool {
+    session.lock();
+    defer session.unlock();
+    if (session.leader != client or session.leader_generation != generation) return false;
+    session.lockPty();
+    defer session.unlockPty();
+    operation(context);
+    return true;
+}
+
+fn withGenerationPtyOperation(
+    session: *Session,
+    generation: u64,
+    operation: *const fn (*anyopaque) void,
+    context: *anyopaque,
+) bool {
+    session.lock();
+    defer session.unlock();
+    if (session.leader_generation != generation) return false;
+    session.lockPty();
+    defer session.unlockPty();
+    operation(context);
+    return true;
+}
+
+const WritePtyContext = struct {
+    session: *Session,
+    bytes: []const u8,
+};
+
+fn writePtyOperation(context: *anyopaque) void {
+    const write_context: *WritePtyContext = @ptrCast(@alignCast(context));
+    writePtyLocked(write_context.session, write_context.bytes);
+}
+
+fn leaderSnapshot(session: *Session, client: *Client) struct {
+    is_leader: bool,
+    generation: u64,
+} {
+    session.lock();
+    defer session.unlock();
+    return .{
+        .is_leader = session.leader == client,
+        .generation = session.leader_generation,
+    };
+}
+
+fn writePtyIfLeader(
+    session: *Session,
+    client: *Client,
+    generation: u64,
+    bytes: []const u8,
+) bool {
+    var context = WritePtyContext{
+        .session = session,
+        .bytes = bytes,
+    };
+    return withLeaderPtyOperation(
+        session,
+        client,
+        generation,
+        writePtyOperation,
+        @ptrCast(&context),
+    );
+}
+
+fn writePtyIfGeneration(
+    session: *Session,
+    generation: u64,
+    bytes: []const u8,
+) bool {
+    var context = WritePtyContext{
+        .session = session,
+        .bytes = bytes,
+    };
+    return withGenerationPtyOperation(
+        session,
+        generation,
+        writePtyOperation,
+        @ptrCast(&context),
+    );
+}
+
+fn resizePtyLocked(session: *Session, size: resize.Size) void {
     session.runtime.resize(session.master, size) catch {};
     session.lockTerminal();
     session.terminal.resize(session.alloc, .{
@@ -845,7 +938,35 @@ fn resizePty(session: *Session, size: resize.Size) void {
         .rows = size.rows,
     }) catch {};
     session.unlockTerminal();
-    session.unlockPty();
+}
+
+const ResizePtyContext = struct {
+    session: *Session,
+    size: resize.Size,
+};
+
+fn resizePtyOperation(context: *anyopaque) void {
+    const resize_context: *ResizePtyContext = @ptrCast(@alignCast(context));
+    resizePtyLocked(resize_context.session, resize_context.size);
+}
+
+fn resizePtyIfLeader(
+    session: *Session,
+    client: *Client,
+    generation: u64,
+    size: resize.Size,
+) bool {
+    var context = ResizePtyContext{
+        .session = session,
+        .size = size,
+    };
+    return withLeaderPtyOperation(
+        session,
+        client,
+        generation,
+        resizePtyOperation,
+        @ptrCast(&context),
+    );
 }
 
 fn asciiStartsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
@@ -944,28 +1065,35 @@ fn updateSessionCwd(client: *Client, bytes: []const u8, flush: bool) void {
     }
 }
 
-fn isLeader(session: *Session, client: *Client) bool {
+fn claimLeaderIfVacant(session: *Session, client: *Client) u64 {
     session.lock();
-    const result = session.leader == client;
+    if (session.leader == null) {
+        session.leader = client;
+        session.leader_generation +%= 1;
+    }
+    const generation = session.leader_generation;
     session.unlock();
-    return result;
+    return generation;
 }
 
-fn claimLeaderIfVacant(session: *Session, client: *Client) void {
-    session.lock();
-    if (session.leader == null) session.leader = client;
-    session.unlock();
-}
-
-fn claimLeader(session: *Session, client: *Client) void {
+fn claimLeaderAndWrite(
+    session: *Session,
+    client: *Client,
+    bytes: []const u8,
+) bool {
     var changed = false;
     session.lock();
     if (session.leader != client) {
         session.leader = client;
+        session.leader_generation +%= 1;
         changed = true;
     }
+    session.lockPty();
+    writePtyLocked(session, bytes);
+    session.unlockPty();
     session.unlock();
     if (changed) client.enqueue(.Resize, &.{}) catch client.eject();
+    return true;
 }
 
 fn releaseLeader(session: *Session, client: *Client) void {
@@ -980,6 +1108,7 @@ fn releaseLeader(session: *Session, client: *Client) void {
             }
         }
         session.leader = replacement;
+        session.leader_generation +%= 1;
     }
     session.unlock();
     if (replacement) |next| {
@@ -1002,17 +1131,25 @@ fn clientMain(client: *Client) void {
         client.request_seen.store(true, .release);
         switch (frame.header.tag) {
             .Input => {
-                if (isLeader(session, client)) {
+                const snapshot = leaderSnapshot(session, client);
+                if (snapshot.is_leader) {
                     const bytes = client.input.observeLeader(frame.payload) catch break;
                     defer session.alloc.free(bytes);
-                    updateSessionCwd(client, bytes, false);
-                    writePty(session, bytes);
+                    if (bytes.len == 0 or
+                        writePtyIfLeader(session, client, snapshot.generation, bytes))
+                    {
+                        updateSessionCwd(client, bytes, false);
+                    }
                 } else {
                     const result = client.input.filterNonLeader(frame.payload) catch break;
                     defer session.alloc.free(result.bytes);
-                    if (result.claims_leadership) claimLeader(session, client);
-                    updateSessionCwd(client, result.bytes, false);
-                    writePty(session, result.bytes);
+                    const accepted = if (result.bytes.len == 0)
+                        true
+                    else if (result.claims_leadership)
+                        claimLeaderAndWrite(session, client, result.bytes)
+                    else
+                        writePtyIfGeneration(session, snapshot.generation, result.bytes);
+                    if (accepted) updateSessionCwd(client, result.bytes, false);
                 }
             },
             .Send => {
@@ -1031,19 +1168,25 @@ fn clientMain(client: *Client) void {
             .Resize => {
                 if (frame.payload.len == @sizeOf(wire.Resize)) {
                     const size = std.mem.bytesToValue(wire.Resize, frame.payload);
-                    if (isLeader(session, client)) resizePty(session, size);
+                    const snapshot = leaderSnapshot(session, client);
+                    if (snapshot.is_leader) {
+                        _ = resizePtyIfLeader(session, client, snapshot.generation, size);
+                    }
                 }
             },
             .Init => {
                 if (std.mem.eql(u8, frame.payload, foreground_init)) {
-                    claimLeaderIfVacant(session, client);
+                    _ = claimLeaderIfVacant(session, client);
                     sendForegroundHistory(client, true);
                     if (session.task_complete.load(.acquire)) {
                         if (!client.closed.load(.acquire)) sendTaskComplete(client);
                     }
                 } else if (frame.payload.len == @sizeOf(wire.Resize)) {
                     const size = std.mem.bytesToValue(wire.Resize, frame.payload);
-                    if (isLeader(session, client)) resizePty(session, size);
+                    const snapshot = leaderSnapshot(session, client);
+                    if (snapshot.is_leader) {
+                        _ = resizePtyIfLeader(session, client, snapshot.generation, size);
+                    }
                 }
             },
             .Kill => {
@@ -1634,6 +1777,40 @@ fn resizeMonitorMain(monitor: *ResizeMonitor) void {
     }
 }
 
+const LeadershipRaceProbe = struct {
+    session: *Session,
+    replacement: *Client,
+    started: std.atomic.Value(bool) = .init(false),
+    claimed: std.atomic.Value(bool) = .init(false),
+    claimed_during_operation: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+};
+
+fn claimLeadershipForTest(probe: *LeadershipRaceProbe) void {
+    probe.started.store(true, .release);
+    probe.session.lock();
+    probe.session.leader = probe.replacement;
+    probe.session.leader_generation +%= 1;
+    probe.claimed.store(true, .release);
+    probe.session.unlock();
+}
+
+fn raceDuringLeaderOperation(context: *anyopaque) void {
+    const probe: *LeadershipRaceProbe = @ptrCast(@alignCast(context));
+    probe.thread = std.Thread.spawn(.{}, claimLeadershipForTest, .{probe}) catch unreachable;
+    while (!probe.started.load(.acquire)) std.atomic.spinLoopHint();
+    probe.claimed_during_operation.store(probe.claimed.load(.acquire), .release);
+}
+
+const OperationMarker = struct {
+    value: u32 = 0,
+};
+
+fn markLeaderOperation(context: *anyopaque) void {
+    const marker: *OperationMarker = @ptrCast(@alignCast(context));
+    marker.value += 1;
+}
+
 test "Windows PTY session provider exposes the frozen provider shape" {
     const value = provider();
     try std.testing.expect(@intFromPtr(value.host_fn) != 0);
@@ -1757,4 +1934,60 @@ test "Windows fragmented input updates session cwd at line termination" {
     }
     updateSessionCwd(&client, "\r", false);
     try std.testing.expectEqualStrings("C:\\", client.session.cwd);
+}
+
+test "Windows leader operation holds validation through a competing claim" {
+    var session: Session = undefined;
+    session.lock_word = .init(0);
+    session.pty_lock_word = .init(0);
+    session.leader_generation = 10;
+
+    var current: Client = undefined;
+    var replacement: Client = undefined;
+    session.leader = &current;
+
+    var probe = LeadershipRaceProbe{
+        .session = &session,
+        .replacement = &replacement,
+    };
+    const committed = withLeaderPtyOperation(
+        &session,
+        &current,
+        10,
+        raceDuringLeaderOperation,
+        @ptrCast(&probe),
+    );
+    try std.testing.expect(committed);
+    probe.thread.?.join();
+    try std.testing.expect(!probe.claimed_during_operation.load(.acquire));
+    try std.testing.expect(probe.claimed.load(.acquire));
+    try std.testing.expect(session.leader == &replacement);
+    try std.testing.expectEqual(@as(u64, 11), session.leader_generation);
+}
+
+test "Windows stale leader token rejects PTY operation after transfer" {
+    var session: Session = undefined;
+    session.lock_word = .init(0);
+    session.pty_lock_word = .init(0);
+    session.leader_generation = 4;
+
+    var current: Client = undefined;
+    var replacement: Client = undefined;
+    session.leader = &current;
+    const snapshot = leaderSnapshot(&session, &current);
+
+    session.lock();
+    session.leader = &replacement;
+    session.leader_generation +%= 1;
+    session.unlock();
+
+    var marker = OperationMarker{};
+    try std.testing.expect(!withLeaderPtyOperation(
+        &session,
+        &current,
+        snapshot.generation,
+        markLeaderOperation,
+        @ptrCast(&marker),
+    ));
+    try std.testing.expectEqual(@as(u32, 0), marker.value);
 }
