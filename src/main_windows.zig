@@ -854,6 +854,7 @@ pub fn main(init: std.process.Init) !void {
         return listSessions(io, gpa, &cfg, &.{});
     };
     if (std.mem.eql(u8, command, "help") or
+        std.mem.eql(u8, command, "h") or
         std.mem.eql(u8, command, "-h") or
         std.mem.eql(u8, command, "--help"))
     {
@@ -1033,8 +1034,13 @@ pub fn main(init: std.process.Init) !void {
         return sendPayload(io, gpa, &cfg, session_name, .LabelSet, payload.items);
     }
 
-    if (std.mem.eql(u8, command, "completions")) {
-        const shell_name = args.next() orelse return error.UnsupportedCommand;
+    if (std.mem.eql(u8, command, "completions") or
+        std.mem.eql(u8, command, "c"))
+    {
+        const shell_name = args.next() orelse return;
+        if (std.mem.eql(u8, shell_name, "--help") or std.mem.eql(u8, shell_name, "-h")) {
+            return printHelp(io);
+        }
         if (args.next() != null) return error.UnsupportedCommand;
         return printCompletions(io, shell_name);
     }
