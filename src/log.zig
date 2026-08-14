@@ -40,6 +40,7 @@ pub const LogSystem = struct {
             ),
             else => return err,
         };
+        errdefer std.Io.File.close(file, self.io);
 
         // Use lseek(SEEK_END) instead of length() + seekTo() to avoid a
         // TOCTOU race: after fork() the parent may still write to the log
@@ -47,11 +48,13 @@ pub const LogSystem = struct {
         // recent parent entries. lseek(fd, 0, SEEK_END) is atomic — it
         // always positions at the true end of file at seek time.
         if (builtin.os.tag == .windows) {
-            self.current_size = 0;
+            self.current_size = (try file.stat(self.io)).size;
+            var seek_buf: [1]u8 = undefined;
+            var writer = file.writerStreaming(self.io, &seek_buf);
+            try writer.seekTo(self.current_size);
         } else {
             const new_pos = cross.c.lseek(file.handle, 0, cross.c.SEEK_END);
             if (new_pos == -1) {
-                std.Io.File.close(file, self.io);
                 return error.SeekFailed;
             }
             self.current_size = @as(u64, @intCast(new_pos));
@@ -127,3 +130,44 @@ pub const LogSystem = struct {
         self.current_size = 0;
     }
 };
+
+test "Windows logs append to existing files after initialization" {
+    if (builtin.os.tag != .windows) return;
+
+    var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = try std.process.currentPath(std.testing.io, &cwd_buffer);
+    const path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ cwd_buffer[0..cwd_len], "zmx-log-eof-test.log" },
+    );
+    defer std.testing.allocator.free(path);
+    std.Io.Dir.deleteFileAbsolute(std.testing.io, path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, path) catch {};
+
+    var existing = try std.Io.Dir.createFileAbsolute(
+        std.testing.io,
+        path,
+        .{ .read = true },
+    );
+    const old_bytes = [_]u8{'x'} ** 5000;
+    try existing.writeStreamingAll(std.testing.io, &old_bytes);
+    existing.close(std.testing.io);
+
+    var system = LogSystem{};
+    try system.init(
+        std.testing.io,
+        path,
+        if (builtin.os.tag == .windows) @enumFromInt(0) else default_log_permissions,
+    );
+    try std.testing.expectEqual(@as(u64, old_bytes.len), system.current_size);
+    try system.log(.info, .scope_test, "suffix", .{});
+    system.deinit();
+
+    const after = try std.Io.Dir.openFileAbsolute(
+        std.testing.io,
+        path,
+        .{ .mode = .read_only },
+    );
+    defer after.close(std.testing.io);
+    try std.testing.expect((try after.stat(std.testing.io)).size > old_bytes.len);
+}
