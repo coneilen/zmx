@@ -81,28 +81,97 @@ fn isCmdOperator(arg: []const u8) bool {
         std.mem.eql(u8, arg, ")");
 }
 
-fn needsCmdQuotes(arg: []const u8) bool {
-    if (arg.len == 0) return true;
-    for (arg) |byte| {
-        switch (byte) {
-            ' ', '\t', '"', '&', '|', '<', '>', '(', ')', '^' => return true,
-            else => {},
+fn isCmdMeta(byte: u8) bool {
+    return switch (byte) {
+        '"', '%', '!', '^', '&', '|', '<', '>', '(', ')' => true,
+        else => false,
+    };
+}
+
+fn appendCmdEscapedArg(
+    list: *std.ArrayList(u8),
+    alloc: std.mem.Allocator,
+    arg: []const u8,
+) !void {
+    // cmd.exe parses its /c payload before CreateProcess-style argument
+    // parsing.  Keep ordinary text inside quoted segments, then leave the
+    // quotes briefly to caret-escape every CMD metacharacter.  This preserves
+    // the literal value of an argument such as `a" & echo INJECTED` without
+    // allowing its ampersand to become a command operator.
+    if (std.mem.indexOfScalar(u8, arg, '"') != null) {
+        try list.append(alloc, '"');
+        var quoted_backslashes: usize = 0;
+        for (arg) |byte| {
+            if (byte == '\\') {
+                quoted_backslashes += 1;
+                continue;
+            }
+            if (byte == '"') {
+                try appendRepeated(list, alloc, '\\', quoted_backslashes * 2 + 1);
+                try list.append(alloc, '"');
+            } else if (isCmdMeta(byte)) {
+                try appendRepeated(list, alloc, '\\', quoted_backslashes);
+                try list.append(alloc, '^');
+                try list.append(alloc, byte);
+            } else {
+                try appendRepeated(list, alloc, '\\', quoted_backslashes);
+                try list.append(alloc, byte);
+            }
+            quoted_backslashes = 0;
         }
+        try appendRepeated(list, alloc, '\\', quoted_backslashes * 2);
+        try list.append(alloc, '"');
+        return;
     }
-    return false;
+
+    try list.append(alloc, '"');
+    var backslashes: usize = 0;
+    for (arg, 0..) |byte, index| {
+        if (byte == '\\') {
+            backslashes += 1;
+            continue;
+        }
+        if (isCmdMeta(byte)) {
+            try appendRepeated(list, alloc, '\\', backslashes * 2);
+            try list.appendSlice(alloc, "\"^");
+            try list.append(alloc, byte);
+            if (index + 1 < arg.len and !isCmdMeta(arg[index + 1])) {
+                try list.append(alloc, '"');
+            }
+        } else {
+            try appendRepeated(list, alloc, '\\', backslashes);
+            try list.append(alloc, byte);
+        }
+        backslashes = 0;
+    }
+    if (arg.len == 0 or !isCmdMeta(arg[arg.len - 1])) {
+        try appendRepeated(list, alloc, '\\', backslashes * 2);
+        try list.append(alloc, '"');
+    }
 }
 
 fn appendCmdArg(list: *std.ArrayList(u8), alloc: std.mem.Allocator, arg: []const u8) !void {
     // Keep standalone command operators active so callers can use the normal
-    // argv-based CLI for redirection and command chaining.  All other parts
-    // use CreateProcess quoting, which protects spaces, quotes, and trailing
-    // backslashes from cmd.exe's command-line parser.
+    // argv-based CLI for redirection and command chaining.  Every other
+    // argument is encoded for cmd.exe itself; CreateProcess quoting alone does
+    // not protect percent expansion, delayed expansion, or CMD metacharacters.
     if (isCmdOperator(arg)) {
         try list.appendSlice(alloc, arg);
-    } else if (needsCmdQuotes(arg)) {
-        try appendWindowsArgImpl(list, alloc, arg, true);
+    } else if (arg.len == 0) {
+        try appendCmdEscapedArg(list, alloc, arg);
+    } else if (std.mem.indexOfAny(u8, arg, " \t\"%!^&|<>()") != null) {
+        try appendCmdEscapedArg(list, alloc, arg);
     } else {
         try list.appendSlice(alloc, arg);
+    }
+}
+
+fn appendCmdEchoArg(list: *std.ArrayList(u8), alloc: std.mem.Allocator, arg: []const u8) !void {
+    for (arg) |byte| {
+        if (byte == ' ' or byte == '\t' or isCmdMeta(byte)) {
+            try list.append(alloc, '^');
+        }
+        try list.append(alloc, byte);
     }
 }
 
@@ -115,10 +184,16 @@ pub fn buildCommandLine(alloc: std.mem.Allocator, spec: pty.SpawnSpec) ![]u8 {
         if (spec.task_mode) {
             const shell = if (spec.shell.len == 0) "cmd.exe" else spec.shell;
             try appendWindowsArg(&line, alloc, shell);
-            try line.appendSlice(alloc, " /d /c ");
+            try line.appendSlice(alloc, " /d /v:off /c ");
+            var echo_args = std.ascii.eqlIgnoreCase(command[0], "echo");
             for (command, 0..) |arg, index| {
                 if (index != 0) try line.append(alloc, ' ');
-                try appendCmdArg(&line, alloc, arg);
+                if (index > 0 and echo_args and !isCmdOperator(arg)) {
+                    try appendCmdEchoArg(&line, alloc, arg);
+                } else {
+                    try appendCmdArg(&line, alloc, arg);
+                }
+                if (isCmdOperator(arg)) echo_args = false;
             }
         } else {
             for (command, 0..) |arg, index| {
@@ -502,6 +577,7 @@ const windows_impl = struct {
         stop_event: ?HANDLE = null,
         pid: DWORD = 0,
         io_closed: bool = false,
+        abort_io: bool = false,
     };
 
     const QUEUE_CAPACITY = 256 * 1024;
@@ -615,6 +691,13 @@ const windows_impl = struct {
     const State = struct {
         alloc: std.mem.Allocator,
         sessions: std.ArrayList(*Session) = .empty,
+        test_fail_worker_spawn: ?WorkerKind = null,
+    };
+
+    const WorkerKind = enum {
+        reader,
+        writer,
+        process_wait,
     };
 
     fn init(alloc: std.mem.Allocator) State {
@@ -654,6 +737,7 @@ const windows_impl = struct {
             .output_queue = SpscQueue.empty(state.alloc),
         };
         errdefer destroySession(session);
+        errdefer abortSpawn(session);
         session.input_queue = try SpscQueue.init(state.alloc, QUEUE_CAPACITY);
         session.output_queue = try SpscQueue.init(state.alloc, QUEUE_CAPACITY);
         session.stop_event = kernel32.CreateEventW(null, 0, 0, null) orelse
@@ -808,24 +892,9 @@ const windows_impl = struct {
         _ = kernel32.CloseHandle(process_info.hThread);
         session.thread = null;
 
-        session.reader_thread = try std.Thread.spawn(.{}, readerMain, .{session});
-        errdefer {
-            session.stop_workers.store(true, .release);
-            if (session.stop_event) |event| _ = kernel32.SetEvent(event);
-            session.input_queue.close();
-            session.output_queue.close();
-            if (session.writer_thread) |writer| {
-                _ = kernel32.CancelSynchronousIo(writer.getHandle());
-                writer.join();
-            }
-            if (session.reader_thread) |reader| reader.join();
-            if (session.process_wait_thread) |waiter| waiter.join();
-            session.writer_thread = null;
-            session.reader_thread = null;
-            session.process_wait_thread = null;
-        }
-        session.writer_thread = try std.Thread.spawn(.{}, writerMain, .{session});
-        session.process_wait_thread = try std.Thread.spawn(.{}, processWaitMain, .{session});
+        session.reader_thread = try spawnWorker(state, .reader, session);
+        session.writer_thread = try spawnWorker(state, .writer, session);
+        session.process_wait_thread = try spawnWorker(state, .process_wait, session);
 
         state.sessions.append(state.alloc, session) catch |err| {
             _ = kernel32.TerminateJobObject(job, 1);
@@ -836,6 +905,32 @@ const windows_impl = struct {
             .master = @intFromPtr(session),
             .process = @intCast(session.pid),
         };
+    }
+
+    fn spawnWorker(state: *State, kind: WorkerKind, session: *Session) !std.Thread {
+        if (state.test_fail_worker_spawn == kind) return error.ThreadSpawnFailure;
+        return switch (kind) {
+            .reader => try std.Thread.spawn(.{}, readerMain, .{session}),
+            .writer => try std.Thread.spawn(.{}, writerMain, .{session}),
+            .process_wait => try std.Thread.spawn(.{}, processWaitMain, .{session}),
+        };
+    }
+
+    fn expectWorkerSpawnFailure(kind: WorkerKind) !void {
+        var state = Self.init(std.testing.allocator);
+        defer Self.deinit(&state);
+        state.test_fail_worker_spawn = kind;
+        try std.testing.expectError(
+            error.ThreadSpawnFailure,
+            Self.spawn(&state, .{
+                .session_name = "worker-startup-failure",
+                .shell = "cmd.exe",
+                .task_mode = false,
+                .command = null,
+                .size = .{ .rows = 24, .cols = 80 },
+            }),
+        );
+        try std.testing.expectEqual(@as(usize, 0), state.sessions.items.len);
     }
 
     fn read(state: *State, master: pty.Handle, buffer: []u8) !usize {
@@ -964,6 +1059,14 @@ const windows_impl = struct {
         }
     }
 
+    fn abortSpawn(session: *Session) void {
+        session.abort_io = true;
+        terminateSession(session, 1);
+        if (session.process) |process| {
+            _ = kernel32.WaitForSingleObject(process, INFINITE);
+        }
+    }
+
     fn takePseudoConsole(session: *Session) ?HPCON {
         while (session.pseudo_console_lock.cmpxchgStrong(0, 1, .acquire, .monotonic) != null) {
             std.atomic.spinLoopHint();
@@ -985,6 +1088,14 @@ const windows_impl = struct {
             session.writer_thread = null;
         }
 
+        if (session.abort_io) {
+            session.stop_workers.store(true, .release);
+            session.output_queue.close();
+            if (session.reader_thread) |reader| {
+                _ = kernel32.CancelSynchronousIo(reader.getHandle());
+            }
+        }
+
         // Closing the pseudo console is what releases a synchronous output
         // read after the process exits. Do this while the reader is still
         // alive so ClosePseudoConsole and the pipe drain can make progress
@@ -993,13 +1104,20 @@ const windows_impl = struct {
             _ = kernel32.ClosePseudoConsole(pseudo_console);
         }
 
+        if (session.abort_io) {
+            if (session.output) |output| {
+                _ = kernel32.CloseHandle(output);
+                session.output = null;
+            }
+        }
+
         const process_done = session.process_exited.load(.acquire) or
             if (session.process) |process|
                 kernel32.WaitForSingleObject(process, 0) == WAIT_OBJECT_0
             else
                 false;
         if (session.reader_thread) |reader| {
-            if (!process_done) {
+            if (session.abort_io or !process_done) {
                 session.stop_workers.store(true, .release);
                 session.output_queue.close();
                 _ = kernel32.CancelSynchronousIo(reader.getHandle());
@@ -1294,7 +1412,32 @@ test "Windows task command line uses cmd shell semantics" {
     });
     defer alloc.free(line);
     try std.testing.expectEqualStrings(
-        "cmd.exe /d /c echo \"hello world\" > C:\\path\\ && dir C:\\path\\ \"a&b\" 日本語",
+        "cmd.exe /d /v:off /c echo hello^ world > C:\\path\\ && dir C:\\path\\ \"a\"^&\"b\" 日本語",
+        line,
+    );
+}
+
+test "Windows cmd payload escapes hostile literal arguments" {
+    const alloc = std.testing.allocator;
+    const args = [_][]const u8{
+        "echo",
+        "a\" & echo INJECTED",
+        "100%",
+        "bang!",
+        "caret^",
+        "pipe|redirection<>",
+        "group(parentheses)",
+    };
+    const line = try buildCommandLine(alloc, .{
+        .session_name = "cmd-escape",
+        .shell = "cmd.exe",
+        .task_mode = true,
+        .command = args[0..],
+        .size = .{ .rows = 24, .cols = 80 },
+    });
+    defer alloc.free(line);
+    try std.testing.expectEqualStrings(
+        "cmd.exe /d /v:off /c echo a^\"^ ^&^ echo^ INJECTED 100^% bang^! caret^^ pipe^|redirection^<^> group^(parentheses^)",
         line,
     );
 }
@@ -1341,16 +1484,30 @@ test "ConPTY adapter exposes the frozen backend shape on every target" {
     try std.testing.expect(@TypeOf(adapter.spawn_fn) == *const fn (*anyopaque, pty.SpawnSpec) anyerror!pty.Spawned);
 }
 
+test "real ConPTY writer startup failure tears down the reader and child" {
+    if (builtin.os.tag != .windows) return;
+    try windows_impl.expectWorkerSpawnFailure(.writer);
+}
+
+test "real ConPTY process-wait startup failure tears down all workers and child" {
+    if (builtin.os.tag != .windows) return;
+    try windows_impl.expectWorkerSpawnFailure(.process_wait);
+}
+
 test "real ConPTY preserves UTF-8 output and Ctrl+C" {
     if (builtin.os.tag != .windows) return;
 
     var state = init(std.testing.allocator);
     defer deinit(&state);
     const command = [_][]const u8{
-        "cmd.exe",
-        "/d",
-        "/c",
-        "chcp 65001>nul & echo hello 日本語",
+        "chcp",
+        "65001",
+        ">",
+        "nul",
+        "&",
+        "echo",
+        "hello",
+        "日本語",
     };
     const spawned = try spawn(&state, .{
         .session_name = "conpty-test",
@@ -1387,7 +1544,8 @@ test "real ConPTY drains final output after process exit" {
         "cmd.exe",
         "/d",
         "/c",
-        "echo final-output",
+        "echo",
+        "final-output",
     };
     const spawned = try spawn(&state, .{
         .session_name = "conpty-final-output",
@@ -1444,10 +1602,12 @@ test "real ConPTY sends Ctrl+C to the attached process" {
     var state = init(std.testing.allocator);
     defer deinit(&state);
     const command = [_][]const u8{
-        "cmd.exe",
-        "/d",
-        "/c",
-        "echo ready & pause >nul",
+        "echo",
+        "ready",
+        "&",
+        "pause",
+        ">",
+        "nul",
     };
     const spawned = try spawn(&state, .{
         .session_name = "conpty-ctrl-c",
@@ -1483,6 +1643,7 @@ test "real ConPTY sends Ctrl+C to the attached process" {
         sleepNs(100 * std.time.ns_per_ms);
     }
     try std.testing.expect(exited);
+    backend(&state).signal(spawned.process, .kill) catch {};
 }
 
 test "real ConPTY accepts resize updates" {
@@ -1508,35 +1669,30 @@ test "real ConPTY worker queues preserve input and EOF semantics" {
 
     var state = init(std.testing.allocator);
     defer deinit(&state);
-    const command = [_][]const u8{
-        "cmd.exe",
-        "/d",
-        "/v:on",
-        "/c",
-        "set /p value= & echo got:!value!",
-    };
     const spawned = try spawn(&state, .{
         .session_name = "conpty-worker-input",
         .shell = "cmd.exe",
-        .task_mode = true,
-        .command = command[0..],
+        .task_mode = false,
+        .command = null,
         .size = .{ .rows = 24, .cols = 80 },
     });
     defer reap(&state, spawned.process);
 
+    _ = try write(&state, spawned.master, "more\r\n");
     try std.testing.expectEqual(@as(usize, 7), try write(&state, spawned.master, "hello\r\n"));
     var output: [4096]u8 = undefined;
     var total: usize = 0;
     var attempts: usize = 0;
-    while (attempts < 2000 and std.mem.indexOf(u8, output[0..total], "got:hello") == null) : (attempts += 1) {
+    while (attempts < 2000 and std.mem.indexOf(u8, output[0..total], "hello") == null) : (attempts += 1) {
         const count = read(&state, spawned.master, output[total..]) catch |err| switch (err) {
             error.WouldBlock => 0,
             else => return err,
         };
         total += count;
-        if (std.mem.indexOf(u8, output[0..total], "got:hello") == null) sleepNs(10 * std.time.ns_per_ms);
+        if (std.mem.indexOf(u8, output[0..total], "hello") == null) sleepNs(10 * std.time.ns_per_ms);
     }
-    try std.testing.expect(std.mem.indexOf(u8, output[0..total], "got:hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output[0..total], "hello") != null);
+    try backend(&state).signal(spawned.process, .kill);
     _ = try wait(&state, spawned.process);
 
     var eof = false;
@@ -1560,21 +1716,20 @@ test "real ConPTY output backpressure does not block the caller" {
 
     var state = init(std.testing.allocator);
     defer deinit(&state);
-    const command = [_][]const u8{
-        "cmd.exe",
-        "/d",
-        "/c",
-        "for /L %i in (1,1,20000) do @echo backpressure",
-    };
     const spawned = try spawn(&state, .{
         .session_name = "conpty-worker-output",
         .shell = "cmd.exe",
-        .task_mode = true,
-        .command = command[0..],
+        .task_mode = false,
+        .command = null,
         .size = .{ .rows = 24, .cols = 80 },
     });
     defer reap(&state, spawned.process);
 
+    _ = try write(
+        &state,
+        spawned.master,
+        "for /L %i in (1,1,20000) do @echo backpressure\r\n",
+    );
     sleepNs(100 * std.time.ns_per_ms);
     var output: [8192]u8 = undefined;
     var total: usize = 0;
