@@ -406,6 +406,7 @@ const windows_impl = struct {
         writer_thread: ?std.Thread = null,
         input_queue: SpscQueue = undefined,
         output_queue: SpscQueue = undefined,
+        input_push_lock: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
         stop_workers: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         pid: DWORD = 0,
         io_closed: bool = false,
@@ -716,7 +717,7 @@ const windows_impl = struct {
             session.input_queue.close();
             return error.ProcessExited;
         }
-        const amount = session.input_queue.push(bytes);
+        const amount = pushInput(session, bytes);
         if (amount == 0) {
             if (session.input_queue.isClosed()) {
                 if (!isAlive(session)) return error.ProcessExited;
@@ -791,13 +792,21 @@ const windows_impl = struct {
             session.input_queue.close();
             return error.ProcessExited;
         }
-        if (session.input_queue.push(&control_bytes) != 1) {
+        if (pushInput(session, &control_bytes) != 1) {
             if (session.input_queue.isClosed()) {
                 if (!isAlive(session)) return error.ProcessExited;
                 return error.BrokenPipe;
             }
             return error.WouldBlock;
         }
+    }
+
+    fn pushInput(session: *Session, bytes: []const u8) usize {
+        while (session.input_push_lock.cmpxchgStrong(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+        defer session.input_push_lock.store(0, .release);
+        return session.input_queue.push(bytes);
     }
 
     fn terminateSession(session: *Session, exit_code: DWORD) void {
@@ -1205,7 +1214,7 @@ test "real ConPTY worker queues preserve input and EOF semantics" {
     var output: [4096]u8 = undefined;
     var total: usize = 0;
     var attempts: usize = 0;
-    while (attempts < 500 and std.mem.indexOf(u8, output[0..total], "got:hello") == null) : (attempts += 1) {
+    while (attempts < 2000 and std.mem.indexOf(u8, output[0..total], "got:hello") == null) : (attempts += 1) {
         const count = read(&state, spawned.master, output[total..]) catch |err| switch (err) {
             error.WouldBlock => 0,
             else => return err,

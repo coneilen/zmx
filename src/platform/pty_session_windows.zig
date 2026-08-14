@@ -7,6 +7,30 @@ const local_ipc_windows = @import("local_ipc_windows.zig");
 const runtime_windows = @import("runtime_windows.zig");
 const session_windows = @import("session_windows.zig");
 const wire = @import("session_wire.zig");
+const windows = std.os.windows;
+
+const kernel32 = struct {
+    extern "kernel32" fn CancelSynchronousIo(thread: windows.HANDLE) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn GetStdHandle(which: windows.DWORD) callconv(.winapi) windows.HANDLE;
+    extern "kernel32" fn PeekNamedPipe(
+        pipe: windows.HANDLE,
+        buffer: ?[*]u8,
+        buffer_length: windows.DWORD,
+        bytes_read: ?*windows.DWORD,
+        total_bytes_available: *windows.DWORD,
+        bytes_left_this_message: ?*windows.DWORD,
+    ) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn ReadFile(
+        file: windows.HANDLE,
+        buffer: [*]u8,
+        length: windows.DWORD,
+        read: *windows.DWORD,
+        overlapped: ?*anyopaque,
+    ) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn Sleep(milliseconds: windows.DWORD) callconv(.winapi) void;
+};
+
+const std_input_handle: windows.DWORD = @bitCast(@as(i32, -10));
 
 comptime {
     if (builtin.os.tag != .windows) @compileError("pty_session_windows requires a Windows target");
@@ -20,12 +44,15 @@ const Session = struct {
     master: pty.Handle,
     process: pty.ProcessId,
     alive: std.atomic.Value(bool) = .init(true),
+    task_complete: std.atomic.Value(bool) = .init(false),
     active_clients: std.atomic.Value(u64) = .init(0),
     lock_word: std.atomic.Value(u8) = .init(0),
     clients: std.ArrayList(*Client) = .empty,
     reader_thread: ?std.Thread = null,
     labels: std.StringHashMapUnmanaged([]const u8) = .empty,
     history: std.ArrayList(u8) = .empty,
+    task_ended_at: u64 = 0,
+    task_exit_code: u8 = 0,
 
     const max_history_bytes = Client.max_output_bytes - @sizeOf(wire.Header);
 
@@ -67,6 +94,15 @@ const Client = struct {
         self.lockOutput();
         self.output_closed = true;
         self.unlockOutput();
+    }
+
+    fn eject(self: *Client) void {
+        self.closed.store(true, .release);
+        self.lockOutput();
+        self.output.clearRetainingCapacity();
+        self.output_closed = true;
+        self.unlockOutput();
+        self.closeConnection();
     }
 
     fn closeConnection(self: *Client) void {
@@ -149,6 +185,7 @@ fn createSession(spec: session_windows.HostSpec, server: local_ipc.Server) !*Ses
 fn sessionMain(session: *Session) void {
     defer destroySession(session);
     while (session.alive.load(.acquire)) {
+        reapClients(session);
         const connection = local_ipc_windows.acceptServerWithDeadline(
             session.server,
             @import("events_windows.zig").Deadline.afterMs(250),
@@ -184,11 +221,30 @@ fn sessionMain(session: *Session) void {
         if (client.thread != null) {
             client.writer_thread = std.Thread.spawn(.{}, writerMain, .{client}) catch blk: {
                 client.closed.store(true, .release);
-                client.closeOutput();
-                client.closeConnection();
+                client.eject();
                 break :blk null;
             };
         }
+    }
+}
+
+fn reapClients(session: *Session) void {
+    while (true) {
+        session.lock();
+        var found: ?*Client = null;
+        for (session.clients.items, 0..) |client, index| {
+            if (!client.closed.load(.acquire)) continue;
+            found = client;
+            _ = session.clients.swapRemove(index);
+            break;
+        }
+        session.unlock();
+
+        const client = found orelse return;
+        if (client.thread) |thread| thread.join();
+        if (client.writer_thread) |thread| thread.join();
+        client.output.deinit(session.alloc);
+        session.alloc.destroy(client);
     }
 }
 
@@ -242,6 +298,19 @@ fn readerMain(session: *Session) void {
         broadcast(session, .Output, buffer[0..amount]);
     }
 
+    if (session.spec.task_mode and session.alive.load(.acquire)) {
+        const exit_code = session.runtime.wait(session.process) catch 1;
+        session.lock();
+        session.task_exit_code = @intCast(@min(exit_code, @as(u32, std.math.maxInt(u8))));
+        session.task_ended_at = @intCast(std.Io.Timestamp.now(session.spec.io, .real).toSeconds());
+        session.task_complete.store(true, .release);
+        const task_exit_code = session.task_exit_code;
+        session.unlock();
+        const payload = [_]u8{task_exit_code};
+        broadcast(session, .TaskComplete, &payload);
+        return;
+    }
+
     session.alive.store(false, .release);
     session.server.close();
 }
@@ -268,7 +337,7 @@ fn broadcast(session: *Session, tag: wire.Tag, payload: []const u8) void {
     defer session.unlock();
     for (session.clients.items) |client| {
         if (client.closed.load(.acquire)) continue;
-        client.enqueue(tag, payload) catch client.closeOutput();
+        client.enqueue(tag, payload) catch client.eject();
     }
 }
 
@@ -289,6 +358,7 @@ fn writePty(session: *Session, bytes: []const u8) void {
 
 fn clientMain(client: *Client) void {
     const session = client.session;
+    if (session.task_complete.load(.acquire)) sendTaskComplete(client);
     defer {
         client.closed.store(true, .release);
         client.closeOutput();
@@ -299,7 +369,8 @@ fn clientMain(client: *Client) void {
         var frame = wire.readFrame(session.alloc, client.connection) catch break;
         defer frame.deinit(session.alloc);
         switch (frame.header.tag) {
-            .Input, .Send, .Output => writePty(session, frame.payload),
+            .Input, .Send => writePty(session, frame.payload),
+            .Output => {},
             .Resize, .Init => {
                 if (frame.payload.len == @sizeOf(wire.Resize)) {
                     const size = std.mem.bytesToValue(wire.Resize, frame.payload);
@@ -320,7 +391,7 @@ fn clientMain(client: *Client) void {
             .LabelGet => sendLabels(client),
             .LabelSet => setLabels(client, frame.payload),
             .LabelClear => clearLabels(client),
-            .History => sendHistory(client),
+            .History => sendHistory(client, frame.payload),
             .Write => writeFile(client, frame.payload),
             else => {},
         }
@@ -355,8 +426,7 @@ fn writerMain(client: *Client) void {
         client.unlockOutput();
         defer pending.deinit(alloc);
         client.connection.writeAll(pending.items) catch {
-            client.closeOutput();
-            client.closeConnection();
+            client.eject();
             return;
         };
     }
@@ -366,6 +436,10 @@ fn sendInfo(client: *Client) void {
     var info = std.mem.zeroes(wire.Info);
     info.pid = @intCast(client.session.process);
     info.clients_len = client.session.active_clients.load(.acquire) -| 1;
+    client.session.lock();
+    info.task_ended_at = client.session.task_ended_at;
+    info.task_exit_code = client.session.task_exit_code;
+    client.session.unlock();
     const command = client.session.spec.command orelse &[_][]const u8{};
     var command_len: usize = 0;
     for (command, 0..) |part, index| {
@@ -382,7 +456,7 @@ fn sendInfo(client: *Client) void {
         @memcpy(info.cmd[offset .. offset + amount], part[0..amount]);
         offset += amount;
     }
-    client.enqueue(.Info, std.mem.asBytes(&info)) catch client.closeOutput();
+    client.enqueue(.Info, std.mem.asBytes(&info)) catch client.eject();
 }
 
 fn sendLabels(client: *Client) void {
@@ -399,20 +473,60 @@ fn sendLabels(client: *Client) void {
     }
 
     session.unlock();
-    client.enqueue(.LabelData, payload.items) catch client.closeOutput();
+    client.enqueue(.LabelData, payload.items) catch client.eject();
 }
 
-fn sendHistory(client: *Client) void {
+fn sendTaskComplete(client: *Client) void {
     const session = client.session;
     session.lock();
-    const payload = session.alloc.dupe(u8, session.history.items) catch {
+    const exit_code = session.task_exit_code;
+    session.unlock();
+    const payload = [_]u8{exit_code};
+    client.enqueue(.TaskComplete, &payload) catch client.eject();
+}
+
+fn sendHistory(client: *Client, request: []const u8) void {
+    const session = client.session;
+    const format: u8 = if (request.len == 0) 0 else request[0];
+    session.lock();
+    const history = session.alloc.dupe(u8, session.history.items) catch {
         session.unlock();
-        client.closeOutput();
+        client.eject();
         return;
     };
     session.unlock();
-    defer session.alloc.free(payload);
-    client.enqueue(.History, payload) catch client.closeOutput();
+    defer session.alloc.free(history);
+    const formatted = serializeHistory(session.alloc, history, format) catch {
+        client.eject();
+        return;
+    };
+    defer session.alloc.free(formatted);
+    client.enqueue(.History, formatted) catch client.eject();
+}
+
+fn serializeHistory(
+    alloc: std.mem.Allocator,
+    payload: []const u8,
+    format: u8,
+) ![]u8 {
+    switch (format) {
+        0, 1 => return alloc.dupe(u8, payload),
+        2 => {
+            var output: std.ArrayList(u8) = .empty;
+            errdefer output.deinit(alloc);
+            try output.appendSlice(alloc, "<pre>");
+            for (payload) |byte| switch (byte) {
+                '&' => try output.appendSlice(alloc, "&amp;"),
+                '<' => try output.appendSlice(alloc, "&lt;"),
+                '>' => try output.appendSlice(alloc, "&gt;"),
+                '"' => try output.appendSlice(alloc, "&quot;"),
+                else => try output.append(alloc, byte),
+            };
+            try output.appendSlice(alloc, "</pre>\n");
+            return output.toOwnedSlice(alloc);
+        },
+        else => return error.UnsupportedHistoryFormat,
+    }
 }
 
 fn setLabels(client: *Client, payload: []const u8) void {
@@ -434,7 +548,7 @@ fn setLabels(client: *Client, payload: []const u8) void {
         }
     }
     session.unlock();
-    client.enqueue(.Ack, "") catch client.closeOutput();
+    client.enqueue(.Ack, "") catch client.eject();
 }
 
 fn clearLabels(client: *Client) void {
@@ -447,37 +561,46 @@ fn clearLabels(client: *Client) void {
     }
     session.labels.clearRetainingCapacity();
     session.unlock();
-    client.enqueue(.Ack, "") catch client.closeOutput();
+    client.enqueue(.Ack, "") catch client.eject();
 }
 
 fn writeFile(client: *Client, payload: []const u8) void {
     const session = client.session;
     if (payload.len < @sizeOf(u32)) {
-        client.enqueue(.Ack, "") catch client.closeOutput();
+        client.enqueue(.Ack, "") catch client.eject();
         return;
     }
     const path_len = std.mem.bytesToValue(u32, payload[0..@sizeOf(u32)]);
     if (payload.len < @sizeOf(u32) + path_len) {
-        client.enqueue(.Ack, "") catch client.closeOutput();
+        client.enqueue(.Ack, "") catch client.eject();
         return;
     }
     const path = payload[@sizeOf(u32)..][0..path_len];
     const content = payload[@sizeOf(u32) + path_len ..];
     var file = std.Io.Dir.cwd().createFile(session.spec.io, path, .{ .truncate = true }) catch {
-        client.enqueue(.Ack, "") catch client.closeOutput();
+        client.enqueue(.Ack, "") catch client.eject();
         return;
     };
     defer file.close(session.spec.io);
     _ = file.writeStreamingAll(session.spec.io, content) catch {};
-    client.enqueue(.Ack, "") catch client.closeOutput();
+    client.enqueue(.Ack, "") catch client.eject();
 }
 
 fn attachLoop(spec: session_windows.AttachSpec, connection: local_ipc.Connection) !void {
     var stop = std.atomic.Value(bool).init(false);
-    var input = AttachInput{ .io = spec.io, .alloc = spec.alloc, .connection = connection, .stop = &stop };
+    const stdin_file = std.Io.File.stdin();
+    var input = AttachInput{
+        .io = spec.io,
+        .alloc = spec.alloc,
+        .connection = connection,
+        .stdin_file = stdin_file,
+        .stop = &stop,
+    };
     const input_thread = try std.Thread.spawn(.{}, attachInputMain, .{&input});
     defer {
         stop.store(true, .release);
+        _ = kernel32.CancelSynchronousIo(input_thread.getHandle());
+        stdin_file.close(spec.io);
         input_thread.join();
     }
 
@@ -501,16 +624,34 @@ const AttachInput = struct {
     io: std.Io,
     alloc: std.mem.Allocator,
     connection: local_ipc.Connection,
+    stdin_file: std.Io.File,
     stop: *std.atomic.Value(bool),
 };
 
 fn attachInputMain(input: *AttachInput) void {
-    var reader_buffer: [4096]u8 = undefined;
     var input_buffer: [4096]u8 = undefined;
-    var reader = std.Io.File.stdin().reader(input.io, &reader_buffer);
+    const stdin_handle = kernel32.GetStdHandle(std_input_handle);
     while (!input.stop.load(.acquire)) {
-        const amount = reader.interface.readSliceShort(&input_buffer) catch break;
-        if (amount == 0) break;
+        var available: windows.DWORD = 0;
+        if (@intFromEnum(kernel32.PeekNamedPipe(
+            stdin_handle,
+            null,
+            0,
+            null,
+            &available,
+            null,
+        )) != 0 and available == 0) {
+            kernel32.Sleep(10);
+            continue;
+        }
+        var amount: windows.DWORD = 0;
+        if (@intFromEnum(kernel32.ReadFile(
+            stdin_handle,
+            &input_buffer,
+            @intCast(input_buffer.len),
+            &amount,
+            null,
+        )) == 0 or amount == 0) break;
         wire.writeFrame(input.connection, .Input, input_buffer[0..amount]) catch break;
     }
 }
@@ -519,4 +660,23 @@ test "Windows PTY session provider exposes the frozen provider shape" {
     const value = provider();
     try std.testing.expect(@intFromPtr(value.host_fn) != 0);
     try std.testing.expect(@intFromPtr(value.attach_fn) != 0);
+}
+
+test "Windows history serializers preserve plain VT and HTML formats" {
+    const raw = "<&\n";
+    const plain = try serializeHistory(std.testing.allocator, raw, 0);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expectEqualStrings(raw, plain);
+
+    const vt = try serializeHistory(std.testing.allocator, raw, 1);
+    defer std.testing.allocator.free(vt);
+    try std.testing.expectEqualStrings(raw, vt);
+
+    const html = try serializeHistory(std.testing.allocator, raw, 2);
+    defer std.testing.allocator.free(html);
+    try std.testing.expectEqualStrings("<pre>&lt;&amp;\n</pre>\n", html);
+    try std.testing.expectError(
+        error.UnsupportedHistoryFormat,
+        serializeHistory(std.testing.allocator, raw, 3),
+    );
 }

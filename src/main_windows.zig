@@ -259,15 +259,23 @@ fn requestResponse(
     var connection = try local_ipc_windows.connect(alloc, .{ .name = endpoint });
     defer connection.close();
     try sendFrame(connection, request_tag, request_payload);
-    var response = try session_windows.readFrameWithDeadline(
-        alloc,
-        connection,
-        session_windows.Deadline.afterMs(5000),
-        null,
-    );
-    errdefer response.deinit(alloc);
-    if (response.header.tag != response_tag) return error.Unexpected;
-    return response.payload;
+    while (true) {
+        var response = try session_windows.readFrameWithDeadline(
+            alloc,
+            connection,
+            session_windows.Deadline.afterMs(5000),
+            null,
+        );
+        if (response.header.tag == .TaskComplete) {
+            response.deinit(alloc);
+            continue;
+        }
+        if (response.header.tag != response_tag) {
+            response.deinit(alloc);
+            return error.Unexpected;
+        }
+        return response.payload;
+    }
 }
 
 fn renderInfo(io: std.Io, session_name: []const u8, payload: []const u8) !void {
@@ -391,14 +399,20 @@ fn writeSessionLine(
     info: wire.Info,
     labels: []const u8,
     short: bool,
+    current_session: ?[]const u8,
 ) !void {
     if (short) {
         try writer.print("{s}\n", .{session_name});
         return;
     }
+    const prefix = if (current_session) |current|
+        if (std.mem.eql(u8, current, session_name)) "→ " else "  "
+    else
+        "";
     const cmd_len = @min(@as(usize, info.cmd_len), info.cmd.len);
     const cwd_len = @min(@as(usize, info.cwd_len), info.cwd.len);
-    try writer.print("name={s}\tpid={d}\tclients={d}\tcreated={d}", .{
+    try writer.print("{s}name={s}\tpid={d}\tclients={d}\tcreated={d}", .{
+        prefix,
         session_name,
         info.pid,
         info.clients_len,
@@ -443,6 +457,8 @@ fn listSessions(
             return std.mem.order(u8, left, right) == .lt;
         }
     }.lessThan);
+    const current_session = try socket.getSeshNameFromEnvAlloc(alloc);
+    defer if (current_session) |name| alloc.free(name);
     if (sessions.items.len == 0) {
         if (short) return;
         var buffer: [4096]u8 = undefined;
@@ -462,7 +478,14 @@ fn listSessions(
             continue;
         };
         defer alloc.free(details.labels);
-        try writeSessionLine(&writer.interface, session_name, details.info, details.labels, short);
+        try writeSessionLine(
+            &writer.interface,
+            session_name,
+            details.info,
+            details.labels,
+            short,
+            current_session,
+        );
     }
     try writer.interface.flush();
 }
@@ -476,6 +499,46 @@ fn unsupported(io: std.Io, command: []const u8) !void {
     );
     try writer.interface.flush();
     return error.UnsupportedCommand;
+}
+
+fn waitForTask(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    cfg: *const Cfg,
+    raw_session_name: ?[]const u8,
+) !void {
+    const session_name = try socket.resolveSessionOrEnv(alloc, io, raw_session_name);
+    defer alloc.free(session_name);
+    while (true) {
+        const payload = try requestResponse(
+            io,
+            alloc,
+            cfg,
+            session_name,
+            .Info,
+            &.{},
+            .Info,
+        );
+        defer alloc.free(payload);
+        if (payload.len != @sizeOf(wire.Info)) return error.Unexpected;
+        const info = std.mem.bytesToValue(wire.Info, payload);
+        if (info.task_ended_at != 0) {
+            var buffer: [1024]u8 = undefined;
+            var writer = std.Io.File.stdout().writer(io, &buffer);
+            if (info.task_exit_code == 0) {
+                try writer.interface.print("task(s) completed!\n", .{});
+            } else {
+                try writer.interface.print(
+                    "task(s) failed! exit_code={d}\n",
+                    .{info.task_exit_code},
+                );
+            }
+            try writer.interface.flush();
+            if (info.task_exit_code != 0) return error.TaskFailed;
+            return;
+        }
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .real) catch {};
+    }
 }
 
 fn runSession(
@@ -578,7 +641,9 @@ pub fn main(init: std.process.Init) !void {
     defer args.deinit();
     const program = args.next() orelse return error.InvalidCommand;
 
-    const command = args.next() orelse "version";
+    const command = args.next() orelse {
+        return listSessions(io, gpa, &cfg, &.{});
+    };
     if (std.mem.eql(u8, command, "version") or
         std.mem.eql(u8, command, "v") or
         std.mem.eql(u8, command, "-v") or
@@ -630,8 +695,8 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, command, "attach") or std.mem.eql(u8, command, "a")) {
-        const session_name = args.next() orelse return error.SessionNameRequired;
-        try runtime_windows.validateSessionName(session_name);
+        const session_name = try socket.resolveSessionOrEnv(gpa, io, args.next());
+        defer gpa.free(session_name);
         return attachSession(io, gpa, session_name);
     }
 
@@ -645,28 +710,64 @@ pub fn main(init: std.process.Init) !void {
         return listSessions(io, gpa, &cfg, parts.items);
     }
 
+    if (std.mem.eql(u8, command, "detach") or
+        std.mem.eql(u8, command, "d") or
+        std.mem.eql(u8, command, "detach-all") or
+        std.mem.eql(u8, command, "da"))
+    {
+        const session_name = try socket.resolveSessionOrEnv(gpa, io, args.next());
+        defer gpa.free(session_name);
+        if (args.next() != null) return error.UnsupportedCommand;
+        return sendCommand(io, gpa, &cfg, session_name, .DetachAll, &.{});
+    }
+
     if (std.mem.eql(u8, command, "wait") or std.mem.eql(u8, command, "w")) {
-        return unsupported(io, "wait");
+        const session_arg = args.next();
+        if (args.next() != null) return error.UnsupportedCommand;
+        return waitForTask(io, gpa, &cfg, session_arg);
     }
 
     if (std.mem.eql(u8, command, "resize")) {
-        const session_name = args.next() orelse return error.SessionNameRequired;
+        const session_name = try socket.resolveSessionOrEnv(gpa, io, args.next());
+        defer gpa.free(session_name);
         const cols_text = args.next() orelse return error.InvalidSize;
         const rows_text = args.next() orelse return error.InvalidSize;
         const size = wire.Resize{
             .cols = try std.fmt.parseInt(u16, cols_text, 10),
             .rows = try std.fmt.parseInt(u16, rows_text, 10),
         };
-        try runtime_windows.validateSessionName(session_name);
         return sendPayload(io, gpa, &cfg, session_name, .Resize, std.mem.asBytes(&size));
     }
 
     if (wireTagForCommand(command)) |tag| {
-        const session_name = args.next() orelse return error.SessionNameRequired;
-        try runtime_windows.validateSessionName(session_name);
+        var session_arg: ?[]const u8 = null;
         var parts: std.ArrayList([]const u8) = .empty;
         defer parts.deinit(gpa);
-        while (args.next()) |part| try parts.append(gpa, part);
+        if (tag == .History) {
+            while (args.next()) |part| {
+                if (std.mem.eql(u8, part, "--vt") or
+                    std.mem.eql(u8, part, "--html"))
+                {
+                    try parts.append(gpa, part);
+                } else if (session_arg == null) {
+                    session_arg = part;
+                } else {
+                    try parts.append(gpa, part);
+                }
+            }
+        } else {
+            session_arg = args.next();
+            while (args.next()) |part| try parts.append(gpa, part);
+        }
+        const session_name = if (tag == .History or tag == .LabelGet or tag == .Info)
+            try socket.resolveSessionOrEnv(gpa, io, session_arg)
+        else
+            try socket.resolveSessionOrEnv(
+                gpa,
+                io,
+                session_arg orelse return error.SessionNameRequired,
+            );
+        defer gpa.free(session_name);
         if (tag == .History or tag == .LabelGet or tag == .Info) {
             return responseCommand(io, gpa, &cfg, session_name, tag, parts.items);
         }
