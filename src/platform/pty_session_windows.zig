@@ -25,6 +25,9 @@ const Session = struct {
     clients: std.ArrayList(*Client) = .empty,
     reader_thread: ?std.Thread = null,
     labels: std.StringHashMapUnmanaged([]const u8) = .empty,
+    history: std.ArrayList(u8) = .empty,
+
+    const max_history_bytes = Client.max_output_bytes - @sizeOf(wire.Header);
 
     fn lock(self: *Session) void {
         while (self.lock_word.cmpxchgStrong(0, 1, .acquire, .monotonic) != null) {
@@ -210,6 +213,7 @@ fn destroySession(session: *Session) void {
         session.alloc.destroy(client);
     }
     session.clients.deinit(session.alloc);
+    session.history.deinit(session.alloc);
     var labels = session.labels;
     var label_it = labels.iterator();
     while (label_it.next()) |entry| {
@@ -234,10 +238,29 @@ fn readerMain(session: *Session) void {
             else => break,
         };
         if (amount == 0) break;
+        recordHistory(session, buffer[0..amount]);
         broadcast(session, .Output, buffer[0..amount]);
     }
+
     session.alive.store(false, .release);
     session.server.close();
+}
+
+fn recordHistory(session: *Session, payload: []const u8) void {
+    session.lock();
+    defer session.unlock();
+    if (payload.len >= Session.max_history_bytes) {
+        session.history.clearRetainingCapacity();
+        session.history.appendSlice(session.alloc, payload[payload.len - Session.max_history_bytes ..]) catch {};
+        return;
+    }
+    const overflow = session.history.items.len + payload.len -| Session.max_history_bytes;
+    if (overflow > 0) {
+        const remaining = session.history.items.len - overflow;
+        std.mem.copyForwards(u8, session.history.items[0..remaining], session.history.items[overflow..]);
+        session.history.shrinkRetainingCapacity(remaining);
+    }
+    session.history.appendSlice(session.alloc, payload) catch {};
 }
 
 fn broadcast(session: *Session, tag: wire.Tag, payload: []const u8) void {
@@ -297,6 +320,7 @@ fn clientMain(client: *Client) void {
             .LabelGet => sendLabels(client),
             .LabelSet => setLabels(client, frame.payload),
             .LabelClear => clearLabels(client),
+            .History => sendHistory(client),
             .Write => writeFile(client, frame.payload),
             else => {},
         }
@@ -373,8 +397,22 @@ fn sendLabels(client: *Client) void {
         payload.append(session.alloc, '=') catch break;
         payload.appendSlice(session.alloc, entry.value_ptr.*) catch break;
     }
+
     session.unlock();
     client.enqueue(.LabelData, payload.items) catch client.closeOutput();
+}
+
+fn sendHistory(client: *Client) void {
+    const session = client.session;
+    session.lock();
+    const payload = session.alloc.dupe(u8, session.history.items) catch {
+        session.unlock();
+        client.closeOutput();
+        return;
+    };
+    session.unlock();
+    defer session.alloc.free(payload);
+    client.enqueue(.History, payload) catch client.closeOutput();
 }
 
 fn setLabels(client: *Client, payload: []const u8) void {
@@ -479,6 +517,6 @@ fn attachInputMain(input: *AttachInput) void {
 
 test "Windows PTY session provider exposes the frozen provider shape" {
     const value = provider();
-    try std.testing.expect(value.host_fn != undefined);
-    try std.testing.expect(value.attach_fn != undefined);
+    try std.testing.expect(@intFromPtr(value.host_fn) != 0);
+    try std.testing.expect(@intFromPtr(value.attach_fn) != 0);
 }

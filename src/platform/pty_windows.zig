@@ -718,7 +718,10 @@ const windows_impl = struct {
         }
         const amount = session.input_queue.push(bytes);
         if (amount == 0) {
-            if (session.input_queue.isClosed()) return error.BrokenPipe;
+            if (session.input_queue.isClosed()) {
+                if (!isAlive(session)) return error.ProcessExited;
+                return error.BrokenPipe;
+            }
             return error.WouldBlock;
         }
         return amount;
@@ -789,7 +792,10 @@ const windows_impl = struct {
             return error.ProcessExited;
         }
         if (session.input_queue.push(&control_bytes) != 1) {
-            if (session.input_queue.isClosed()) return error.BrokenPipe;
+            if (session.input_queue.isClosed()) {
+                if (!isAlive(session)) return error.ProcessExited;
+                return error.BrokenPipe;
+            }
             return error.WouldBlock;
         }
     }
