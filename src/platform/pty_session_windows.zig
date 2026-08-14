@@ -193,6 +193,7 @@ const Client = struct {
     input_lock: std.atomic.Value(u8) = .init(0),
     esc_timer_cancel: std.atomic.Value(bool) = .init(false),
     esc_timer_active: std.atomic.Value(bool) = .init(false),
+    esc_timer_generation: std.atomic.Value(u64) = .init(0),
 
     const max_output_bytes = 256 * 1024;
     const max_cwd_input_bytes = 4096;
@@ -1151,7 +1152,31 @@ fn claimLeaderAndWrite(
     return writePtyIfLeader(session, client, generation, bytes);
 }
 
-fn flushPendingEscape(client: *Client) void {
+fn claimLeaderAndWriteIfGeneration(
+    session: *Session,
+    client: *Client,
+    expected_generation: u64,
+    bytes: []const u8,
+) bool {
+    var changed = false;
+    var generation: u64 = undefined;
+    session.lock();
+    if (session.leader_generation != expected_generation) {
+        session.unlock();
+        return false;
+    }
+    if (session.leader != client) {
+        session.leader = client;
+        session.leader_generation +%= 1;
+        changed = true;
+    }
+    generation = session.leader_generation;
+    session.unlock();
+    if (changed) client.enqueue(.Resize, &.{}) catch client.eject();
+    return writePtyIfLeader(session, client, generation, bytes);
+}
+
+fn flushPendingEscape(client: *Client, expected_generation: ?u64) void {
     client.lockInput();
     const result = client.input.flushPendingEscape() catch {
         client.unlockInput();
@@ -1161,7 +1186,11 @@ fn flushPendingEscape(client: *Client) void {
     client.unlockInput();
     defer client.session.alloc.free(result.bytes);
     if (result.bytes.len == 0) return;
-    if (claimLeaderAndWrite(client.session, client, result.bytes)) {
+    const accepted = if (expected_generation) |generation|
+        claimLeaderAndWriteIfGeneration(client.session, client, generation, result.bytes)
+    else
+        claimLeaderAndWrite(client.session, client, result.bytes);
+    if (accepted) {
         updateSessionCwd(client, result.bytes, false);
     }
 }
@@ -1175,7 +1204,8 @@ fn loneEscapeTimerMain(client: *Client) void {
     {
         return;
     }
-    flushPendingEscape(client);
+    const expected_generation = client.esc_timer_generation.load(.acquire);
+    flushPendingEscape(client, expected_generation);
 }
 
 fn releaseLeader(session: *Session, client: *Client) void {
@@ -1247,6 +1277,7 @@ fn clientMain(client: *Client) void {
                         writePtyIfGeneration(session, snapshot.generation, result.bytes);
                     if (accepted) updateSessionCwd(client, result.bytes, false);
                     if (pending_lone_escape) {
+                        client.esc_timer_generation.store(snapshot.generation, .release);
                         if (lone_escape_thread != null and
                             !client.esc_timer_active.load(.acquire))
                         {
@@ -1262,7 +1293,7 @@ fn clientMain(client: *Client) void {
                                 .{client},
                             ) catch blk: {
                                 client.esc_timer_active.store(false, .release);
-                                flushPendingEscape(client);
+                                flushPendingEscape(client, snapshot.generation);
                                 break :blk null;
                             };
                         }

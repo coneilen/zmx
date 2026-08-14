@@ -5,13 +5,22 @@ const std = @import("std");
 /// Incomplete escape sequences are held so leadership changes cannot duplicate
 /// or tear a report.
 pub const InputClassifier = struct {
+    const CarryKind = enum {
+        none,
+        csi,
+        ss3,
+        string,
+    };
+
     alloc: std.mem.Allocator,
     carry: std.ArrayList(u8) = .empty,
     carry_emitted: bool = false,
     carry_from_leader: bool = false,
     quarantined: bool = false,
+    carry_kind: CarryKind = .none,
+    carry_scan_offset: usize = 0,
     string_control: ?StringControl = null,
-    string_scan_offset: usize = 0,
+    csi_scan_work: usize = 0,
 
     // A terminal escape sequence is normally a few dozen bytes. Kitty
     // keyboard reports can be larger, but they still must not make a client
@@ -41,6 +50,10 @@ pub const InputClassifier = struct {
         return self.analyze(payload, false);
     }
 
+    pub fn csiScanWork(self: *const InputClassifier) usize {
+        return self.csi_scan_work;
+    }
+
     pub fn hasPendingLoneEsc(self: *const InputClassifier) bool {
         return !self.quarantined and
             !self.carry_emitted and
@@ -56,7 +69,9 @@ pub const InputClassifier = struct {
             !self.carry_from_leader and
             self.carry.items.len == 2 and
             self.carry.items[0] == 0x1b and
-            isStringIntroducer(self.carry.items[1]);
+            (isStringIntroducer(self.carry.items[1]) or
+                self.carry.items[1] == '[' or
+                self.carry.items[1] == 'O');
     }
 
     pub fn flushLoneEsc(self: *InputClassifier) !Result {
@@ -64,8 +79,9 @@ pub const InputClassifier = struct {
         self.carry.clearRetainingCapacity();
         self.carry_emitted = false;
         self.carry_from_leader = false;
+        self.carry_kind = .none;
+        self.carry_scan_offset = 0;
         self.string_control = null;
-        self.string_scan_offset = 0;
         return .{
             .bytes = try self.alloc.dupe(u8, &.{0x1b}),
             .claims_leadership = true,
@@ -78,8 +94,9 @@ pub const InputClassifier = struct {
         self.carry.clearRetainingCapacity();
         self.carry_emitted = false;
         self.carry_from_leader = false;
+        self.carry_kind = .none;
+        self.carry_scan_offset = 0;
         self.string_control = null;
-        self.string_scan_offset = 0;
         return .{
             .bytes = bytes,
             .claims_leadership = true,
@@ -90,8 +107,9 @@ pub const InputClassifier = struct {
         self.carry.clearRetainingCapacity();
         self.carry_emitted = false;
         self.carry_from_leader = false;
+        self.carry_kind = .none;
+        self.carry_scan_offset = 0;
         self.string_control = null;
-        self.string_scan_offset = 0;
         self.quarantined = true;
     }
 
@@ -212,6 +230,15 @@ pub const InputClassifier = struct {
         return bytes.len;
     }
 
+    fn findCsiFinal(self: *InputClassifier, bytes: []const u8, start: usize) ?usize {
+        var cursor = start;
+        while (cursor < bytes.len) : (cursor += 1) {
+            self.csi_scan_work += 1;
+            if (bytes[cursor] >= 0x40 and bytes[cursor] <= 0x7e) return cursor;
+        }
+        return null;
+    }
+
     fn isKeyboardModifierBody(body: []const u8) bool {
         if (body.len < 3 or body[0] != '1' or body[1] != ';') return false;
         const modifier = std.fmt.parseInt(u8, body[2..], 10) catch return false;
@@ -251,13 +278,14 @@ pub const InputClassifier = struct {
         const carried_len = self.carry.items.len;
         const carried_emitted = self.carry_emitted;
         const carried_from_leader = self.carry_from_leader;
-        const carried_string_control = self.string_control;
-        const carried_string_scan_offset = self.string_scan_offset;
+        const carried_kind = self.carry_kind;
+        const carried_scan_offset = self.carry_scan_offset;
         self.carry.clearRetainingCapacity();
         self.carry_emitted = false;
         self.carry_from_leader = false;
+        self.carry_kind = .none;
+        self.carry_scan_offset = 0;
         self.string_control = null;
-        self.string_scan_offset = 0;
 
         var output: std.ArrayList(u8) = .empty;
         errdefer output.deinit(self.alloc);
@@ -271,8 +299,8 @@ pub const InputClassifier = struct {
             const from_leader = from_carry and carried_from_leader;
 
             if (stringControlForC1(byte)) |control| {
-                const scan_start = if (i == 0 and carried_string_control != null)
-                    carried_string_scan_offset
+                const scan_start = if (i == 0 and carried_kind == .string)
+                    carried_scan_offset
                 else
                     i + 1;
                 const end = findStringEnd(combined.items, scan_start, control);
@@ -287,11 +315,14 @@ pub const InputClassifier = struct {
                             .claims_leadership = claims_leadership,
                         };
                     }
+                    self.carry_kind = .string;
+                    self.carry_scan_offset = nextStringScanOffset(combined.items[i..]);
                     self.string_control = control;
-                    self.string_scan_offset = nextStringScanOffset(combined.items[i..]);
                     break;
                 }
-                if (raw_owner) try appendOutput(&output, self.alloc, combined.items[i..end.?]);
+                if (raw_owner and !(from_carry and !carried_from_leader)) {
+                    try appendOutput(&output, self.alloc, combined.items[i..end.?]);
+                }
                 i = end.?;
                 continue;
             }
@@ -334,8 +365,8 @@ pub const InputClassifier = struct {
 
             const second = combined.items[i + 1];
             if (stringControlForEscape(second)) |control| {
-                const scan_start = if (i == 0 and carried_string_control != null)
-                    carried_string_scan_offset
+                const scan_start = if (i == 0 and carried_kind == .string)
+                    carried_scan_offset
                 else
                     i + 2;
                 const end = findStringEnd(combined.items, scan_start, control);
@@ -350,15 +381,18 @@ pub const InputClassifier = struct {
                             .claims_leadership = claims_leadership,
                         };
                     }
+                    self.carry_kind = .string;
+                    self.carry_scan_offset = nextStringScanOffset(combined.items[i..]);
                     self.string_control = control;
-                    self.string_scan_offset = nextStringScanOffset(combined.items[i..]);
                     if (raw_owner and i > 0) {
                         output.clearRetainingCapacity();
                         try appendOutput(&output, self.alloc, combined.items[0..i]);
                     }
                     break;
                 }
-                if (raw_owner) try appendOutput(&output, self.alloc, combined.items[i..end.?]);
+                if (raw_owner and !(from_carry and !carried_from_leader)) {
+                    try appendOutput(&output, self.alloc, combined.items[i..end.?]);
+                }
                 i = end.?;
                 continue;
             }
@@ -369,14 +403,11 @@ pub const InputClassifier = struct {
             var incomplete = false;
 
             if (second == '[') {
-                var final_index: ?usize = null;
-                var cursor = i + 2;
-                while (cursor < combined.items.len) : (cursor += 1) {
-                    if (combined.items[cursor] >= 0x40 and combined.items[cursor] <= 0x7e) {
-                        final_index = cursor;
-                        break;
-                    }
-                }
+                const scan_start = if (i == 0 and carried_kind == .csi)
+                    carried_scan_offset
+                else
+                    i + 2;
+                const final_index = self.findCsiFinal(combined.items, scan_start);
                 if (final_index == null) {
                     incomplete = true;
                 } else {
@@ -421,6 +452,13 @@ pub const InputClassifier = struct {
                         .claims_leadership = claims_leadership,
                     };
                 }
+                if (second == '[') {
+                    self.carry_kind = .csi;
+                    self.carry_scan_offset = combined.items.len - i;
+                } else if (second == 'O') {
+                    self.carry_kind = .ss3;
+                    self.carry_scan_offset = combined.items.len - i;
+                }
                 if (raw_owner and i > 0) {
                     output.clearRetainingCapacity();
                     try appendOutput(&output, self.alloc, combined.items[0..i]);
@@ -428,7 +466,11 @@ pub const InputClassifier = struct {
                 break;
             }
 
-            const allow = raw_owner or is_mouse or
+            const carried_nonleader_control = from_carry and
+                !carried_from_leader and
+                !is_mouse and
+                !is_keyboard;
+            const allow = (raw_owner and !carried_nonleader_control) or is_mouse or
                 (is_keyboard and !emitted and !from_leader);
             if (allow) try appendOutput(&output, self.alloc, combined.items[i..end]);
             if (is_keyboard and !emitted and !from_leader) claims_leadership = true;
@@ -728,4 +770,95 @@ test "Windows attach classifier bounds string controls and preserves short Alt k
     defer std.testing.allocator.free(next.bytes);
     try std.testing.expectEqualStrings("z", next.bytes);
     try std.testing.expect(next.claims_leadership);
+}
+
+test "Windows attach classifier preserves non-leader origin for carried controls" {
+    const controls = [_][2][]const u8{
+        .{ "\x1b[?1;", "2u" },
+        .{ "\x1b[97;1:", "3u" },
+        .{ "\x1b]0;title", "\x07" },
+        .{ "\x1bP1$r0", "\x1b\\" },
+        .{ "\x1b_kitty", "\x1b\\" },
+        .{ "\x1b^private", "\x1b\\" },
+    };
+    for (controls) |control| {
+        var classifier = InputClassifier.init(std.testing.allocator);
+        defer classifier.deinit();
+        const first = try classifier.filterNonLeader(control[0]);
+        defer std.testing.allocator.free(first.bytes);
+        try std.testing.expectEqual(@as(usize, 0), first.bytes.len);
+        const completed = try classifier.observeLeader(control[1]);
+        defer std.testing.allocator.free(completed);
+        try std.testing.expectEqual(@as(usize, 0), completed.len);
+    }
+
+    var keyboard = InputClassifier.init(std.testing.allocator);
+    defer keyboard.deinit();
+    const prefix = try keyboard.filterNonLeader("\x1b[");
+    defer std.testing.allocator.free(prefix.bytes);
+    const completed = try keyboard.observeLeader("A");
+    defer std.testing.allocator.free(completed);
+    try std.testing.expectEqualStrings("\x1b[A", completed);
+}
+
+test "Windows attach classifier bounds ambiguous CSI and SS3 prefixes" {
+    const prefixes = [_][]const u8{ "\x1b[", "\x1bO" };
+    for (prefixes) |prefix| {
+        var classifier = InputClassifier.init(std.testing.allocator);
+        defer classifier.deinit();
+        const held = try classifier.filterNonLeader(prefix);
+        defer std.testing.allocator.free(held.bytes);
+        try std.testing.expectEqual(@as(usize, 0), held.bytes.len);
+        try std.testing.expect(classifier.hasPendingEscape());
+        const flushed = try classifier.flushPendingEscape();
+        defer std.testing.allocator.free(flushed.bytes);
+        try std.testing.expectEqualStrings(prefix, flushed.bytes);
+        try std.testing.expect(flushed.claims_leadership);
+    }
+
+    var continuation = InputClassifier.init(std.testing.allocator);
+    defer continuation.deinit();
+    const held = try continuation.filterNonLeader("\x1b[");
+    defer std.testing.allocator.free(held.bytes);
+    const arrow = try continuation.filterNonLeader("A");
+    defer std.testing.allocator.free(arrow.bytes);
+    try std.testing.expectEqualStrings("\x1b[A", arrow.bytes);
+    try std.testing.expect(arrow.claims_leadership);
+
+    var ss3 = InputClassifier.init(std.testing.allocator);
+    defer ss3.deinit();
+    const ss3_prefix = try ss3.filterNonLeader("\x1bO");
+    defer std.testing.allocator.free(ss3_prefix.bytes);
+    const function_key = try ss3.filterNonLeader("P");
+    defer std.testing.allocator.free(function_key.bytes);
+    try std.testing.expectEqualStrings("\x1bOP", function_key.bytes);
+    try std.testing.expect(function_key.claims_leadership);
+}
+
+test "Windows attach classifier scans split CSI incrementally up to carry limit" {
+    const stream = try std.testing.allocator.alloc(u8, InputClassifier.max_carry_bytes);
+    defer std.testing.allocator.free(stream);
+    stream[0] = 0x1b;
+    stream[1] = '[';
+    @memset(stream[2..], '1');
+    stream[stream.len - 1] = 'A';
+
+    var classifier = InputClassifier.init(std.testing.allocator);
+    defer classifier.deinit();
+    var offset: usize = 0;
+    var final_len: usize = 0;
+    var final_claims = false;
+    while (offset < stream.len) {
+        const end = @min(offset + 64, stream.len);
+        const result = try classifier.filterNonLeader(stream[offset..end]);
+        defer std.testing.allocator.free(result.bytes);
+        if (result.bytes.len != 0) {
+            final_len = result.bytes.len;
+            final_claims = result.claims_leadership;
+        }
+        offset = end;
+    }
+    try std.testing.expectEqual(stream.len, final_len);
+    try std.testing.expect(final_claims);
+    try std.testing.expect(classifier.csiScanWork() < InputClassifier.max_carry_bytes * 2);
 }
