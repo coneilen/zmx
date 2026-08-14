@@ -1412,13 +1412,20 @@ fn clientMain(client: *Client) void {
 
 fn detachAll(session: *Session) void {
     var clients: std.ArrayList(*Client) = .empty;
+    defer clients.deinit(session.alloc);
     session.lock();
+    clients.ensureTotalCapacity(session.alloc, session.clients.items.len) catch {
+        // Without a staging list, keep the session lock while ejecting every
+        // client so reaping cannot remove a pointer before its transport is
+        // closed. No broadcast references have been acquired on this path.
+        for (session.clients.items) |other| other.eject();
+        session.unlock();
+        return;
+    };
     for (session.clients.items) |other| {
         other.closed.store(true, .release);
         _ = other.broadcast_refs.fetchAdd(1, .acq_rel);
-        clients.append(session.alloc, other) catch {
-            _ = other.broadcast_refs.fetchSub(1, .acq_rel);
-        };
+        clients.appendAssumeCapacity(other);
     }
     session.unlock();
     for (clients.items) |other| {
@@ -1426,7 +1433,6 @@ fn detachAll(session: *Session) void {
         other.closeConnection();
         _ = other.broadcast_refs.fetchSub(1, .acq_rel);
     }
-    clients.deinit(session.alloc);
 }
 
 fn writerMain(client: *Client) void {
@@ -2025,6 +2031,8 @@ fn cwdMutationWorker(probe: *CwdMutationProbe) void {
     probe.finished.store(true, .release);
 }
 
+fn testConnectionClose(_: local_ipc.Handle) void {}
+
 test "Windows PTY session provider exposes the frozen provider shape" {
     const value = provider();
     try std.testing.expect(@intFromPtr(value.host_fn) != 0);
@@ -2311,4 +2319,42 @@ test "Windows replacement pin survives reap check until resize enqueue completes
 
     _ = replacement.broadcast_refs.fetchSub(1, .acq_rel);
     try std.testing.expectEqual(@as(usize, 0), replacement.broadcast_refs.load(.acquire));
+}
+
+test "Windows detach-all ejects every client when staging allocation fails" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+    });
+    var session: Session = undefined;
+    session.alloc = failing.allocator();
+    session.lock_word = .init(0);
+    session.clients = .empty;
+    defer session.clients.deinit(std.testing.allocator);
+
+    var clients: [3]Client = undefined;
+    for (&clients) |*client| {
+        client.* = .{
+            .session = &session,
+            .connection = .{
+                .handle = 0,
+                .close_fn = testConnectionClose,
+            },
+            .input = input_classifier.InputClassifier.init(std.testing.allocator),
+        };
+        try session.clients.append(std.testing.allocator, client);
+    }
+    defer for (&clients) |*client| client.input.deinit();
+
+    detachAll(&session);
+
+    // The lock remains usable immediately, proving the OOM path did not leave
+    // detach-all or reaping waiting on a leaked reference.
+    session.lock();
+    session.unlock();
+    for (&clients) |*client| {
+        try std.testing.expect(client.closed.load(.acquire));
+        try std.testing.expect(client.output_closed);
+        try std.testing.expect(client.connection_closed.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), client.broadcast_refs.load(.acquire));
+    }
 }
