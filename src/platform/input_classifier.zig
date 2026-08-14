@@ -182,22 +182,14 @@ pub const InputClassifier = struct {
         pm,
     };
 
+    // Do not recognize C1 introducers here: bytes 0x80-0x9f are valid UTF-8
+    // continuation bytes and must remain part of non-ASCII keyboard input.
     fn stringControlForEscape(byte: u8) ?StringControl {
         return switch (byte) {
             ']' => .osc,
             'P' => .dcs,
             '_' => .apc,
             '^' => .pm,
-            else => null,
-        };
-    }
-
-    fn stringControlForC1(byte: u8) ?StringControl {
-        return switch (byte) {
-            0x9d => .osc,
-            0x90 => .dcs,
-            0x9f => .apc,
-            0x9e => .pm,
             else => null,
         };
     }
@@ -213,7 +205,6 @@ pub const InputClassifier = struct {
     ) ?usize {
         var cursor = start;
         while (cursor < bytes.len) : (cursor += 1) {
-            if (bytes[cursor] == 0x9c) return cursor + 1;
             if (bytes[cursor] == 0x1b and
                 cursor + 1 < bytes.len and
                 bytes[cursor + 1] == '\\')
@@ -298,35 +289,6 @@ pub const InputClassifier = struct {
             const emitted = from_carry and carried_emitted;
             const from_leader = from_carry and carried_from_leader;
 
-            if (stringControlForC1(byte)) |control| {
-                const scan_start = if (i == 0 and carried_kind == .string)
-                    carried_scan_offset
-                else
-                    i + 1;
-                const end = findStringEnd(combined.items, scan_start, control);
-                if (end == null) {
-                    if (!self.appendCarry(
-                        combined.items[i..],
-                        emitted,
-                        raw_owner or from_leader,
-                    )) {
-                        return .{
-                            .bytes = try output.toOwnedSlice(self.alloc),
-                            .claims_leadership = claims_leadership,
-                        };
-                    }
-                    self.carry_kind = .string;
-                    self.carry_scan_offset = nextStringScanOffset(combined.items[i..]);
-                    self.string_control = control;
-                    break;
-                }
-                if (raw_owner and !(from_carry and !carried_from_leader)) {
-                    try appendOutput(&output, self.alloc, combined.items[i..end.?]);
-                }
-                i = end.?;
-                continue;
-            }
-
             if (byte != 0x1b) {
                 // All standalone bytes except ESC are intentional terminal
                 // input, including C0 controls such as Ctrl+C/D/Z. Protocol
@@ -384,10 +346,6 @@ pub const InputClassifier = struct {
                     self.carry_kind = .string;
                     self.carry_scan_offset = nextStringScanOffset(combined.items[i..]);
                     self.string_control = control;
-                    if (raw_owner and i > 0) {
-                        output.clearRetainingCapacity();
-                        try appendOutput(&output, self.alloc, combined.items[0..i]);
-                    }
                     break;
                 }
                 if (raw_owner and !(from_carry and !carried_from_leader)) {
@@ -458,10 +416,6 @@ pub const InputClassifier = struct {
                 } else if (second == 'O') {
                     self.carry_kind = .ss3;
                     self.carry_scan_offset = combined.items.len - i;
-                }
-                if (raw_owner and i > 0) {
-                    output.clearRetainingCapacity();
-                    try appendOutput(&output, self.alloc, combined.items[0..i]);
                 }
                 break;
             }
@@ -699,7 +653,6 @@ test "Windows attach classifier filters complete string controls" {
         "\x1bP1$r0\x1b\\",
         "\x1b_kitty\x1b\\",
         "\x1b^private\x1b\\",
-        "\x9d0;title\x07",
     };
     for (controls) |control| {
         var classifier = InputClassifier.init(std.testing.allocator);
@@ -709,6 +662,41 @@ test "Windows attach classifier filters complete string controls" {
         try std.testing.expectEqual(@as(usize, 0), result.bytes.len);
         try std.testing.expect(!result.claims_leadership);
     }
+}
+
+test "Windows attach classifier preserves UTF-8 continuation bytes" {
+    var classifier = InputClassifier.init(std.testing.allocator);
+    defer classifier.deinit();
+    const emoji = "\xf0\x9f\x98\x80";
+    const result = try classifier.filterNonLeader(emoji);
+    defer std.testing.allocator.free(result.bytes);
+    try std.testing.expectEqualSlices(u8, emoji, result.bytes);
+    try std.testing.expect(result.claims_leadership);
+}
+
+test "Windows attach classifier flushes ESC carried after a leadership claim" {
+    var classifier = InputClassifier.init(std.testing.allocator);
+    defer classifier.deinit();
+    const result = try classifier.filterNonLeader("x\x1b");
+    defer std.testing.allocator.free(result.bytes);
+    try std.testing.expectEqualStrings("x", result.bytes);
+    try std.testing.expect(result.claims_leadership);
+    try std.testing.expect(classifier.hasPendingLoneEsc());
+    const flushed = try classifier.flushPendingEscape();
+    defer std.testing.allocator.free(flushed.bytes);
+    try std.testing.expectEqualSlices(u8, &.{0x1b}, flushed.bytes);
+    try std.testing.expect(flushed.claims_leadership);
+}
+
+test "Windows attach classifier preserves filtered carry before new incomplete control" {
+    var classifier = InputClassifier.init(std.testing.allocator);
+    defer classifier.deinit();
+    const first = try classifier.filterNonLeader("x\x1b]old");
+    defer std.testing.allocator.free(first.bytes);
+    try std.testing.expectEqualStrings("x", first.bytes);
+    const second = try classifier.observeLeader("\x07\x1b]new");
+    defer std.testing.allocator.free(second);
+    try std.testing.expectEqual(@as(usize, 0), second.len);
 }
 
 test "Windows attach classifier filters split string controls" {

@@ -1195,6 +1195,10 @@ fn flushPendingEscape(client: *Client, expected_generation: ?u64) void {
     }
 }
 
+fn shouldDetachInput(detach_key_disabled: bool, bytes: []const u8) bool {
+    return !detach_key_disabled and bytes.len > 0 and bytes[0] == 0x1c;
+}
+
 fn loneEscapeTimerMain(client: *Client) void {
     defer client.esc_timer_active.store(false, .release);
     kernel32.Sleep(@intCast(input_classifier.InputClassifier.lone_esc_timeout_ms));
@@ -1277,7 +1281,8 @@ fn clientMain(client: *Client) void {
                         writePtyIfGeneration(session, snapshot.generation, result.bytes);
                     if (accepted) updateSessionCwd(client, result.bytes, false);
                     if (pending_lone_escape) {
-                        client.esc_timer_generation.store(snapshot.generation, .release);
+                        const timer_generation = leaderSnapshot(session, client).generation;
+                        client.esc_timer_generation.store(timer_generation, .release);
                         if (lone_escape_thread != null and
                             !client.esc_timer_active.load(.acquire))
                         {
@@ -1861,6 +1866,12 @@ const ResizeMonitor = struct {
 fn attachInputMain(input: *AttachInput) void {
     var input_buffer: [4096]u8 = undefined;
     const stdin_handle = kernel32.GetStdHandle(std_input_handle);
+    const detach_key_disabled = blk: {
+        var environ = std.process.Environ.createMap(.{ .block = .global }, input.alloc) catch
+            break :blk false;
+        defer environ.deinit();
+        break :blk environ.contains("ZMX_NO_DETACH_KEY");
+    };
     while (!input.stop.load(.acquire)) {
         if (!input.console_input) {
             var available: windows.DWORD = 0;
@@ -1888,7 +1899,7 @@ fn attachInputMain(input: *AttachInput) void {
             writeWireFrame(input.wire_lock, input.connection, .Detach, "") catch {};
             break;
         }
-        if (input_buffer[0] == 0x1c) {
+        if (shouldDetachInput(detach_key_disabled, input_buffer[0..amount])) {
             writeWireFrame(input.wire_lock, input.connection, .Detach, "") catch {};
             break;
         }
@@ -1980,6 +1991,13 @@ test "Windows PTY session provider exposes the frozen provider shape" {
     const value = provider();
     try std.testing.expect(@intFromPtr(value.host_fn) != 0);
     try std.testing.expect(@intFromPtr(value.attach_fn) != 0);
+}
+
+test "Windows attach honors the disabled detach key" {
+    try std.testing.expect(shouldDetachInput(false, &.{0x1c}));
+    try std.testing.expect(!shouldDetachInput(true, &.{0x1c}));
+    try std.testing.expect(!shouldDetachInput(false, "\xf0\x9f\x98\x80"));
+    try std.testing.expect(!shouldDetachInput(false, &.{}));
 }
 
 test "Windows history serializers preserve plain VT and HTML formats" {
