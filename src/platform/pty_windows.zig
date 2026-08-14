@@ -117,6 +117,14 @@ pub fn read(state: *BackendState, master: pty.Handle, buffer: []u8) !usize {
     return implementation.read(state, master, buffer);
 }
 
+pub fn waitReadable(state: *BackendState, master: pty.Handle) !void {
+    return implementation.waitReadable(state, master);
+}
+
+pub fn waitWritable(state: *BackendState, master: pty.Handle) !void {
+    return implementation.waitWritable(state, master);
+}
+
 pub fn write(state: *BackendState, master: pty.Handle, bytes: []const u8) !usize {
     return implementation.write(state, master, bytes);
 }
@@ -173,6 +181,14 @@ const unsupported_impl = struct {
     }
 
     fn read(_: *State, _: pty.Handle, _: []u8) !usize {
+        return error.UnsupportedPlatform;
+    }
+
+    fn waitReadable(_: *State, _: pty.Handle) !void {
+        return error.UnsupportedPlatform;
+    }
+
+    fn waitWritable(_: *State, _: pty.Handle) !void {
         return error.UnsupportedPlatform;
     }
 
@@ -234,6 +250,7 @@ const windows_impl = struct {
     const ERROR_PIPE_NOT_CONNECTED: DWORD = 233;
     const STILL_ACTIVE: DWORD = 259;
     const WAIT_OBJECT_0: DWORD = 0;
+    const WAIT_TIMEOUT: DWORD = 0x00000102;
     const WAIT_FAILED: DWORD = 0xffffffff;
     const INFINITE: DWORD = 0xffffffff;
 
@@ -281,6 +298,12 @@ const windows_impl = struct {
 
     const kernel32 = struct {
         extern "kernel32" fn CloseHandle(handle: HANDLE) callconv(.winapi) BOOL;
+        extern "kernel32" fn CreateEventW(
+            attributes: ?*windows.SECURITY_ATTRIBUTES,
+            manual_reset: BOOL,
+            initial_state: BOOL,
+            name: ?[*:0]const u16,
+        ) callconv(.winapi) ?HANDLE;
         extern "kernel32" fn CreatePipe(
             read_pipe: *HANDLE,
             write_pipe: *HANDLE,
@@ -292,6 +315,7 @@ const windows_impl = struct {
             mask: DWORD,
             flags: DWORD,
         ) callconv(.winapi) BOOL;
+        extern "kernel32" fn SetEvent(event: HANDLE) callconv(.winapi) BOOL;
         extern "kernel32" fn CreatePseudoConsole(
             size: windows.COORD,
             input: HANDLE,
@@ -353,6 +377,12 @@ const windows_impl = struct {
             handle: HANDLE,
             milliseconds: DWORD,
         ) callconv(.winapi) DWORD;
+        extern "kernel32" fn WaitForMultipleObjects(
+            count: DWORD,
+            handles: [*]const HANDLE,
+            wait_all: BOOL,
+            milliseconds: DWORD,
+        ) callconv(.winapi) DWORD;
         extern "kernel32" fn GetExitCodeProcess(
             process: HANDLE,
             exit_code: *DWORD,
@@ -404,10 +434,13 @@ const windows_impl = struct {
         thread: ?HANDLE = null,
         reader_thread: ?std.Thread = null,
         writer_thread: ?std.Thread = null,
+        process_wait_thread: ?std.Thread = null,
         input_queue: SpscQueue = undefined,
         output_queue: SpscQueue = undefined,
         input_push_lock: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
         stop_workers: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        process_exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        stop_event: ?HANDLE = null,
         pid: DWORD = 0,
         io_closed: bool = false,
     };
@@ -420,6 +453,8 @@ const windows_impl = struct {
         head: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         tail: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        not_empty: ?HANDLE = null,
+        not_full: ?HANDLE = null,
 
         fn empty(alloc: std.mem.Allocator) SpscQueue {
             return .{
@@ -429,20 +464,38 @@ const windows_impl = struct {
         }
 
         fn init(alloc: std.mem.Allocator, capacity: usize) !SpscQueue {
-            return .{
+            var queue = SpscQueue{
                 .alloc = alloc,
                 .storage = try alloc.alloc(u8, capacity),
             };
+            errdefer alloc.free(queue.storage);
+            queue.not_empty = kernel32.CreateEventW(null, 0, 0, null) orelse
+                return error.WindowsApiFailure;
+            errdefer _ = kernel32.CloseHandle(queue.not_empty.?);
+            queue.not_full = kernel32.CreateEventW(null, 0, 0, null) orelse
+                return error.WindowsApiFailure;
+            return queue;
         }
 
         fn deinit(self: *SpscQueue) void {
-            if (self.storage.len == 0) return;
-            self.alloc.free(self.storage);
-            self.storage = &[_]u8{};
+            if (self.not_empty) |event| {
+                _ = kernel32.CloseHandle(event);
+                self.not_empty = null;
+            }
+            if (self.not_full) |event| {
+                _ = kernel32.CloseHandle(event);
+                self.not_full = null;
+            }
+            if (self.storage.len != 0) {
+                self.alloc.free(self.storage);
+                self.storage = &[_]u8{};
+            }
         }
 
         fn close(self: *SpscQueue) void {
             self.closed.store(true, .release);
+            if (self.not_empty) |event| _ = kernel32.SetEvent(event);
+            if (self.not_full) |event| _ = kernel32.SetEvent(event);
         }
 
         fn isClosed(self: *const SpscQueue) bool {
@@ -465,6 +518,7 @@ const windows_impl = struct {
                 @memcpy(self.storage[0 .. amount - first], bytes[first..amount]);
             }
             self.head.store(head +% amount, .release);
+            if (self.not_empty) |event| _ = kernel32.SetEvent(event);
             return amount;
         }
 
@@ -482,7 +536,20 @@ const windows_impl = struct {
                 @memcpy(buffer[first..amount], self.storage[0 .. amount - first]);
             }
             self.tail.store(tail +% amount, .release);
+            if (self.not_full) |event| _ = kernel32.SetEvent(event);
             return amount;
+        }
+
+        fn waitForData(self: *SpscQueue) void {
+            if (self.not_empty) |event| {
+                _ = kernel32.WaitForSingleObject(event, INFINITE);
+            }
+        }
+
+        fn waitForSpace(self: *SpscQueue) void {
+            if (self.not_full) |event| {
+                _ = kernel32.WaitForSingleObject(event, INFINITE);
+            }
         }
     };
 
@@ -530,6 +597,8 @@ const windows_impl = struct {
         errdefer destroySession(session);
         session.input_queue = try SpscQueue.init(state.alloc, QUEUE_CAPACITY);
         session.output_queue = try SpscQueue.init(state.alloc, QUEUE_CAPACITY);
+        session.stop_event = kernel32.CreateEventW(null, 0, 0, null) orelse
+            return error.WindowsApiFailure;
 
         const command_line = try buildCommandLine(state.alloc, spec);
         defer state.alloc.free(command_line);
@@ -683,12 +752,21 @@ const windows_impl = struct {
         session.reader_thread = try std.Thread.spawn(.{}, readerMain, .{session});
         errdefer {
             session.stop_workers.store(true, .release);
+            if (session.stop_event) |event| _ = kernel32.SetEvent(event);
             session.input_queue.close();
             session.output_queue.close();
+            if (session.writer_thread) |writer| {
+                _ = kernel32.CancelSynchronousIo(writer.getHandle());
+                writer.join();
+            }
             if (session.reader_thread) |reader| reader.join();
+            if (session.process_wait_thread) |waiter| waiter.join();
+            session.writer_thread = null;
             session.reader_thread = null;
+            session.process_wait_thread = null;
         }
         session.writer_thread = try std.Thread.spawn(.{}, writerMain, .{session});
+        session.process_wait_thread = try std.Thread.spawn(.{}, processWaitMain, .{session});
 
         state.sessions.append(state.alloc, session) catch |err| {
             _ = kernel32.TerminateJobObject(job, 1);
@@ -708,6 +786,16 @@ const windows_impl = struct {
         if (amount > 0) return amount;
         if (session.output_queue.isClosed()) return 0;
         return error.WouldBlock;
+    }
+
+    fn waitReadable(state: *State, master: pty.Handle) !void {
+        const session = findSessionByMaster(state, master) orelse return error.InvalidHandle;
+        session.output_queue.waitForData();
+    }
+
+    fn waitWritable(state: *State, master: pty.Handle) !void {
+        const session = findSessionByMaster(state, master) orelse return error.InvalidHandle;
+        session.input_queue.waitForSpace();
     }
 
     fn write(state: *State, master: pty.Handle, bytes: []const u8) !usize {
@@ -821,6 +909,7 @@ const windows_impl = struct {
         if (session.io_closed) return;
         session.io_closed = true;
         session.stop_workers.store(true, .release);
+        if (session.stop_event) |event| _ = kernel32.SetEvent(event);
         session.input_queue.close();
         session.output_queue.close();
 
@@ -830,8 +919,13 @@ const windows_impl = struct {
             session.writer_thread = null;
         }
         if (session.reader_thread) |reader| {
+            _ = kernel32.CancelSynchronousIo(reader.getHandle());
             reader.join();
             session.reader_thread = null;
+        }
+        if (session.process_wait_thread) |waiter| {
+            waiter.join();
+            session.process_wait_thread = null;
         }
 
         if (session.output) |output| {
@@ -849,6 +943,10 @@ const windows_impl = struct {
         }
         session.input_queue.deinit();
         session.output_queue.deinit();
+        if (session.stop_event) |event| {
+            _ = kernel32.CloseHandle(event);
+            session.stop_event = null;
+        }
     }
 
     fn destroySession(session: *Session) void {
@@ -875,35 +973,85 @@ const windows_impl = struct {
         };
         var buffer: [8192]u8 = undefined;
         while (!session.stop_workers.load(.acquire)) {
-            var available: DWORD = 0;
-            if (kernel32.PeekNamedPipe(output, null, 0, null, &available, null) == 0) {
-                switch (lastErrorCode()) {
-                    ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED => break,
-                    else => {
-                        kernel32.Sleep(1);
-                        continue;
-                    },
-                }
-            }
-            if (available == 0) {
-                if (!isAlive(session)) break;
-                kernel32.Sleep(1);
-                continue;
-            }
-
-            const amount: DWORD = @intCast(@min(@as(usize, available), buffer.len));
             var read_count: DWORD = 0;
-            if (kernel32.ReadFile(output, &buffer, amount, &read_count, null) == 0) break;
+            if (kernel32.ReadFile(
+                output,
+                &buffer,
+                @intCast(buffer.len),
+                &read_count,
+                null,
+            ) == 0) {
+                if (session.process_exited.load(.acquire)) {
+                    drainAvailableOutput(session, output);
+                }
+                break;
+            }
             if (read_count == 0) continue;
 
             var offset: usize = 0;
             while (offset < read_count and !session.stop_workers.load(.acquire)) {
                 const pushed = session.output_queue.push(buffer[offset..read_count]);
-                offset += pushed;
-                if (offset < read_count) kernel32.Sleep(1);
+                if (pushed > 0) {
+                    offset += pushed;
+                } else if (session.output_queue.isClosed()) {
+                    break;
+                } else {
+                    session.output_queue.waitForSpace();
+                }
             }
         }
         session.output_queue.close();
+    }
+
+    fn processWaitMain(session: *Session) void {
+        const process = session.process orelse return;
+        const stop_event = session.stop_event orelse return;
+        const handles = [_]HANDLE{ process, stop_event };
+        const result = kernel32.WaitForMultipleObjects(
+            handles.len,
+            &handles,
+            0,
+            INFINITE,
+        );
+        if (result != WAIT_OBJECT_0 or session.stop_workers.load(.acquire)) return;
+        session.process_exited.store(true, .release);
+        kernel32.Sleep(10);
+        if (session.reader_thread) |reader| {
+            _ = kernel32.CancelSynchronousIo(reader.getHandle());
+        }
+        if (session.writer_thread) |writer| {
+            _ = kernel32.CancelSynchronousIo(writer.getHandle());
+        }
+    }
+
+    fn drainAvailableOutput(session: *Session, output: HANDLE) void {
+        var buffer: [8192]u8 = undefined;
+        while (!session.stop_workers.load(.acquire)) {
+            var available: DWORD = 0;
+            if (kernel32.PeekNamedPipe(output, null, 0, null, &available, null) == 0 or
+                available == 0)
+            {
+                return;
+            }
+            const amount: DWORD = @intCast(@min(@as(usize, available), buffer.len));
+            var read_count: DWORD = 0;
+            if (kernel32.ReadFile(output, &buffer, amount, &read_count, null) == 0 or
+                read_count == 0)
+            {
+                return;
+            }
+            var offset: usize = 0;
+            while (offset < read_count and !session.stop_workers.load(.acquire)) {
+                const pushed = session.output_queue.push(buffer[offset..read_count]);
+                if (pushed > 0) {
+                    offset += pushed;
+                } else if (session.output_queue.isClosed()) {
+                    return;
+                } else {
+                    session.output_queue.waitForSpace();
+                }
+            }
+        }
     }
 
     fn writerMain(session: *Session) void {
@@ -916,7 +1064,7 @@ const windows_impl = struct {
             const amount = session.input_queue.pop(&buffer);
             if (amount == 0) {
                 if (session.input_queue.isClosed()) break;
-                kernel32.Sleep(1);
+                session.input_queue.waitForData();
                 continue;
             }
 

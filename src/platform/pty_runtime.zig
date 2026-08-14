@@ -37,6 +37,16 @@ pub const Runtime = struct {
         return error.UnsupportedPlatform;
     }
 
+    pub fn waitReadable(self: *Runtime, master: pty.Handle) !void {
+        if (builtin.os.tag == .windows) return pty_windows.waitReadable(&self.windows, master);
+        return error.UnsupportedPlatform;
+    }
+
+    pub fn waitWritable(self: *Runtime, master: pty.Handle) !void {
+        if (builtin.os.tag == .windows) return pty_windows.waitWritable(&self.windows, master);
+        return error.UnsupportedPlatform;
+    }
+
     pub fn write(self: *Runtime, master: pty.Handle, bytes: []const u8) !usize {
         if (builtin.os.tag == .windows) return pty_windows.write(&self.windows, master, bytes);
         return error.UnsupportedPlatform;

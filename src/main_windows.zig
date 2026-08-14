@@ -458,7 +458,10 @@ fn listSessions(
             return std.mem.order(u8, left, right) == .lt;
         }
     }.lessThan);
-    const current_session = try socket.getSeshNameFromEnvAlloc(alloc);
+    const current_session = if (try socket.getSeshNameFromEnvAlloc(alloc)) |raw_name| blk: {
+        defer alloc.free(raw_name);
+        break :blk try socket.getSeshName(alloc, raw_name);
+    } else null;
     defer if (current_session) |name| alloc.free(name);
     if (sessions.items.len == 0) {
         if (short) return;
@@ -687,6 +690,84 @@ fn tailSession(
     if (exit_code != 0) return error.TaskFailed;
 }
 
+fn tailSessions(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    raw_args: []const []const u8,
+) !void {
+    var matchers: std.ArrayList(socket.SessionMatch) = .empty;
+    defer {
+        for (matchers.items) |matcher| alloc.free(matcher.name);
+        matchers.deinit(alloc);
+    }
+    if (raw_args.len == 0) {
+        const current = (try socket.getSeshNameFromEnvAlloc(alloc)) orelse
+            return error.SessionNameRequired;
+        defer alloc.free(current);
+        try matchers.append(alloc, try socket.parseSessionArg(alloc, current));
+    } else {
+        for (raw_args) |raw| {
+            if (std.mem.eql(u8, raw, "--help") or std.mem.eql(u8, raw, "-h")) {
+                return printHelp(io);
+            }
+            if (std.mem.eql(u8, raw, ".")) {
+                const current = (try socket.getSeshNameFromEnvAlloc(alloc)) orelse
+                    return error.SessionNameRequired;
+                defer alloc.free(current);
+                try matchers.append(alloc, try socket.parseSessionArg(alloc, current));
+            } else {
+                try matchers.append(alloc, try socket.parseSessionArg(alloc, raw));
+            }
+        }
+    }
+
+    var targets: std.ArrayList([]u8) = .empty;
+    defer {
+        for (targets.items) |target| alloc.free(target);
+        targets.deinit(alloc);
+    }
+    var sessions: ?std.ArrayList([]u8) = null;
+    defer if (sessions) |*names| {
+        for (names.items) |name| alloc.free(name);
+        names.deinit(alloc);
+    };
+
+    for (matchers.items) |matcher| {
+        if (matcher.is_prefix) {
+            if (sessions == null) sessions = try runtime_windows.listSessionNames(io, alloc);
+            for (sessions.?.items) |name| {
+                if (!matcher.matches(name)) continue;
+                var duplicate = false;
+                for (targets.items) |target| {
+                    if (std.mem.eql(u8, target, name)) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (!duplicate) try targets.append(alloc, try alloc.dupe(u8, name));
+            }
+        } else {
+            var duplicate = false;
+            for (targets.items) |target| {
+                if (std.mem.eql(u8, target, matcher.name)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) try targets.append(alloc, try alloc.dupe(u8, matcher.name));
+        }
+    }
+    if (targets.items.len == 0) return error.NoMatchingSessions;
+
+    var first_error: ?anyerror = null;
+    for (targets.items) |target| {
+        tailSession(io, alloc, target) catch |err| {
+            if (first_error == null) first_error = err;
+        };
+    }
+    if (first_error) |err| return err;
+}
+
 fn runForegroundSession(
     io: std.Io,
     alloc: std.mem.Allocator,
@@ -887,10 +968,12 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, command, "run") or std.mem.eql(u8, command, "r")) {
-        const session_name = args.next() orelse return error.SessionNameRequired;
-        if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
+        const raw_session_name = args.next() orelse return error.SessionNameRequired;
+        if (std.mem.eql(u8, raw_session_name, "--help") or std.mem.eql(u8, raw_session_name, "-h")) {
             return printHelp(io);
         }
+        const session_name = try socket.getSeshName(gpa, raw_session_name);
+        defer gpa.free(session_name);
         try runtime_windows.validateSessionName(session_name);
         var command_args: std.ArrayList([]const u8) = .empty;
         defer command_args.deinit(gpa);
@@ -946,16 +1029,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, command, "tail") or std.mem.eql(u8, command, "t")) {
-        const raw_session_name = args.next();
-        if (raw_session_name) |name| {
-            if (std.mem.eql(u8, name, "--help") or std.mem.eql(u8, name, "-h")) {
-                return printHelp(io);
-            }
-        }
-        const session_name = try socket.resolveSessionOrEnv(gpa, io, raw_session_name);
-        defer gpa.free(session_name);
-        if (args.next() != null) return error.UnsupportedCommand;
-        return tailSession(io, gpa, session_name);
+        var tail_args: std.ArrayList([]const u8) = .empty;
+        defer tail_args.deinit(gpa);
+        while (args.next()) |part| try tail_args.append(gpa, part);
+        return tailSessions(io, gpa, tail_args.items);
     }
 
     if (std.mem.eql(u8, command, "list") or

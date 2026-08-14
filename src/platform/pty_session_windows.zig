@@ -2,6 +2,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const pty = @import("pty.zig");
 const pty_runtime = @import("pty_runtime.zig");
+const resize = @import("resize.zig");
 const local_ipc = @import("local_ipc.zig");
 const local_ipc_windows = @import("local_ipc_windows.zig");
 const runtime_windows = @import("runtime_windows.zig");
@@ -11,9 +12,22 @@ const windows = std.os.windows;
 
 const kernel32 = struct {
     extern "kernel32" fn CancelSynchronousIo(thread: windows.HANDLE) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn CloseHandle(handle: windows.HANDLE) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn CreateEventW(
+        attributes: ?*windows.SECURITY_ATTRIBUTES,
+        manual_reset: windows.BOOL,
+        initial_state: windows.BOOL,
+        name: ?[*:0]const u16,
+    ) callconv(.winapi) ?windows.HANDLE;
+    extern "kernel32" fn GetConsoleCP() callconv(.winapi) windows.UINT;
     extern "kernel32" fn GetConsoleMode(
         console: windows.HANDLE,
         mode: *windows.DWORD,
+    ) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn GetConsoleOutputCP() callconv(.winapi) windows.UINT;
+    extern "kernel32" fn GetConsoleScreenBufferInfo(
+        console: windows.HANDLE,
+        info: *CONSOLE_SCREEN_BUFFER_INFO,
     ) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn GetStdHandle(which: windows.DWORD) callconv(.winapi) windows.HANDLE;
     extern "kernel32" fn PeekNamedPipe(
@@ -31,17 +45,56 @@ const kernel32 = struct {
         read: *windows.DWORD,
         overlapped: ?*anyopaque,
     ) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn SetConsoleCP(code_page: windows.UINT) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn SetConsoleMode(
         console: windows.HANDLE,
         mode: windows.DWORD,
     ) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn SetConsoleOutputCP(code_page: windows.UINT) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn SetEvent(event: windows.HANDLE) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn Sleep(milliseconds: windows.DWORD) callconv(.winapi) void;
+    extern "kernel32" fn WaitForSingleObject(
+        handle: windows.HANDLE,
+        milliseconds: windows.DWORD,
+    ) callconv(.winapi) windows.DWORD;
 };
 
 const std_input_handle: windows.DWORD = @bitCast(@as(i32, -10));
+const std_output_handle: windows.DWORD = @bitCast(@as(i32, -11));
 const enableProcessedInput: windows.DWORD = 0x0001;
 const enableLineInput: windows.DWORD = 0x0002;
 const enableEchoInput: windows.DWORD = 0x0004;
+const cp_utf8: windows.UINT = 65001;
+
+const SMALL_RECT = extern struct {
+    Left: windows.SHORT,
+    Top: windows.SHORT,
+    Right: windows.SHORT,
+    Bottom: windows.SHORT,
+};
+
+const CONSOLE_SCREEN_BUFFER_INFO = extern struct {
+    dwSize: windows.COORD,
+    dwCursorPosition: windows.COORD,
+    wAttributes: windows.WORD,
+    srWindow: SMALL_RECT,
+    dwMaximumWindowSize: windows.COORD,
+};
+
+fn currentConsoleSize() ?resize.Size {
+    const output = kernel32.GetStdHandle(std_output_handle);
+    var info: CONSOLE_SCREEN_BUFFER_INFO = undefined;
+    if (@intFromEnum(kernel32.GetConsoleScreenBufferInfo(output, &info)) == 0) return null;
+    const cols: i32 = @as(i32, @intCast(info.srWindow.Right)) -
+        @as(i32, @intCast(info.srWindow.Left)) + 1;
+    const rows: i32 = @as(i32, @intCast(info.srWindow.Bottom)) -
+        @as(i32, @intCast(info.srWindow.Top)) + 1;
+    if (cols <= 0 or rows <= 0) return null;
+    return .{
+        .cols = @intCast(@min(cols, std.math.maxInt(u16))),
+        .rows = @intCast(@min(rows, std.math.maxInt(u16))),
+    };
+}
 
 comptime {
     if (builtin.os.tag != .windows) @compileError("pty_session_windows requires a Windows target");
@@ -87,11 +140,14 @@ const Client = struct {
     connection_closed: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
     writer_thread: ?std.Thread = null,
+    data_event: ?windows.HANDLE = null,
+    space_event: ?windows.HANDLE = null,
     output_lock: std.atomic.Value(u8) = .init(0),
     output: std.ArrayList(u8) = .empty,
     output_closed: bool = false,
 
     const max_output_bytes = 256 * 1024;
+    const output_wait_ms: windows.DWORD = 1000;
 
     fn lockOutput(self: *Client) void {
         while (self.output_lock.cmpxchgStrong(0, 1, .acquire, .monotonic) != null) {
@@ -107,6 +163,8 @@ const Client = struct {
         self.lockOutput();
         self.output_closed = true;
         self.unlockOutput();
+        if (self.data_event) |event| _ = kernel32.SetEvent(event);
+        if (self.space_event) |event| _ = kernel32.SetEvent(event);
     }
 
     fn eject(self: *Client) void {
@@ -115,6 +173,8 @@ const Client = struct {
         self.output.clearRetainingCapacity();
         self.output_closed = true;
         self.unlockOutput();
+        if (self.data_event) |event| _ = kernel32.SetEvent(event);
+        if (self.space_event) |event| _ = kernel32.SetEvent(event);
         self.closeConnection();
     }
 
@@ -125,20 +185,86 @@ const Client = struct {
     }
 
     fn enqueue(self: *Client, tag: wire.Tag, payload: []const u8) !void {
-        var frame: std.ArrayList(u8) = .empty;
-        defer frame.deinit(self.session.alloc);
-        const header = wire.Header{ .tag = tag, .len = @intCast(payload.len) };
-        try frame.appendSlice(self.session.alloc, std.mem.asBytes(&header));
-        try frame.appendSlice(self.session.alloc, payload);
+        const frame_len = @sizeOf(wire.Header) + payload.len;
+        if (payload.len > max_output_bytes - @sizeOf(wire.Header)) {
+            return error.FrameTooLarge;
+        }
 
         self.lockOutput();
         defer self.unlockOutput();
-        if (self.output_closed or self.output.items.len + frame.items.len > max_output_bytes) {
-            self.output_closed = true;
-            self.closed.store(true, .release);
+        if (self.output_closed or frame_len > max_output_bytes - self.output.items.len) {
             return error.WouldBlock;
         }
-        try self.output.appendSlice(self.session.alloc, frame.items);
+        try self.output.ensureUnusedCapacity(self.session.alloc, frame_len);
+        const header = wire.Header{ .tag = tag, .len = @intCast(payload.len) };
+        self.output.appendSliceAssumeCapacity(std.mem.asBytes(&header));
+        self.output.appendSliceAssumeCapacity(payload);
+        if (self.data_event) |event| _ = kernel32.SetEvent(event);
+    }
+
+    fn enqueueOutput(self: *Client, payload: []const u8) !void {
+        const frame_len = @sizeOf(wire.Header) + payload.len;
+        if (payload.len > max_output_bytes - @sizeOf(wire.Header)) {
+            return error.FrameTooLarge;
+        }
+        while (true) {
+            self.lockOutput();
+            if (self.output_closed) {
+                self.unlockOutput();
+                return error.BrokenPipe;
+            }
+            if (frame_len <= max_output_bytes - self.output.items.len) {
+                self.output.ensureUnusedCapacity(self.session.alloc, frame_len) catch |err| {
+                    self.unlockOutput();
+                    return err;
+                };
+                const header = wire.Header{ .tag = .Output, .len = @intCast(payload.len) };
+                self.output.appendSliceAssumeCapacity(std.mem.asBytes(&header));
+                self.output.appendSliceAssumeCapacity(payload);
+                self.unlockOutput();
+                if (self.data_event) |event| _ = kernel32.SetEvent(event);
+                return;
+            }
+            self.unlockOutput();
+            if (self.space_event) |event| {
+                if (kernel32.WaitForSingleObject(event, output_wait_ms) == 0x00000102) {
+                    return error.WouldBlock;
+                }
+            } else {
+                return error.WouldBlock;
+            }
+        }
+    }
+
+    fn enqueueTaskComplete(self: *Client, payload: []const u8) !void {
+        const frame_len = @sizeOf(wire.Header) + payload.len;
+        while (true) {
+            self.lockOutput();
+            if (self.output_closed) {
+                self.unlockOutput();
+                return error.BrokenPipe;
+            }
+            if (frame_len <= max_output_bytes - self.output.items.len) {
+                self.output.ensureUnusedCapacity(self.session.alloc, frame_len) catch |err| {
+                    self.unlockOutput();
+                    return err;
+                };
+                const header = wire.Header{ .tag = .TaskComplete, .len = @intCast(payload.len) };
+                self.output.appendSliceAssumeCapacity(std.mem.asBytes(&header));
+                self.output.appendSliceAssumeCapacity(payload);
+                self.unlockOutput();
+                if (self.data_event) |event| _ = kernel32.SetEvent(event);
+                return;
+            }
+            self.unlockOutput();
+            if (self.space_event) |event| {
+                if (kernel32.WaitForSingleObject(event, output_wait_ms) == 0x00000102) {
+                    return error.WouldBlock;
+                }
+            } else {
+                return error.WouldBlock;
+            }
+        }
     }
 };
 
@@ -222,12 +348,13 @@ fn createSession(spec: session_windows.HostSpec, server: local_ipc.Server) !*Ses
     const cwd_len = std.process.currentPath(spec.io, &cwd_buffer) catch 0;
     const cwd = try spec.alloc.dupe(u8, cwd_buffer[0..cwd_len]);
     errdefer spec.alloc.free(cwd);
+    const initial_size = currentConsoleSize() orelse resize.Size{ .rows = 24, .cols = 80 };
     const spawned = try runtime.spawn(.{
         .session_name = spec.session_name,
         .shell = spec.shell,
         .task_mode = spec.task_mode,
         .command = spec.command,
-        .size = .{ .rows = 24, .cols = 80 },
+        .size = initial_size,
     });
     session.* = .{
         .alloc = spec.alloc,
@@ -264,10 +391,33 @@ fn sessionMain(session: *Session) void {
             continue;
         };
         client.* = .{ .session = session, .connection = connection };
+        client.data_event = kernel32.CreateEventW(
+            null,
+            @enumFromInt(0),
+            @enumFromInt(0),
+            null,
+        ) orelse {
+            connection.close();
+            session.alloc.destroy(client);
+            continue;
+        };
+        client.space_event = kernel32.CreateEventW(
+            null,
+            @enumFromInt(0),
+            @enumFromInt(0),
+            null,
+        ) orelse {
+            connection.close();
+            _ = kernel32.CloseHandle(client.data_event.?);
+            session.alloc.destroy(client);
+            continue;
+        };
         session.lock();
         session.clients.append(session.alloc, client) catch {
             session.unlock();
             connection.close();
+            _ = kernel32.CloseHandle(client.data_event.?);
+            _ = kernel32.CloseHandle(client.space_event.?);
             session.alloc.destroy(client);
             continue;
         };
@@ -304,6 +454,14 @@ fn reapClients(session: *Session) void {
         const client = found orelse return;
         if (client.thread) |thread| thread.join();
         if (client.writer_thread) |thread| thread.join();
+        if (client.space_event) |event| {
+            _ = kernel32.CloseHandle(event);
+            client.space_event = null;
+        }
+        if (client.data_event) |event| {
+            _ = kernel32.CloseHandle(event);
+            client.data_event = null;
+        }
         client.output.deinit(session.alloc);
         session.alloc.destroy(client);
     }
@@ -326,6 +484,14 @@ fn destroySession(session: *Session) void {
     for (clients) |client| {
         if (client.thread) |thread| thread.join();
         if (client.writer_thread) |thread| thread.join();
+        if (client.space_event) |event| {
+            _ = kernel32.CloseHandle(event);
+            client.space_event = null;
+        }
+        if (client.data_event) |event| {
+            _ = kernel32.CloseHandle(event);
+            client.data_event = null;
+        }
         client.output.deinit(session.alloc);
         session.alloc.destroy(client);
     }
@@ -350,7 +516,7 @@ fn readerMain(session: *Session) void {
     while (session.alive.load(.acquire)) {
         const amount = session.runtime.read(session.master, &buffer) catch |err| switch (err) {
             error.WouldBlock => {
-                _ = std.Thread.yield() catch {};
+                session.runtime.waitReadable(session.master) catch break;
                 continue;
             },
             else => break,
@@ -397,9 +563,21 @@ fn recordHistory(session: *Session, payload: []const u8) void {
 fn broadcast(session: *Session, tag: wire.Tag, payload: []const u8) void {
     session.lock();
     defer session.unlock();
-    for (session.clients.items) |client| {
-        if (client.closed.load(.acquire)) continue;
-        client.enqueue(tag, payload) catch client.eject();
+    const max_payload = Client.max_output_bytes - @sizeOf(wire.Header);
+    var offset: usize = 0;
+    while (offset < payload.len or (payload.len == 0 and offset == 0)) {
+        const amount = @min(payload.len -| offset, max_payload);
+        const chunk = payload[offset .. offset + amount];
+        for (session.clients.items) |client| {
+            if (client.closed.load(.acquire)) continue;
+            switch (tag) {
+                .Output => client.enqueueOutput(chunk) catch client.eject(),
+                .TaskComplete => client.enqueueTaskComplete(chunk) catch client.eject(),
+                else => client.enqueue(tag, chunk) catch client.eject(),
+            }
+        }
+        if (payload.len == 0) break;
+        offset += amount;
     }
 }
 
@@ -408,7 +586,7 @@ fn writePty(session: *Session, bytes: []const u8) void {
     while (offset < bytes.len and session.alive.load(.acquire)) {
         const amount = session.runtime.write(session.master, bytes[offset..]) catch |err| switch (err) {
             error.WouldBlock => {
-                _ = std.Thread.yield() catch {};
+                session.runtime.waitWritable(session.master) catch return;
                 continue;
             },
             else => return,
@@ -483,12 +661,17 @@ fn writerMain(client: *Client) void {
         }
         if (client.output.items.len == 0) {
             client.unlockOutput();
-            _ = std.Thread.yield() catch {};
+            if (client.data_event) |event| {
+                _ = kernel32.WaitForSingleObject(event, std.math.maxInt(windows.DWORD));
+            } else {
+                return;
+            }
             continue;
         }
         var pending = std.ArrayList(u8).empty;
         std.mem.swap(std.ArrayList(u8), &client.output, &pending);
         client.unlockOutput();
+        if (client.space_event) |event| _ = kernel32.SetEvent(event);
         defer pending.deinit(alloc);
         client.connection.writeAll(pending.items) catch {
             client.eject();
@@ -660,11 +843,36 @@ fn attachLoop(spec: session_windows.AttachSpec, connection: local_ipc.Connection
     _ = try attachLoopResult(spec, connection);
 }
 
+fn lockWire(lock: *std.atomic.Value(u8)) void {
+    while (lock.cmpxchgStrong(0, 1, .acquire, .monotonic) != null) {
+        std.atomic.spinLoopHint();
+    }
+}
+
+fn unlockWire(lock: *std.atomic.Value(u8)) void {
+    lock.store(0, .release);
+}
+
+fn writeWireFrame(
+    lock: *std.atomic.Value(u8),
+    connection: local_ipc.Connection,
+    tag: wire.Tag,
+    payload: []const u8,
+) !void {
+    lockWire(lock);
+    defer unlockWire(lock);
+    return wire.writeFrame(connection, tag, payload);
+}
+
 fn attachLoopResult(spec: session_windows.AttachSpec, connection: local_ipc.Connection) !?u8 {
     var stop = std.atomic.Value(bool).init(false);
+    var wire_lock = std.atomic.Value(u8).init(0);
     const stdin_file = std.Io.File.stdin();
     const stdin_handle = kernel32.GetStdHandle(std_input_handle);
+    const stdout_handle = kernel32.GetStdHandle(std_output_handle);
     var original_console_mode: ?windows.DWORD = null;
+    var original_input_cp: ?windows.UINT = null;
+    var original_output_cp: ?windows.UINT = null;
     var console_input = false;
     var mode: windows.DWORD = 0;
     if (@intFromEnum(kernel32.GetConsoleMode(stdin_handle, &mode)) != 0) {
@@ -674,10 +882,37 @@ fn attachLoopResult(spec: session_windows.AttachSpec, connection: local_ipc.Conn
             original_console_mode = mode;
         }
     }
+    if (console_input) {
+        const input_cp = kernel32.GetConsoleCP();
+        if (input_cp != 0 and @intFromEnum(kernel32.SetConsoleCP(cp_utf8)) != 0) {
+            original_input_cp = input_cp;
+        }
+    }
+    var output_mode: windows.DWORD = 0;
+    const console_output = @intFromEnum(
+        kernel32.GetConsoleMode(stdout_handle, &output_mode),
+    ) != 0;
+    if (console_output) {
+        const output_cp = kernel32.GetConsoleOutputCP();
+        if (output_cp != 0 and @intFromEnum(kernel32.SetConsoleOutputCP(cp_utf8)) != 0) {
+            original_output_cp = output_cp;
+        }
+    }
     defer if (original_console_mode) |restore_mode| {
         _ = kernel32.SetConsoleMode(stdin_handle, restore_mode);
         original_console_mode = null;
     };
+    defer if (original_input_cp) |restore_cp| {
+        _ = kernel32.SetConsoleCP(restore_cp);
+        original_input_cp = null;
+    };
+    defer if (original_output_cp) |restore_cp| {
+        _ = kernel32.SetConsoleOutputCP(restore_cp);
+        original_output_cp = null;
+    };
+    if (currentConsoleSize()) |size| {
+        try writeWireFrame(&wire_lock, connection, .Resize, std.mem.asBytes(&size));
+    }
     var input = AttachInput{
         .io = spec.io,
         .alloc = spec.alloc,
@@ -685,15 +920,35 @@ fn attachLoopResult(spec: session_windows.AttachSpec, connection: local_ipc.Conn
         .stdin_file = stdin_file,
         .stop = &stop,
         .console_input = console_input,
+        .wire_lock = &wire_lock,
     };
     const input_thread = try std.Thread.spawn(.{}, attachInputMain, .{&input});
+    var resize_monitor = ResizeMonitor{
+        .connection = connection,
+        .stop = &stop,
+        .wire_lock = &wire_lock,
+        .enabled = console_output,
+    };
+    const resize_thread = if (console_output)
+        std.Thread.spawn(.{}, resizeMonitorMain, .{&resize_monitor}) catch null
+    else
+        null;
     defer {
         stop.store(true, .release);
         _ = kernel32.CancelSynchronousIo(input_thread.getHandle());
         input_thread.join();
+        if (resize_thread) |thread| thread.join();
         if (original_console_mode) |restore_mode| {
             _ = kernel32.SetConsoleMode(stdin_handle, restore_mode);
             original_console_mode = null;
+        }
+        if (original_input_cp) |restore_cp| {
+            _ = kernel32.SetConsoleCP(restore_cp);
+            original_input_cp = null;
+        }
+        if (original_output_cp) |restore_cp| {
+            _ = kernel32.SetConsoleOutputCP(restore_cp);
+            original_output_cp = null;
         }
         stdin_file.close(spec.io);
     }
@@ -726,6 +981,14 @@ const AttachInput = struct {
     stdin_file: std.Io.File,
     stop: *std.atomic.Value(bool),
     console_input: bool,
+    wire_lock: *std.atomic.Value(u8),
+};
+
+const ResizeMonitor = struct {
+    connection: local_ipc.Connection,
+    stop: *std.atomic.Value(bool),
+    wire_lock: *std.atomic.Value(u8),
+    enabled: bool,
 };
 
 fn attachInputMain(input: *AttachInput) void {
@@ -754,7 +1017,36 @@ fn attachInputMain(input: *AttachInput) void {
             &amount,
             null,
         )) == 0 or amount == 0) break;
-        wire.writeFrame(input.connection, .Input, input_buffer[0..amount]) catch break;
+        writeWireFrame(
+            input.wire_lock,
+            input.connection,
+            .Input,
+            input_buffer[0..amount],
+        ) catch break;
+    }
+}
+
+fn resizeMonitorMain(monitor: *ResizeMonitor) void {
+    var previous: ?resize.Size = currentConsoleSize();
+    while (!monitor.stop.load(.acquire)) {
+        if (monitor.enabled) {
+            if (currentConsoleSize()) |size| {
+                const changed = if (previous) |old|
+                    old.cols != size.cols or old.rows != size.rows
+                else
+                    true;
+                if (changed) {
+                    writeWireFrame(
+                        monitor.wire_lock,
+                        monitor.connection,
+                        .Resize,
+                        std.mem.asBytes(&size),
+                    ) catch return;
+                    previous = size;
+                }
+            }
+        }
+        kernel32.Sleep(100);
     }
 }
 

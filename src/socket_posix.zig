@@ -9,6 +9,10 @@ pub fn getSeshPrefix() []const u8 {
     return lib_posix.getenv("ZMX_SESSION_PREFIX") orelse "";
 }
 
+pub fn getSeshPrefixAlloc(alloc: std.mem.Allocator) ![]u8 {
+    return alloc.dupe(u8, getSeshPrefix());
+}
+
 pub fn getSeshNameFromEnv() []const u8 {
     return lib_posix.getenv("ZMX_SESSION") orelse "";
 }

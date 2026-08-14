@@ -7,12 +7,31 @@ pub const Handle = local_ipc.Handle;
 pub const Server = local_ipc.Server;
 pub const Connection = local_ipc.Connection;
 
+threadlocal var prefix_buffer: [4096]u8 = undefined;
+threadlocal var session_buffer: [4096]u8 = undefined;
+
 pub fn getSeshPrefix() []const u8 {
-    return "";
+    const key = comptime std.unicode.wtf8ToWtf16LeStringLiteral("ZMX_SESSION_PREFIX");
+    const value = (std.process.Environ{ .block = .global }).getWindows(key) orelse return "";
+    const len = std.unicode.utf16LeToUtf8(&prefix_buffer, value) catch return "";
+    return prefix_buffer[0..len];
+}
+
+pub fn getSeshPrefixAlloc(alloc: std.mem.Allocator) ![]u8 {
+    return (std.process.Environ{ .block = .global }).getAlloc(
+        alloc,
+        "ZMX_SESSION_PREFIX",
+    ) catch |err| switch (err) {
+        error.EnvironmentVariableMissing => alloc.dupe(u8, ""),
+        else => return err,
+    };
 }
 
 pub fn getSeshNameFromEnv() []const u8 {
-    return "";
+    const key = comptime std.unicode.wtf8ToWtf16LeStringLiteral("ZMX_SESSION");
+    const value = (std.process.Environ{ .block = .global }).getWindows(key) orelse return "";
+    const len = std.unicode.utf16LeToUtf8(&session_buffer, value) catch return "";
+    return session_buffer[0..len];
 }
 
 pub fn getSeshNameFromEnvAlloc(alloc: std.mem.Allocator) !?[]u8 {
@@ -28,9 +47,13 @@ pub fn getSeshNameFromEnvAlloc(alloc: std.mem.Allocator) !?[]u8 {
 }
 
 pub fn getSeshName(alloc: std.mem.Allocator, sesh: []const u8) ![]const u8 {
-    if (sesh.len == 0) return error.SessionNameRequired;
-    try runtime_windows.validateSessionName(sesh);
-    return alloc.dupe(u8, sesh);
+    const prefix = try getSeshPrefixAlloc(alloc);
+    defer alloc.free(prefix);
+    if (sesh.len == 0 and prefix.len == 0) return error.SessionNameRequired;
+    const full = try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, sesh });
+    errdefer alloc.free(full);
+    try runtime_windows.validateSessionName(full);
+    return full;
 }
 
 pub fn resolveSessionOrEnv(

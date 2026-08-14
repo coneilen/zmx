@@ -6,6 +6,7 @@ else
     @import("socket_posix.zig");
 
 pub const getSeshPrefix = selected.getSeshPrefix;
+pub const getSeshPrefixAlloc = selected.getSeshPrefixAlloc;
 pub const getSeshNameFromEnv = selected.getSeshNameFromEnv;
 pub const getSeshNameFromEnvAlloc = selected.getSeshNameFromEnvAlloc;
 pub const getSeshName = selected.getSeshName;
