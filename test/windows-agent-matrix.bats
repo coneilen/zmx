@@ -38,6 +38,9 @@ matrix_script_path() {
   echo "$output" | grep -q '"generic_input_probe_status"'
   echo "$output" | grep -q '"bounded_timeout_cleanup"'
   echo "$output" | grep -q '"runtime_cleanup_failure_propagation"'
+  echo "$output" | grep -q '"captured_process_start_failure"'
+  echo "$output" | grep -q '"wrong_binary_matrix_json"'
+  echo "$output" | grep -q '"matrix_failure_fallback_json"'
 }
 
 @test "Windows agent matrix reports every missing backend explicitly" {
@@ -62,6 +65,25 @@ matrix_script_path() {
   echo "$output" | grep -q '"mode": "failure-injection"'
   echo "$output" | grep -q '"status": "pass"'
   echo "$output" | grep -q '"observed_status": "fail"'
+  echo "$output" | grep -q '"start_failed": true'
   echo "$output" | grep -q '"timed-out process remained alive after bounded post-kill wait"'
   echo "$output" | grep -q '"simulated_exit_code": 1'
+}
+
+@test "Windows agent matrix emits failed JSON for a wrong zmx binary" {
+  local pwsh wrong_binary
+  pwsh=$(pwsh_matrix) || skip "PowerShell 7 is not installed"
+  if command -v wslpath >/dev/null 2>&1; then
+    wrong_binary=$(wslpath -w "$REPO_DIR/test/fixtures/windows-agent-high-output.ps1")
+  else
+    wrong_binary="$REPO_DIR/test/fixtures/windows-agent-high-output.ps1"
+  fi
+
+  run "$pwsh" -NoProfile -File "$(matrix_script_path)" -ZmxPath "$wrong_binary"
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -q '"status": "fail"'
+  echo "$output" | grep -q '"generic_probes"'
+  echo "$output" | grep -q '"input_probe"'
+  echo "$output" | grep -q '"runtime_cleanup"'
+  ! echo "$output" | grep -q 'matrix document was not produced'
 }

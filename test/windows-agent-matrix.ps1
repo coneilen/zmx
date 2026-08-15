@@ -215,12 +215,14 @@ function Invoke-Captured {
     )
 
     $process = [System.Diagnostics.Process]::new()
-    $process.StartInfo = New-ProcessStartInfo -FilePath $FilePath -ArgumentList $ArgumentList -Environment $Environment
     $commandText = (($FilePath + " " + ($ArgumentList -join " ")).Trim())
+    $processStarted = $false
     try {
+        $process.StartInfo = New-ProcessStartInfo -FilePath $FilePath -ArgumentList $ArgumentList -Environment $Environment
         if (-not $process.Start()) {
             throw "Process did not start"
         }
+        $processStarted = $true
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
         if ($null -ne $InputText) {
@@ -235,6 +237,9 @@ function Invoke-Captured {
             return [pscustomobject]@{
                 exit_code = $null
                 timed_out = $true
+                failed = $timeoutCleanup.cleanup_failed
+                start_failed = $false
+                process_started = $true
                 timeout_cleanup_failed = $timeoutCleanup.cleanup_failed
                 timeout_cleanup_detail = $timeoutCleanup.detail
                 stdout = if ($FullOutput) { $stdout } else { Redact-PublicText -Text $stdout }
@@ -247,8 +252,23 @@ function Invoke-Captured {
         return [pscustomobject]@{
             exit_code = $process.ExitCode
             timed_out = $false
+            failed = $false
+            start_failed = $false
+            process_started = $true
             stdout = if ($FullOutput) { $stdout } else { Redact-PublicText -Text $stdout }
             stderr = if ($FullOutput) { $stderr } else { Redact-PublicText -Text $stderr }
+            command = Redact-PublicText -Text $commandText
+        }
+    } catch {
+        $detail = Redact-PublicText -Text $_.Exception.Message
+        return [pscustomobject]@{
+            exit_code = $null
+            timed_out = $false
+            failed = $true
+            start_failed = -not $processStarted
+            process_started = $processStarted
+            stdout = ""
+            stderr = "captured process failure: $detail"
             command = Redact-PublicText -Text $commandText
         }
     } finally {
@@ -398,11 +418,16 @@ function Set-Capability {
 
 function Resolve-ZmxSpec {
     if (-not [string]::IsNullOrWhiteSpace($ZmxPath)) {
-        if (-not (Test-Path -LiteralPath $ZmxPath -PathType Leaf)) {
-            return $null
+        $path = $ZmxPath
+        if (Test-Path -LiteralPath $ZmxPath -PathType Leaf) {
+            $path = (Resolve-Path -LiteralPath $ZmxPath).Path
+        } else {
+            try {
+                $path = [IO.Path]::GetFullPath($ZmxPath)
+            } catch {}
         }
         return [pscustomobject]@{
-            file_path = (Resolve-Path -LiteralPath $ZmxPath).Path
+            file_path = $path
             environment = @{}
         }
     }
@@ -511,6 +536,14 @@ function Get-ZmxSessionRegistration {
     param([Parameter(Mandatory = $true)][string]$Session)
 
     $result = Invoke-Zmx -ArgumentList @("list") -Timeout 10
+    if ($result.start_failed) {
+        return [pscustomobject]@{
+            query_succeeded = $true
+            registered = $false
+            pid = $null
+            detail = "zmx command could not start; no session registration can exist: $($result.stderr)"
+        }
+    }
     if ($result.exit_code -ne 0) {
         return [pscustomobject]@{
             query_succeeded = $false
@@ -1355,6 +1388,15 @@ function Test-Backend {
 function Invoke-FailureInjectionTests {
     $tests = [ordered]@{}
 
+    $Script:FailureInjectionInvokeResult = [pscustomobject]@{
+        exit_code = 1
+        timed_out = $false
+        failed = $true
+        start_failed = $false
+        process_started = $false
+        stdout = ""
+        stderr = "injected generic input launch failure"
+    }
     function Invoke-Zmx {
         param(
             [string[]]$ArgumentList,
@@ -1363,12 +1405,7 @@ function Invoke-FailureInjectionTests {
             [hashtable]$Environment,
             [switch]$FullOutput
         )
-        [pscustomobject]@{
-            exit_code = 1
-            timed_out = $false
-            stdout = ""
-            stderr = "injected generic input launch failure"
-        }
+        return $Script:FailureInjectionInvokeResult
     }
     function Wait-ZmxSession {
         param([string]$Session, [int]$Timeout = 15)
@@ -1398,6 +1435,21 @@ function Invoke-FailureInjectionTests {
         pass = $inputPass
         observed_status = $input.status
         detail = $input.detail
+    }
+
+    $wrongBinaryPath = Join-Path $PSScriptRoot "fixtures\windows-agent-high-output.ps1"
+    $wrongBinary = Invoke-Captured -FilePath $wrongBinaryPath -ArgumentList @("--wrong-binary") -Timeout 1
+    $Script:FailureInjectionInvokeResult = $wrongBinary
+    $wrongInput = Test-ZmxInputProbe -Session "injected-wrong-binary"
+    $wrongBinaryPass = $wrongBinary.start_failed -and
+        $wrongBinary.failed -and
+        $wrongInput.status -eq "fail" -and
+        $wrongInput.capabilities["send_short"].status -eq "fail"
+    $tests.wrong_binary = [ordered]@{
+        pass = $wrongBinaryPass
+        start_failed = $wrongBinary.start_failed
+        generic_input_status = $wrongInput.status
+        detail = $wrongBinary.stderr
     }
 
     $pwsh = Get-Command pwsh -ErrorAction Stop
@@ -1510,7 +1562,10 @@ if ($SelfTest) {
                 "bomless_utf8_input",
                 "generic_input_probe_status",
                 "bounded_timeout_cleanup",
-                "runtime_cleanup_failure_propagation"
+                "runtime_cleanup_failure_propagation",
+                "captured_process_start_failure",
+                "wrong_binary_matrix_json",
+                "matrix_failure_fallback_json"
             )
             credential_policy = "No credentials or private prompts are supplied; sensitive environment variables are removed."
         })
@@ -1543,6 +1598,7 @@ New-Item -ItemType Directory -Force -Path $Script:ZmxEnvironment.ZMX_DIR | Out-N
 
 $document = $null
 $finalDocument = $null
+$matrixError = $null
 try {
     $genericProbes = Test-GenericProbes
     $backendRows = @()
@@ -1594,6 +1650,8 @@ try {
         generic_probes = $genericProbes
         backends = $matrixRows
     }
+} catch {
+    $matrixError = Redact-PublicText -Text $_.Exception.Message
 } finally {
     if ($null -ne $document) {
         $finalDocument = Finalize-MatrixDocument -Document $document `
@@ -1604,7 +1662,42 @@ try {
 }
 
 if ($null -eq $document) {
-    throw "matrix document was not produced"
+    $document = [ordered]@{
+        schema = $Script:Schema
+        mode = "matrix"
+        status = "fail"
+        generated_at = [DateTime]::UtcNow.ToString("o")
+        host = [ordered]@{
+            os = "Windows"
+            powershell = $PSVersionTable.PSVersion.ToString()
+        }
+        zmx = [ordered]@{
+            available = ($null -ne $Script:ZmxSpec)
+            diagnostic = "matrix execution failed before capability collection"
+        }
+        credential_policy = "No credentials or private prompts are supplied; sensitive environment variables are removed."
+        summary = [ordered]@{
+            pass = 0
+            fail = 1
+            skip = 0
+        }
+        generic_probes = [ordered]@{
+            status = "fail"
+            input_probe = [ordered]@{
+                status = "fail"
+                detail = "matrix execution failed before generic input probing"
+            }
+            high_output_probe = [ordered]@{
+                status = "fail"
+                detail = "matrix execution failed before generic high-output probing"
+            }
+            capabilities = [ordered]@{}
+        }
+        backends = @()
+        error = "matrix execution failed: $matrixError"
+    }
+    $finalDocument = Finalize-MatrixDocument -Document $document `
+        -RuntimePath $Script:ZmxEnvironment.ZMX_DIR
 }
 Write-JsonDocument -Document $finalDocument.document
 exit $finalDocument.exit_code

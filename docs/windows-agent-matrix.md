@@ -66,12 +66,18 @@ exit.
 records when the pipe-safe PowerShell runner cannot automate them safely.
 Missing or unauthenticated backends are also explicit skips with public
 install/version diagnostics; they are never treated as passing.
+An invalid, wrong-architecture, or blocked `-ZmxPath` is captured as a failed
+process-start result. The generic probe then reports `fail`, while the matrix
+still emits JSON with `runtime_cleanup` and exits nonzero rather than throwing
+before document finalization. Unexpected matrix exceptions use the same failed
+fallback document, so a null document is never thrown to the caller.
 
 ## TDD evidence
 
 The BATS contract in `test/windows-agent-matrix.bats` runs the PowerShell
-`-SelfTest`, `-DiscoverOnly`, and `-FailureInjection` modes. The expected
-workflow is:
+`-SelfTest`, `-DiscoverOnly`, and `-FailureInjection` modes. Failure injection
+covers startup exceptions, wrong-binary generic-probe failure, bounded timeout
+cleanup, and `ZMX_DIR` removal propagation. The expected workflow is:
 
 1. **RED** — contract tests fail when the matrix script is absent or exact
    marker/cleanup assertions are removed.
