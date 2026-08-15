@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [int]$Lines = 256,
-    [int]$ChunkSize = 32
+    [int]$ChunkSize = 32,
+    [int]$HoldSeconds = 2
 )
 
 Set-StrictMode -Version Latest
@@ -22,3 +23,6 @@ for ($index = 0; $index -lt $Lines; $index++) {
     }
 }
 "ZMX_HIGH_OUTPUT_END"
+if ($HoldSeconds -gt 0) {
+    Start-Sleep -Seconds $HoldSeconds
+}

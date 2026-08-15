@@ -36,6 +36,22 @@ $Script:RequiredCapabilities = @(
     "app_crash_survival",
     "clean_kill"
 )
+$Script:GenericCapabilities = @(
+    "send_short",
+    "send_large",
+    "send_multiline",
+    "send_unicode",
+    "send_chunking",
+    "separate_enter",
+    "bracketed_paste",
+    "long_high_output",
+    "probe_cleanup"
+)
+$Script:BackendCapabilities = @(
+    $Script:RequiredCapabilities | Where-Object {
+        $Script:GenericCapabilities -notcontains $_
+    }
+)
 
 $Script:BackendCatalog = @(
     [pscustomobject]@{
@@ -300,10 +316,13 @@ function Get-BackendDiscovery {
 }
 
 function New-CapabilityMap {
-    param([string]$Detail = "not run")
+    param(
+        [string]$Detail = "not run",
+        [string[]]$Names = $Script:RequiredCapabilities
+    )
 
     $capabilities = [ordered]@{}
-    foreach ($name in $Script:RequiredCapabilities) {
+    foreach ($name in $Names) {
         [void]($capabilities[$name] = [ordered]@{
                 status = "skip"
                 detail = $Detail
@@ -437,20 +456,47 @@ function Wait-ZmxVtHistoryMarker {
     return $false
 }
 
-function Get-ZmxSessionPid {
+function Get-ZmxSessionRegistration {
     param([Parameter(Mandatory = $true)][string]$Session)
 
     $result = Invoke-Zmx -ArgumentList @("list") -Timeout 10
     if ($result.exit_code -ne 0) {
-        return $null
+        return [pscustomobject]@{
+            query_succeeded = $false
+            registered = $false
+            pid = $null
+            detail = "zmx list failed: $($result.stderr)"
+        }
     }
     foreach ($line in ($result.stdout -split "`r?`n")) {
         if ($line -match "name=$([regex]::Escape($Session))\b") {
             $match = [regex]::Match($line, "\bpid=(\d+)\b")
+            $pid = $null
             if ($match.Success) {
-                return [int]$match.Groups[1].Value
+                $pid = [int]$match.Groups[1].Value
+            }
+            return [pscustomobject]@{
+                query_succeeded = $true
+                registered = $true
+                pid = $pid
+                detail = Redact-PublicText -Text $line
             }
         }
+    }
+    return [pscustomobject]@{
+        query_succeeded = $true
+        registered = $false
+        pid = $null
+        detail = "session registration absent"
+    }
+}
+
+function Get-ZmxSessionPid {
+    param([Parameter(Mandatory = $true)][string]$Session)
+
+    $registration = Get-ZmxSessionRegistration -Session $Session
+    if ($registration.registered) {
+        return $registration.pid
     }
     return $null
 }
@@ -491,19 +537,53 @@ function Wait-ZmxSessionAbsent {
 
     $deadline = [DateTime]::UtcNow.AddSeconds($Timeout)
     while ([DateTime]::UtcNow -lt $deadline) {
-        $listedPid = Get-ZmxSessionPid -Session $Session
+        $registration = Get-ZmxSessionRegistration -Session $Session
+        $listedPid = if ($registration.registered) { $registration.pid } else { $null }
         $commandLinePid = if ($null -eq $ProcessId) {
             Get-ZmxCommandLinePid -Session $Session
         } else {
             $null
         }
         $remainingPid = if ($null -ne $listedPid) { $listedPid } else { $commandLinePid }
-        if ($null -eq $remainingPid -and (Test-WindowsProcessAbsent -ProcessId $ProcessId)) {
-            return $true
+        $processAbsent = if ($null -ne $remainingPid) {
+            Test-WindowsProcessAbsent -ProcessId $remainingPid
+        } else {
+            Test-WindowsProcessAbsent -ProcessId $ProcessId
+        }
+        if ($registration.query_succeeded -and
+            -not $registration.registered -and $null -eq $remainingPid -and $processAbsent)
+        {
+            return [pscustomobject]@{
+                registration_removed = $true
+                process_absent = $true
+                registered = $false
+                detail = "session registration and process are absent"
+            }
         }
         Start-Sleep -Milliseconds 250
     }
-    return $false
+    $registration = Get-ZmxSessionRegistration -Session $Session
+    $remainingPid = if ($registration.registered) {
+        $registration.pid
+    } elseif ($null -eq $ProcessId) {
+        Get-ZmxCommandLinePid -Session $Session
+    } else {
+        $null
+    }
+    return [pscustomobject]@{
+        registration_removed = $registration.query_succeeded -and -not $registration.registered
+        process_absent = if ($null -ne $remainingPid) {
+            Test-WindowsProcessAbsent -ProcessId $remainingPid
+        } else {
+            Test-WindowsProcessAbsent -ProcessId $ProcessId
+        }
+        registered = $registration.registered
+        detail = if ($registration.registered) {
+            "session registration remains: $($registration.detail)"
+        } else {
+            "session/process disappearance was not observed: $($registration.detail)"
+        }
+    }
 }
 
 function Stop-ZmxSession {
@@ -524,11 +604,14 @@ function Stop-ZmxSession {
         } catch {}
     }
     $absent = Wait-ZmxSessionAbsent -Session $Session -ProcessId $targetPid -Timeout 10
-    $processAbsent = Test-WindowsProcessAbsent -ProcessId $targetPid
+    $success = $absent.registration_removed -and $absent.process_absent
     return [pscustomobject]@{
         exit_code = $kill.exit_code
-        absent = $absent
-        process_absent = $processAbsent
+        success = $success
+        registration_removed = $absent.registration_removed
+        process_absent = $absent.process_absent
+        registered = $absent.registered
+        detail = $absent.detail
         target_pid = $targetPid
     }
 }
@@ -556,6 +639,27 @@ function Get-Utf8Base64 {
     return [Convert]::ToBase64String($utf8.GetBytes($Text))
 }
 
+function New-BackendMarkerProbe {
+    param(
+        [Parameter(Mandatory = $true)][string]$Backend,
+        [Parameter(Mandatory = $true)][string]$Kind
+    )
+
+    $fragmentA = "ZMX_OUTPUT_BEGIN_${Kind}_${Backend}"
+    $fragmentB = "_${PID}_END"
+    $marker = "$fragmentA$fragmentB"
+    $prompt = "Reply with one line containing the exact output envelope formed by " +
+        "concatenating fragment A [$fragmentA] and fragment B [$fragmentB], " +
+        "with no separator. Do not use tools or modify files."
+    if ($prompt.Contains($marker)) {
+        throw "backend marker was included contiguously in submitted input"
+    }
+    return [pscustomobject]@{
+        marker = $marker
+        prompt = $prompt
+    }
+}
+
 function Send-ZmxInput {
     param(
         [Parameter(Mandatory = $true)][string]$Session,
@@ -568,7 +672,8 @@ function Send-ZmxInput {
 function Test-ZmxInputProbe {
     param([Parameter(Mandatory = $true)][string]$Session)
 
-    $capabilities = New-CapabilityMap -Detail "generic zmx/ConPTY input probe not run"
+    $capabilities = New-CapabilityMap -Names $Script:GenericCapabilities `
+        -Detail "generic zmx/ConPTY input probe not run"
     $fixture = Join-Path $PSScriptRoot "fixtures\windows-agent-input-probe.ps1"
     $pwsh = Get-Command pwsh -ErrorAction SilentlyContinue
     $launchAttempted = $false
@@ -658,7 +763,10 @@ function Test-ZmxInputProbe {
             -Detail "bracketed-paste framing was observed and the exact payload was echoed"
     } finally {
         if ($launchAttempted) {
-            [void](Stop-ZmxSession -Session $Session -ProcessId $processId)
+            $cleanup = Stop-ZmxSession -Session $Session -ProcessId $processId
+            Set-Capability -Capabilities $capabilities -Name "probe_cleanup" `
+                -Status $(if ($cleanup.success) { "pass" } else { "fail" }) `
+                -Detail "generic input probe cleanup: $($cleanup.detail)"
         }
     }
     return $capabilities
@@ -707,19 +815,28 @@ function Test-ZmxFixture {
     $pwsh = Get-Command pwsh -ErrorAction SilentlyContinue
     $launchAttempted = $false
     $processId = $null
+    $result = [pscustomobject]@{
+        status = "skip"
+        detail = "generic zmx/ConPTY fixture not run"
+        cleanup = $null
+    }
     try {
         if ($null -eq $pwsh -or -not (Test-Path -LiteralPath $fixture -PathType Leaf)) {
-            return [pscustomobject]@{ status = "skip"; detail = "PowerShell fixture unavailable" }
+            $result.status = "skip"
+            $result.detail = "PowerShell fixture unavailable"
+            return $result
         }
         $launchAttempted = $true
         $lines = 256
         $chunkSize = 32
         $run = Invoke-Zmx -ArgumentList @(
             "run", $Session, "-d", [string]$pwsh.Source, "-NoProfile", "-File", $fixture,
-            "-Lines", $lines, "-ChunkSize", $chunkSize
+            "-Lines", $lines, "-ChunkSize", $chunkSize, "-HoldSeconds", "3"
         ) -Timeout 10
         if ($run.exit_code -ne 0 -or -not (Wait-ZmxSession -Session $Session -Timeout 10)) {
-            return [pscustomobject]@{ status = "fail"; detail = "high-output fixture did not start" }
+            $result.status = "fail"
+            $result.detail = "high-output fixture did not start"
+            return $result
         }
         $processId = Get-ZmxSessionPid -Session $Session
         $deadline = [DateTime]::UtcNow.AddSeconds(15)
@@ -752,21 +869,84 @@ function Test-ZmxFixture {
                 $cursor = $position
             }
             if ($missing.Count -eq 0) {
-                return [pscustomobject]@{
-                    status = "pass"
-                    detail = "generic zmx/ConPTY fixture observed all $lines sequence and chunk markers"
-                }
+                $result.status = "pass"
+                $result.detail = "generic zmx/ConPTY fixture observed all $lines sequence and chunk markers"
+                return $result
             }
             Start-Sleep -Milliseconds 250
         }
-        return [pscustomobject]@{
-            status = "fail"
-            detail = "generic zmx/ConPTY fixture missing or reordered $($missing.Count) sequence/chunk markers"
-        }
+        $result.status = "fail"
+        $result.detail = "generic zmx/ConPTY fixture missing or reordered $($missing.Count) sequence/chunk markers"
+        return $result
     } finally {
         if ($launchAttempted) {
-            [void](Stop-ZmxSession -Session $Session -ProcessId $processId)
+            $result.cleanup = Stop-ZmxSession -Session $Session -ProcessId $processId
+            if (-not $result.cleanup.success) {
+                $result.status = "fail"
+                $result.detail = "$($result.detail); cleanup failed: $($result.cleanup.detail)"
+            }
         }
+    }
+}
+
+function Test-GenericProbes {
+    $capabilities = New-CapabilityMap -Names $Script:GenericCapabilities `
+        -Detail "generic zmx/ConPTY probes not run"
+    if ($null -eq $Script:ZmxSpec) {
+        foreach ($name in $Script:GenericCapabilities) {
+            Set-Capability -Capabilities $capabilities -Name $name -Status "skip" `
+                -Detail "zmx.exe unavailable; pass -ZmxPath or build a native Windows binary"
+        }
+        return [ordered]@{
+            status = "skip"
+            capabilities = $capabilities
+        }
+    }
+
+    $input = Test-ZmxInputProbe -Session "${SessionPrefix}-generic-input"
+    foreach ($name in @(
+            "send_short",
+            "send_large",
+            "send_multiline",
+            "send_unicode",
+            "send_chunking",
+            "separate_enter",
+            "bracketed_paste",
+            "probe_cleanup"
+        ))
+    {
+        [void]($capabilities[$name] = $input[$name])
+    }
+
+    $fixture = Test-ZmxFixture -Session "${SessionPrefix}-generic-high-output"
+    Set-Capability -Capabilities $capabilities -Name "long_high_output" `
+        -Status $fixture.status -Detail $fixture.detail
+
+    $cleanupStatuses = @($input.probe_cleanup.status)
+    if ($null -ne $fixture.cleanup) {
+        $cleanupStatuses += if ($fixture.cleanup.success) { "pass" } else { "fail" }
+    }
+    $cleanupStatus = if ($cleanupStatuses -contains "fail") {
+        "fail"
+    } elseif ($cleanupStatuses -contains "pass") {
+        "pass"
+    } else {
+        "skip"
+    }
+    Set-Capability -Capabilities $capabilities -Name "probe_cleanup" `
+        -Status $cleanupStatus `
+        -Detail "generic probe registrations and processes were polled for removal"
+
+    $status = if (@($capabilities.Values | Where-Object { $_.status -eq "fail" }).Count -gt 0) {
+        "fail"
+    } elseif (@($capabilities.Values | Where-Object { $_.status -eq "pass" }).Count -gt 0) {
+        "pass"
+    } else {
+        "skip"
+    }
+    return [ordered]@{
+        status = $status
+        capabilities = $capabilities
     }
 }
 
@@ -776,7 +956,8 @@ function Test-Backend {
         [Parameter(Mandatory = $true)][pscustomobject]$Discovery
     )
 
-    $capabilities = New-CapabilityMap -Detail $Discovery.diagnostic
+    $capabilities = New-CapabilityMap -Names $Script:BackendCapabilities `
+        -Detail $Discovery.diagnostic
     $session = "$SessionPrefix-$($Catalog.name)"
     $row = [ordered]@{
         name = $Catalog.name
@@ -794,7 +975,7 @@ function Test-Backend {
 
     if ($null -eq $Script:ZmxSpec) {
         $row.diagnostic = "zmx.exe unavailable; build a native Windows zmx binary or pass -ZmxPath; backend: $($Discovery.diagnostic)"
-        foreach ($name in $Script:RequiredCapabilities) {
+        foreach ($name in $Script:BackendCapabilities) {
             Set-Capability -Capabilities $capabilities -Name $name -Status "skip" `
                 -Detail $row.diagnostic
         }
@@ -828,19 +1009,6 @@ function Test-Backend {
             -Detail "started as a real zmx Windows ConPTY session"
 
         $authRequired = Get-BackendAuthRequired -Session $session -Timeout 5
-        $probeCapabilities = Test-ZmxInputProbe -Session "${session}-input-probe"
-        foreach ($name in @(
-                "send_short",
-                "send_large",
-                "send_multiline",
-                "send_unicode",
-                "send_chunking",
-                "separate_enter",
-                "bracketed_paste"
-            ))
-        {
-            [void]($capabilities[$name] = $probeCapabilities[$name])
-        }
 
         $setLabels = Invoke-Zmx -ArgumentList @(
             "set", $session, "backend=$($Catalog.name)", "activity=matrix", "usage=public"
@@ -859,18 +1027,14 @@ function Test-Backend {
         Set-Capability -Capabilities $capabilities -Name "hooks" -Status "skip" `
             -Detail "no public cross-agent hook contract was assumed"
 
-        $fixture = Test-ZmxFixture -Session "${session}-fixture"
-        Set-Capability -Capabilities $capabilities -Name "long_high_output" `
-            -Status $fixture.status -Detail $fixture.detail
-
         $agentReplyMarker = $null
         if ($authRequired) {
             Set-AgentDependentSkips -Capabilities $capabilities `
                 -Detail "backend reported authentication or interactive trust gating before any input was sent"
         } else {
-            $agentReplyMarker = "ZMX_AGENT_REPLY_$($Catalog.name)_$PID"
-            $promptText = "ZMX_AGENT_PROMPT_$($Catalog.name)_$PID Reply with exactly $agentReplyMarker. Do not use tools or modify files."
-            $promptResult = Send-ZmxInput -Session $session -Text "$promptText`r"
+            $promptProbe = New-BackendMarkerProbe -Backend $Catalog.name -Kind "REPLY"
+            $agentReplyMarker = $promptProbe.marker
+            $promptResult = Send-ZmxInput -Session $session -Text "$($promptProbe.prompt)`r"
             $promptPass = Wait-ZmxHistoryMarker -Session $session `
                 -Marker $agentReplyMarker -Timeout 15
             Set-Capability -Capabilities $capabilities -Name "prompt_input" `
@@ -878,23 +1042,48 @@ function Test-Backend {
                 -Detail $(if ($promptPass) { "exact backend reply marker observed" } else { "no exact backend reply marker observed" })
 
             if ($promptPass) {
-                $longReplyMarker = "ZMX_AGENT_LONG_REPLY_$($Catalog.name)_$PID"
-                $longPrompt = "ZMX_AGENT_LONG_PROMPT_$($Catalog.name)_$PID Reply with exactly $longReplyMarker. Do not use tools or modify files."
-                $longResult = Send-ZmxInput -Session $session -Text "$longPrompt`r"
+                $longProbe = New-BackendMarkerProbe -Backend $Catalog.name -Kind "LONG"
+                $longReplyMarker = $longProbe.marker
+                $longResult = Send-ZmxInput -Session $session -Text "$($longProbe.prompt)`r"
                 $longPass = Wait-ZmxHistoryMarker -Session $session `
                     -Marker $longReplyMarker -Timeout 20
                 Set-Capability -Capabilities $capabilities -Name "backend_long_turn" `
                     -Status $(if ($longPass) { "pass" } else { "skip" }) `
                     -Detail $(if ($longPass) { "exact backend long-turn reply marker observed" } else { "no exact backend long-turn reply marker observed" })
 
-                $progressReplyMarker = "ZMX_AGENT_PROGRESS_REPLY_$($Catalog.name)_$PID"
-                $progressPrompt = "ZMX_AGENT_PROGRESS_PROMPT_$($Catalog.name)_$PID Reply with exactly $progressReplyMarker. Do not use tools or modify files."
-                $progressResult = Send-ZmxInput -Session $session -Text "$progressPrompt`r"
-                $progressPass = Wait-ZmxHistoryMarker -Session $session `
-                    -Marker $progressReplyMarker -Timeout 15
-                Set-Capability -Capabilities $capabilities -Name "background_progress" `
-                    -Status $(if ($progressPass) { "pass" } else { "skip" }) `
-                    -Detail $(if ($progressPass) { "exact progress reply marker observed" } else { "no exact progress reply marker observed" })
+                $progressProbe = New-BackendMarkerProbe -Backend $Catalog.name -Kind "PROGRESS"
+                $progressReplyMarker = $progressProbe.marker
+                $progressAttach = $null
+                try {
+                    $progressAttach = Start-LongProcess -FilePath $Script:ZmxSpec.file_path `
+                        -ArgumentList @("attach", $session) -Environment $Script:ZmxEnvironment
+                    Start-Sleep -Milliseconds 750
+                    if ($progressAttach.HasExited) {
+                        Set-Capability -Capabilities $capabilities -Name "background_progress" `
+                            -Status "skip" -Detail "attach process exited before pending operation could be detached"
+                    } else {
+                        $progressResult = Send-ZmxInput -Session $session `
+                            -Text "$($progressProbe.prompt) Wait three seconds before producing the envelope.`r"
+                        Start-Sleep -Milliseconds 750
+                        $beforeDetach = Get-ZmxHistory -Session $session
+                        $detachProgress = Invoke-Zmx -ArgumentList @("detach") `
+                            -Environment @{ ZMX_SESSION = $session } -Timeout 10
+                        $progressAttachExited = Wait-ProcessExit -Process $progressAttach -Timeout 10
+                        $progressAfterDetach = Wait-ZmxHistoryMarker -Session $session `
+                            -Marker $progressReplyMarker -Timeout 15
+                        $progressPass = -not $beforeDetach.Contains($progressReplyMarker) `
+                            -and $progressAttachExited -and $progressAfterDetach
+                        Set-Capability -Capabilities $capabilities -Name "background_progress" `
+                            -Status $(if ($progressPass) { "pass" } else { "skip" }) `
+                            -Detail $(if ($progressPass) {
+                                "detached pending deterministic operation and observed its exact post-detach marker"
+                            } else {
+                                "pending operation was not observed producing its exact marker after detach"
+                            })
+                    }
+                } finally {
+                    Stop-ProcessInstance -Process $progressAttach
+                }
 
                 $attach = $null
                 try {
@@ -917,9 +1106,9 @@ function Test-Backend {
                     Stop-ProcessInstance -Process $attach
                 }
 
-                $resumeMarker = "ZMX_AGENT_RESUME_REPLY_$($Catalog.name)_$PID"
-                $resumePrompt = "ZMX_AGENT_RESUME_PROMPT_$($Catalog.name)_$PID Reply with exactly $resumeMarker. Do not use tools or modify files."
-                $resumeResult = Send-ZmxInput -Session $session -Text "$resumePrompt`r"
+                $resumeProbe = New-BackendMarkerProbe -Backend $Catalog.name -Kind "RESUME"
+                $resumeMarker = $resumeProbe.marker
+                $resumeResult = Send-ZmxInput -Session $session -Text "$($resumeProbe.prompt)`r"
                 $resumePass = Wait-ZmxHistoryMarker -Session $session `
                     -Marker $resumeMarker -Timeout 15
                 [void](Invoke-Zmx -ArgumentList @("history", $session) -Timeout 10 -FullOutput)
@@ -929,9 +1118,9 @@ function Test-Backend {
                     -Status $(if ($resumePass) { "pass" } else { "skip" }) `
                     -Detail "fresh zmx history client observed exact resume marker for session $session"
 
-                $vtMarker = "ZMX_AGENT_VT_REPLY_$($Catalog.name)_$PID"
-                $vtPrompt = "ZMX_AGENT_VT_PROMPT_$($Catalog.name)_$PID Reply with exactly $vtMarker. Do not use tools or modify files."
-                $vtResult = Send-ZmxInput -Session $session -Text "$vtPrompt`r"
+                $vtProbe = New-BackendMarkerProbe -Backend $Catalog.name -Kind "VT"
+                $vtMarker = $vtProbe.marker
+                $vtResult = Send-ZmxInput -Session $session -Text "$($vtProbe.prompt)`r"
                 $vtPass = (Wait-ZmxHistoryMarker -Session $session -Marker $vtMarker -Timeout 15) `
                     -and (Wait-ZmxVtHistoryMarker -Session $session -Marker $vtMarker -Timeout 15)
                 Set-Capability -Capabilities $capabilities -Name "reconnect_vt" `
@@ -961,9 +1150,10 @@ function Test-Backend {
                 }
 
                 $ctrlC = Send-ZmxInput -Session $session -Text ([char]3)
-                $afterCtrlMarker = "ZMX_AGENT_AFTER_CTRL_C_$($Catalog.name)_$PID"
+                $afterCtrlProbe = New-BackendMarkerProbe -Backend $Catalog.name -Kind "AFTER_CTRL"
+                $afterCtrlMarker = $afterCtrlProbe.marker
                 $afterCtrl = Send-ZmxInput -Session $session `
-                    -Text "Reply with exactly $afterCtrlMarker and do not use tools.`r"
+                    -Text "$($afterCtrlProbe.prompt)`r"
                 $ctrlPass = Wait-ZmxHistoryMarker -Session $session `
                     -Marker $afterCtrlMarker -Timeout 15
                 Set-Capability -Capabilities $capabilities -Name "ctrl_c" `
@@ -983,8 +1173,8 @@ function Test-Backend {
         if ($launchAttempted) {
             $cleanup = Stop-ZmxSession -Session $session -ProcessId $processId
             Set-Capability -Capabilities $capabilities -Name "clean_kill" `
-                -Status $(if ($cleanup.absent) { "pass" } else { "fail" }) `
-                -Detail "kill attempted (exit=$($cleanup.exit_code), pid=$($cleanup.target_pid)); session=$($cleanup.absent), process=$($cleanup.process_absent)"
+                -Status $(if ($cleanup.success) { "pass" } else { "fail" }) `
+                -Detail "kill attempted (exit=$($cleanup.exit_code), pid=$($cleanup.target_pid)); registration=$($cleanup.registration_removed), process=$($cleanup.process_absent): $($cleanup.detail)"
         }
     }
     return $row
@@ -1025,13 +1215,17 @@ if ($SelfTest) {
             schema = $Script:Schema
             status = "pass"
             required_capabilities = $Script:RequiredCapabilities
+            generic_probe_capabilities = $Script:GenericCapabilities
+            backend_capabilities = $Script:BackendCapabilities
             backends = $names
             observable_contract = @(
                 "exact_history_markers",
+                "output_only_backend_markers",
                 "sequence_chunk_markers",
                 "attach_process_exit",
+                "pending_progress_after_detach",
                 "vt_marker_bytes",
-                "session_process_absence_after_kill",
+                "registration_removal_after_kill",
                 "bomless_utf8_input"
             )
             credential_policy = "No credentials or private prompts are supplied; sensitive environment variables are removed."
@@ -1058,6 +1252,7 @@ $Script:ZmxEnvironment = @{
 New-Item -ItemType Directory -Force -Path $Script:ZmxEnvironment.ZMX_DIR | Out-Null
 
 try {
+    $genericProbes = Test-GenericProbes
     $backendRows = @()
     foreach ($catalog in $Script:BackendCatalog) {
         $found = $discovery | Where-Object { $_.name -eq $catalog.name } | Select-Object -First 1
@@ -1079,15 +1274,20 @@ try {
         $invalidTypes = ($invalidRows | ForEach-Object { $_.GetType().FullName } | Sort-Object -Unique) -join ", "
         Write-Warning "matrix backend collector emitted $($invalidRows.Count) unexpected record(s): $invalidTypes"
     }
-    $allCapabilities = @($matrixRows | ForEach-Object { $_["capabilities"].Values })
+    $allCapabilities = @(
+        $genericProbes.capabilities.Values
+        $matrixRows | ForEach-Object { $_["capabilities"].Values }
+    )
     $summary = [ordered]@{
         pass = @($allCapabilities | Where-Object { $_.status -eq "pass" }).Count
         fail = @($allCapabilities | Where-Object { $_.status -eq "fail" }).Count
         skip = @($allCapabilities | Where-Object { $_.status -eq "skip" }).Count
     }
+    $matrixStatus = if ($summary.fail -gt 0) { "fail" } else { "pass" }
     Write-JsonDocument -Document ([ordered]@{
             schema = $Script:Schema
             mode = "matrix"
+            status = $matrixStatus
             generated_at = [DateTime]::UtcNow.ToString("o")
             host = [ordered]@{
                 os = "Windows"
@@ -1099,8 +1299,12 @@ try {
             }
             credential_policy = "No credentials or private prompts are supplied; sensitive environment variables are removed."
             summary = $summary
+            generic_probes = $genericProbes
             backends = $matrixRows
         })
+    if ($summary.fail -gt 0) {
+        exit 1
+    }
 } finally {
     if (Test-Path -LiteralPath $Script:ZmxEnvironment.ZMX_DIR) {
         Remove-Item -LiteralPath $Script:ZmxEnvironment.ZMX_DIR -Recurse -Force -ErrorAction SilentlyContinue

@@ -40,14 +40,22 @@ high-output sequence/chunk markers, labels, detach/background progress, VT
 history reconstruction, fresh-client session resume, Ctrl+C, client
 termination, and clean kill. The high-output result is labeled generic unless
 the active backend itself produced the markers; it never counts fixture output
-as a backend turn.
+as a backend turn. Generic ConPTY input/high-output capabilities are emitted
+under top-level `generic_probes`, never copied into an authentication-skipped
+backend row.
 
 Authentication is checked from initial output before any backend input is
 sent. Authentication-required backends keep agent-dependent capabilities as
 explicit skips; generic zmx/ConPTY probe results are reported separately.
+Backend response envelopes are assembled from separated prompt fragments, so
+the exact expected marker is output-only and cannot be satisfied by TUI echo.
+Background progress detaches an attached client while a deterministic delayed
+operation is pending, then polls for the marker produced after detach.
 Process input/output uses BOM-less UTF-8 and exact Unicode/base64 markers, and
-cleanup force-stops any remaining captured process before polling both session
-and daemon-process absence after every launch attempt.
+cleanup force-stops any remaining captured process before polling registration
+removal and daemon-process absence after every launch attempt. Stale
+registrations make the matrix fail; cleanup failures propagate through generic
+and backend probe results.
 
 `resize`, agent-specific hooks, and app-crash injection are explicit `skip`
 records when the pipe-safe PowerShell runner cannot automate them safely.

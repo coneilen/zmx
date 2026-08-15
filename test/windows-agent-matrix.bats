@@ -31,6 +31,10 @@ matrix_script_path() {
   echo "$output" | grep -q '"exact_history_markers"'
   echo "$output" | grep -q '"bomless_utf8_input"'
   echo "$output" | grep -q '"sequence_chunk_markers"'
+  echo "$output" | grep -q '"output_only_backend_markers"'
+  echo "$output" | grep -q '"pending_progress_after_detach"'
+  echo "$output" | grep -q '"registration_removal_after_kill"'
+  echo "$output" | grep -q '"generic_probe_capabilities"'
 }
 
 @test "Windows agent matrix reports every missing backend explicitly" {
