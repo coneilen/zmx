@@ -27,6 +27,10 @@ matrix_script_path() {
   [ "$status" -eq 0 ]
   echo "$output" | grep -q '"schema": "zmx/windows-agent-matrix/v1"'
   echo "$output" | grep -q '"status": "pass"'
+  echo "$output" | grep -q '"backend_long_turn"'
+  echo "$output" | grep -q '"exact_history_markers"'
+  echo "$output" | grep -q '"bomless_utf8_input"'
+  echo "$output" | grep -q '"sequence_chunk_markers"'
 }
 
 @test "Windows agent matrix reports every missing backend explicitly" {

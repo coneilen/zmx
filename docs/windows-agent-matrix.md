@@ -29,10 +29,25 @@ No credentials or private prompts are supplied.
 ## Coverage
 
 Available backends are launched with `zmx run` and exercised through the real
-Windows ConPTY path. The matrix covers prompt/Enter framing, short/large/
-multiline/Unicode/chunked input, bracketed paste bytes, deterministic
-high-output, labels, detach/background progress, VT history reconstruction,
-fresh-client session resume, Ctrl+C, client termination, and clean kill.
+Windows ConPTY path. A separate public echo probe makes every raw-input pass
+observable with exact history markers, including short/large/multiline/
+Unicode/chunked input, separate Enter, and bracketed-paste payload handling.
+The Unicode probe verifies BOM-less UTF-8 using BMP characters that Windows
+ConPTY can round-trip exactly; the bracketed-paste probe verifies the payload
+after ConPTY consumes its framing controls. The matrix
+also covers backend reply markers, deterministic generic zmx/ConPTY
+high-output sequence/chunk markers, labels, detach/background progress, VT
+history reconstruction, fresh-client session resume, Ctrl+C, client
+termination, and clean kill. The high-output result is labeled generic unless
+the active backend itself produced the markers; it never counts fixture output
+as a backend turn.
+
+Authentication is checked from initial output before any backend input is
+sent. Authentication-required backends keep agent-dependent capabilities as
+explicit skips; generic zmx/ConPTY probe results are reported separately.
+Process input/output uses BOM-less UTF-8 and exact Unicode/base64 markers, and
+cleanup force-stops any remaining captured process before polling both session
+and daemon-process absence after every launch attempt.
 
 `resize`, agent-specific hooks, and app-crash injection are explicit `skip`
 records when the pipe-safe PowerShell runner cannot automate them safely.
@@ -44,8 +59,10 @@ install/version diagnostics; they are never treated as passing.
 The BATS contract in `test/windows-agent-matrix.bats` runs the PowerShell
 `-SelfTest` and `-DiscoverOnly` modes. The expected workflow is:
 
-1. **RED** — contract tests fail when the matrix script is absent.
+1. **RED** — contract tests fail when the matrix script is absent or exact
+   marker/cleanup assertions are removed.
 2. **GREEN** — self-test, discovery, and the native matrix run produce the
-   documented schema.
+   documented schema with bounded observable probes.
 3. **REGRESSION** — run the native Windows matrix plus the existing Windows,
-   WSL, release, and BATS suites; a missing backend remains a visible skip.
+   WSL, release, and BATS suites; a missing or unauthenticated backend remains
+   a visible skip.
