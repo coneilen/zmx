@@ -41,8 +41,10 @@ history reconstruction, fresh-client session resume, Ctrl+C, client
 termination, and clean kill. The high-output result is labeled generic unless
 the active backend itself produced the markers; it never counts fixture output
 as a backend turn. Generic ConPTY input/high-output capabilities are emitted
-under top-level `generic_probes`, never copied into an authentication-skipped
-backend row.
+under top-level `generic_probes`, with explicit `input_probe` and
+`high_output_probe` statuses, never copied into an authentication-skipped
+backend row. When PowerShell and the fixtures are present, input launch,
+session, and readiness failures are `fail`, not an all-skip result.
 
 Authentication is checked from initial output before any backend input is
 sent. Authentication-required backends keep agent-dependent capabilities as
@@ -55,7 +57,10 @@ Process input/output uses BOM-less UTF-8 and exact Unicode/base64 markers, and
 cleanup force-stops any remaining captured process before polling registration
 removal and daemon-process absence after every launch attempt. Stale
 registrations make the matrix fail; cleanup failures propagate through generic
-and backend probe results.
+and backend probe results. Command timeouts use a bounded post-kill wait and
+report a timeout cleanup failure if the process remains alive. Failure to
+remove the matrix `ZMX_DIR` is included in the result and forces a nonzero
+exit.
 
 `resize`, agent-specific hooks, and app-crash injection are explicit `skip`
 records when the pipe-safe PowerShell runner cannot automate them safely.
@@ -65,12 +70,13 @@ install/version diagnostics; they are never treated as passing.
 ## TDD evidence
 
 The BATS contract in `test/windows-agent-matrix.bats` runs the PowerShell
-`-SelfTest` and `-DiscoverOnly` modes. The expected workflow is:
+`-SelfTest`, `-DiscoverOnly`, and `-FailureInjection` modes. The expected
+workflow is:
 
 1. **RED** — contract tests fail when the matrix script is absent or exact
    marker/cleanup assertions are removed.
-2. **GREEN** — self-test, discovery, and the native matrix run produce the
-   documented schema with bounded observable probes.
+2. **GREEN** — self-test, discovery, failure injection, and the native matrix
+   run produce the documented schema with bounded observable probes.
 3. **REGRESSION** — run the native Windows matrix plus the existing Windows,
    WSL, release, and BATS suites; a missing or unauthenticated backend remains
    a visible skip.

@@ -35,6 +35,9 @@ matrix_script_path() {
   echo "$output" | grep -q '"pending_progress_after_detach"'
   echo "$output" | grep -q '"registration_removal_after_kill"'
   echo "$output" | grep -q '"generic_probe_capabilities"'
+  echo "$output" | grep -q '"generic_input_probe_status"'
+  echo "$output" | grep -q '"bounded_timeout_cleanup"'
+  echo "$output" | grep -q '"runtime_cleanup_failure_propagation"'
 }
 
 @test "Windows agent matrix reports every missing backend explicitly" {
@@ -48,4 +51,17 @@ matrix_script_path() {
   echo "$output" | grep -q '"name": "codex"'
   echo "$output" | grep -q '"install"'
   echo "$output" | grep -q '"version_command"'
+}
+
+@test "Windows agent matrix failure injections preserve bounded cleanup contracts" {
+  local pwsh
+  pwsh=$(pwsh_matrix) || skip "PowerShell 7 is not installed"
+
+  run "$pwsh" -NoProfile -File "$(matrix_script_path)" -FailureInjection
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -q '"mode": "failure-injection"'
+  echo "$output" | grep -q '"status": "pass"'
+  echo "$output" | grep -q '"observed_status": "fail"'
+  echo "$output" | grep -q '"timed-out process remained alive after bounded post-kill wait"'
+  echo "$output" | grep -q '"simulated_exit_code": 1'
 }

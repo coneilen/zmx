@@ -4,7 +4,8 @@ param(
     [string]$OutputPath,
     [string]$SessionPrefix = "zmx-agent-matrix-$PID",
     [switch]$DiscoverOnly,
-    [switch]$SelfTest
+    [switch]$SelfTest,
+    [switch]$FailureInjection
 )
 
 Set-StrictMode -Version Latest
@@ -154,6 +155,55 @@ function Read-ProcessOutput {
     }
 }
 
+function Complete-TimedOutProcess {
+    param(
+        [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
+        [int]$PostKillTimeout = 2000,
+        [scriptblock]$KillAction
+    )
+
+    $killError = $null
+    try {
+        if (-not $Process.HasExited) {
+            if ($null -ne $KillAction) {
+                & $KillAction $Process
+            } else {
+                $Process.Kill($true)
+            }
+        }
+    } catch {
+        $killError = Redact-PublicText -Text $_.Exception.Message
+    }
+
+    $exited = $false
+    try {
+        $exited = $Process.WaitForExit($PostKillTimeout)
+    } catch {
+        $killError = if ($null -ne $killError) {
+            "$killError; bounded wait failed: $(Redact-PublicText -Text $_.Exception.Message)"
+        } else {
+            "bounded wait failed: $(Redact-PublicText -Text $_.Exception.Message)"
+        }
+    }
+    if (-not $exited) {
+        try {
+            $exited = $Process.HasExited
+        } catch {}
+    }
+
+    [pscustomobject]@{
+        exited = $exited
+        cleanup_failed = -not $exited
+        detail = if (-not $exited) {
+            "timed-out process remained alive after bounded post-kill wait"
+        } elseif ($null -ne $killError) {
+            "kill reported failure but process exited during bounded post-kill wait: $killError"
+        } else {
+            "timed-out process exited after kill"
+        }
+    }
+}
+
 function Invoke-Captured {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -179,13 +229,14 @@ function Invoke-Captured {
         $process.StandardInput.Close()
         $finished = $process.WaitForExit($Timeout * 1000)
         if (-not $finished) {
-            try { $process.Kill($true) } catch {}
-            $process.WaitForExit()
+            $timeoutCleanup = Complete-TimedOutProcess -Process $process
             $stdout = Read-ProcessOutput -Task $stdoutTask
             $stderr = Read-ProcessOutput -Task $stderrTask
             return [pscustomobject]@{
                 exit_code = $null
                 timed_out = $true
+                timeout_cleanup_failed = $timeoutCleanup.cleanup_failed
+                timeout_cleanup_detail = $timeoutCleanup.detail
                 stdout = if ($FullOutput) { $stdout } else { Redact-PublicText -Text $stdout }
                 stderr = if ($FullOutput) { $stderr } else { Redact-PublicText -Text $stderr }
                 command = Redact-PublicText -Text $commandText
@@ -616,6 +667,66 @@ function Stop-ZmxSession {
     }
 }
 
+function Remove-ZmxRuntimeDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [scriptblock]$RemovalAction
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return [pscustomobject]@{
+            success = $true
+            detail = "ZMX_DIR was already absent"
+        }
+    }
+
+    try {
+        if ($null -ne $RemovalAction) {
+            & $RemovalAction $Path
+        } else {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+        }
+    } catch {
+        return [pscustomobject]@{
+            success = $false
+            detail = "ZMX_DIR removal failed: $(Redact-PublicText -Text $_.Exception.Message)"
+        }
+    }
+
+    if (Test-Path -LiteralPath $Path) {
+        return [pscustomobject]@{
+            success = $false
+            detail = "ZMX_DIR remains after removal attempt"
+        }
+    }
+    return [pscustomobject]@{
+        success = $true
+        detail = "ZMX_DIR removed"
+    }
+}
+
+function Finalize-MatrixDocument {
+    param(
+        [Parameter(Mandatory = $true)]$Document,
+        [Parameter(Mandatory = $true)][string]$RuntimePath,
+        [scriptblock]$RemovalAction
+    )
+
+    $runtimeCleanup = Remove-ZmxRuntimeDirectory -Path $RuntimePath -RemovalAction $RemovalAction
+    $exitCode = if ([int]$Document["summary"]["fail"] -gt 0) { 1 } else { 0 }
+    if (-not $runtimeCleanup.success) {
+        $Document["status"] = "fail"
+        $Document["summary"]["fail"] = [int]$Document["summary"]["fail"] + 1
+        $exitCode = 1
+    }
+    $Document["runtime_cleanup"] = $runtimeCleanup
+    [pscustomobject]@{
+        document = $Document
+        cleanup = $runtimeCleanup
+        exit_code = $exitCode
+    }
+}
+
 function Wait-ProcessExit {
     param(
         [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
@@ -672,104 +783,147 @@ function Send-ZmxInput {
 function Test-ZmxInputProbe {
     param([Parameter(Mandatory = $true)][string]$Session)
 
+    $probeNames = @(
+        "send_short",
+        "send_large",
+        "send_multiline",
+        "send_unicode",
+        "send_chunking",
+        "separate_enter",
+        "bracketed_paste"
+    )
     $capabilities = New-CapabilityMap -Names $Script:GenericCapabilities `
         -Detail "generic zmx/ConPTY input probe not run"
     $fixture = Join-Path $PSScriptRoot "fixtures\windows-agent-input-probe.ps1"
     $pwsh = Get-Command pwsh -ErrorAction SilentlyContinue
     $launchAttempted = $false
     $processId = $null
-    try {
-        if ($null -eq $pwsh -or -not (Test-Path -LiteralPath $fixture -PathType Leaf)) {
-            return $capabilities
+    $probeDetail = "generic zmx/ConPTY input probe not run"
+
+    if ($null -eq $pwsh -or -not (Test-Path -LiteralPath $fixture -PathType Leaf)) {
+        $probeDetail = "PowerShell or generic input fixture unavailable"
+        return [ordered]@{
+            status = "skip"
+            detail = $probeDetail
+            capabilities = $capabilities
         }
-        $launchAttempted = $true
+    }
+
+    $launchAttempted = $true
+    try {
         $run = Invoke-Zmx -ArgumentList @(
             "run", $Session, "-d", [string]$pwsh.Source, "-NoProfile", "-File", $fixture
         ) -Timeout 10
-        if ($run.exit_code -ne 0 -or -not (Wait-ZmxSession -Session $Session -Timeout 10) -or
-            -not (Wait-ZmxHistoryMarker -Session $Session -Marker "ZMX_PROBE_READY" -Timeout 10))
-        {
-            return $capabilities
+        $sessionReady = $run.exit_code -eq 0
+        if ($sessionReady) {
+            $sessionReady = Wait-ZmxSession -Session $Session -Timeout 10
         }
-        $processId = Get-ZmxSessionPid -Session $Session
+        if ($sessionReady) {
+            $sessionReady = Wait-ZmxHistoryMarker -Session $Session `
+                -Marker "ZMX_PROBE_READY" -Timeout 10
+        }
+        if (-not $sessionReady) {
+            foreach ($name in $probeNames) {
+                Set-Capability -Capabilities $capabilities -Name $name -Status "fail" `
+                    -Detail "generic input probe launch/session/readiness failed"
+            }
+            $probeDetail = "generic input probe launch/session/readiness failed"
+        } else {
+            $processId = Get-ZmxSessionPid -Session $Session
+            $probeDetail = "generic input probe completed"
 
-        $short = Send-ZmxInput -Session $Session -Text "ZMX_SHORT_PROBE`r"
-        $shortPass = Wait-ZmxHistoryMarker -Session $Session `
-            -Marker "ZMX_PROBE_TEXT:ZMX_SHORT_PROBE" -Timeout 10
-        Set-Capability -Capabilities $capabilities -Name "send_short" `
-            -Status $(if ($shortPass) { "pass" } else { "fail" }) `
-            -Detail "exact short marker echoed by the generic ConPTY probe"
+            $short = Send-ZmxInput -Session $Session -Text "ZMX_SHORT_PROBE`r"
+            $shortPass = Wait-ZmxHistoryMarker -Session $Session `
+                -Marker "ZMX_PROBE_TEXT:ZMX_SHORT_PROBE" -Timeout 10
+            Set-Capability -Capabilities $capabilities -Name "send_short" `
+                -Status $(if ($shortPass) { "pass" } else { "fail" }) `
+                -Detail "exact short marker echoed by the generic ConPTY probe"
 
-        $separate = Send-ZmxInput -Session $Session -Text "ZMX_SEPARATE_ENTER_PROBE"
-        Start-Sleep -Milliseconds 300
-        $beforeEnter = Get-ZmxHistory -Session $Session
-        $enter = Send-ZmxInput -Session $Session -Text ([char]13)
-        $separatePass = -not $beforeEnter.Contains("ZMX_PROBE_TEXT:ZMX_SEPARATE_ENTER_PROBE") `
-            -and (Wait-ZmxHistoryMarker -Session $Session -Marker "ZMX_PROBE_TEXT:ZMX_SEPARATE_ENTER_PROBE" -Timeout 10)
-        Set-Capability -Capabilities $capabilities -Name "separate_enter" `
-            -Status $(if ($separatePass) { "pass" } else { "fail" }) `
-            -Detail "marker appeared only after the separately framed Enter"
+            $separate = Send-ZmxInput -Session $Session -Text "ZMX_SEPARATE_ENTER_PROBE"
+            Start-Sleep -Milliseconds 300
+            $beforeEnter = Get-ZmxHistory -Session $Session
+            $enter = Send-ZmxInput -Session $Session -Text ([char]13)
+            $separatePass = -not $beforeEnter.Contains("ZMX_PROBE_TEXT:ZMX_SEPARATE_ENTER_PROBE") `
+                -and (Wait-ZmxHistoryMarker -Session $Session -Marker "ZMX_PROBE_TEXT:ZMX_SEPARATE_ENTER_PROBE" -Timeout 10)
+            Set-Capability -Capabilities $capabilities -Name "separate_enter" `
+                -Status $(if ($separatePass) { "pass" } else { "fail" }) `
+                -Detail "marker appeared only after the separately framed Enter"
 
-        $largeText = "ZMX_LARGE_PROBE_" + ("x" * 4096)
-        $large = Send-ZmxInput -Session $Session -Text "$largeText`r"
-        $largePayloadLength = ([Text.Encoding]::UTF8.GetBytes("$largeText`r")).Length
-        $largePass = Wait-ZmxHistoryMarker -Session $Session `
-            -Marker "ZMX_PROBE_TEXT:ZMX_LARGE_PROBE_" -Timeout 10
-        $largeHistory = Get-ZmxHistory -Session $Session
-        $largePass = $largePass -and
-            $largeHistory.Contains("ZMX_PROBE_LEN:$largePayloadLength")
-        Set-Capability -Capabilities $capabilities -Name "send_large" `
-            -Status $(if ($largePass) { "pass" } else { "fail" }) `
-            -Detail "4096-byte payload and probe length marker observed"
+            $largeText = "ZMX_LARGE_PROBE_" + ("x" * 4096)
+            $large = Send-ZmxInput -Session $Session -Text "$largeText`r"
+            $largePayloadLength = ([Text.Encoding]::UTF8.GetBytes("$largeText`r")).Length
+            $largePass = Wait-ZmxHistoryMarker -Session $Session `
+                -Marker "ZMX_PROBE_TEXT:ZMX_LARGE_PROBE_" -Timeout 10
+            $largeHistory = Get-ZmxHistory -Session $Session
+            $largePass = $largePass -and
+                $largeHistory.Contains("ZMX_PROBE_LEN:$largePayloadLength")
+            Set-Capability -Capabilities $capabilities -Name "send_large" `
+                -Status $(if ($largePass) { "pass" } else { "fail" }) `
+                -Detail "4096-byte payload and probe length marker observed"
 
-        $multiline = Send-ZmxInput -Session $Session -Text "ZMX_MULTI_ONE`r`nZMX_MULTI_TWO`r"
-        $multilinePass = (Wait-ZmxHistoryMarker -Session $Session -Marker "ZMX_PROBE_TEXT:ZMX_MULTI_ONE" -Timeout 10) `
-            -and (Wait-ZmxHistoryMarker -Session $Session -Marker "ZMX_PROBE_TEXT:ZMX_MULTI_TWO" -Timeout 10)
-        Set-Capability -Capabilities $capabilities -Name "send_multiline" `
-            -Status $(if ($multilinePass) { "pass" } else { "fail" }) `
-            -Detail "both CRLF/LF line markers echoed exactly"
+            $multiline = Send-ZmxInput -Session $Session -Text "ZMX_MULTI_ONE`r`nZMX_MULTI_TWO`r"
+            $multilinePass = (Wait-ZmxHistoryMarker -Session $Session -Marker "ZMX_PROBE_TEXT:ZMX_MULTI_ONE" -Timeout 10) `
+                -and (Wait-ZmxHistoryMarker -Session $Session -Marker "ZMX_PROBE_TEXT:ZMX_MULTI_TWO" -Timeout 10)
+            Set-Capability -Capabilities $capabilities -Name "send_multiline" `
+                -Status $(if ($multilinePass) { "pass" } else { "fail" }) `
+                -Detail "both CRLF/LF line markers echoed exactly"
 
-        $unicode = "ZMX_UNICODE_世界_Ж_λ_é"
-        $unicodePayload = "$unicode`r"
-        $unicodeResult = Send-ZmxInput -Session $Session -Text $unicodePayload
-        $unicodeBase64 = Get-Utf8Base64 -Text $unicodePayload
-        $unicodePass = (Wait-ZmxHistoryMarker -Session $Session -Marker "ZMX_PROBE_TEXT:$unicode" -Timeout 10) `
-            -and (Wait-ZmxHistoryMarker -Session $Session `
-                -Marker "ZMX_PROBE_B64:$unicodeBase64" -Timeout 10)
-        Set-Capability -Capabilities $capabilities -Name "send_unicode" `
-            -Status $(if ($unicodePass) { "pass" } else { "fail" }) `
-            -Detail "exact UTF-8 text and BOM-less byte encoding marker observed"
+            $unicode = "ZMX_UNICODE_世界_Ж_λ_é"
+            $unicodePayload = "$unicode`r"
+            $unicodeResult = Send-ZmxInput -Session $Session -Text $unicodePayload
+            $unicodeBase64 = Get-Utf8Base64 -Text $unicodePayload
+            $unicodePass = (Wait-ZmxHistoryMarker -Session $Session -Marker "ZMX_PROBE_TEXT:$unicode" -Timeout 10) `
+                -and (Wait-ZmxHistoryMarker -Session $Session `
+                    -Marker "ZMX_PROBE_B64:$unicodeBase64" -Timeout 10)
+            Set-Capability -Capabilities $capabilities -Name "send_unicode" `
+                -Status $(if ($unicodePass) { "pass" } else { "fail" }) `
+                -Detail "exact UTF-8 text and BOM-less byte encoding marker observed"
 
-        $chunked = Send-ZmxInput -Session $Session -Text "ZMX_CHUNK_A"
-        $chunked2 = Send-ZmxInput -Session $Session -Text "ZMX_CHUNK_B"
-        $chunked3 = Send-ZmxInput -Session $Session -Text "ZMX_CHUNK_C"
-        $chunkEnter = Send-ZmxInput -Session $Session -Text ([char]13)
-        $chunkPass = Wait-ZmxHistoryMarker -Session $Session `
-            -Marker "ZMX_PROBE_TEXT:ZMX_CHUNK_AZMX_CHUNK_BZMX_CHUNK_C" -Timeout 10
-        Set-Capability -Capabilities $capabilities -Name "send_chunking" `
-            -Status $(if ($chunkPass) { "pass" } else { "fail" }) `
-            -Detail "all three independently framed chunks reconstructed in order"
+            $chunked = Send-ZmxInput -Session $Session -Text "ZMX_CHUNK_A"
+            $chunked2 = Send-ZmxInput -Session $Session -Text "ZMX_CHUNK_B"
+            $chunked3 = Send-ZmxInput -Session $Session -Text "ZMX_CHUNK_C"
+            $chunkEnter = Send-ZmxInput -Session $Session -Text ([char]13)
+            $chunkPass = Wait-ZmxHistoryMarker -Session $Session `
+                -Marker "ZMX_PROBE_TEXT:ZMX_CHUNK_AZMX_CHUNK_BZMX_CHUNK_C" -Timeout 10
+            Set-Capability -Capabilities $capabilities -Name "send_chunking" `
+                -Status $(if ($chunkPass) { "pass" } else { "fail" }) `
+                -Detail "all three independently framed chunks reconstructed in order"
 
-        $paste = ([char]27) + "[200~ZMX_BRACKETED_PASTE" + ([char]27) + "[201~"
-        $pasteResult = Send-ZmxInput -Session $Session -Text "$paste`r"
-        $pastePayload = "ZMX_BRACKETED_PASTE`r"
-        $pasteBase64 = Get-Utf8Base64 -Text $pastePayload
-        $pastePass = (Wait-ZmxHistoryMarker -Session $Session `
-                -Marker "ZMX_PROBE_TEXT:ZMX_BRACKETED_PASTE" -Timeout 10) `
-            -and (Wait-ZmxHistoryMarker -Session $Session `
-                -Marker "ZMX_PROBE_NORMALIZED_B64:$pasteBase64" -Timeout 10)
-        Set-Capability -Capabilities $capabilities -Name "bracketed_paste" `
-            -Status $(if ($pastePass) { "pass" } else { "fail" }) `
-            -Detail "bracketed-paste framing was observed and the exact payload was echoed"
+            $paste = ([char]27) + "[200~ZMX_BRACKETED_PASTE" + ([char]27) + "[201~"
+            $pasteResult = Send-ZmxInput -Session $Session -Text "$paste`r"
+            $pastePayload = "ZMX_BRACKETED_PASTE`r"
+            $pasteBase64 = Get-Utf8Base64 -Text $pastePayload
+            $pastePass = (Wait-ZmxHistoryMarker -Session $Session `
+                    -Marker "ZMX_PROBE_TEXT:ZMX_BRACKETED_PASTE" -Timeout 10) `
+                -and (Wait-ZmxHistoryMarker -Session $Session `
+                    -Marker "ZMX_PROBE_NORMALIZED_B64:$pasteBase64" -Timeout 10)
+            Set-Capability -Capabilities $capabilities -Name "bracketed_paste" `
+                -Status $(if ($pastePass) { "pass" } else { "fail" }) `
+                -Detail "bracketed-paste framing was observed and the exact payload was echoed"
+        }
     } finally {
         if ($launchAttempted) {
             $cleanup = Stop-ZmxSession -Session $Session -ProcessId $processId
             Set-Capability -Capabilities $capabilities -Name "probe_cleanup" `
                 -Status $(if ($cleanup.success) { "pass" } else { "fail" }) `
                 -Detail "generic input probe cleanup: $($cleanup.detail)"
+            if (-not $cleanup.success) {
+                $probeDetail = "$probeDetail; cleanup failed: $($cleanup.detail)"
+            }
         }
     }
-    return $capabilities
+    $probeStatus = if (@($capabilities.Values | Where-Object { $_.status -eq "fail" }).Count -gt 0) {
+        "fail"
+    } elseif (@($capabilities.Values | Where-Object { $_.status -eq "pass" }).Count -gt 0) {
+        "pass"
+    } else {
+        "skip"
+    }
+    return [ordered]@{
+        status = $probeStatus
+        detail = $probeDetail
+        capabilities = $capabilities
+    }
 }
 
 function Get-BackendAuthRequired {
@@ -899,6 +1053,15 @@ function Test-GenericProbes {
         }
         return [ordered]@{
             status = "skip"
+            input_probe = [ordered]@{
+                status = "skip"
+                detail = "zmx.exe unavailable; pass -ZmxPath or build a native Windows binary"
+                capabilities = $capabilities
+            }
+            high_output_probe = [ordered]@{
+                status = "skip"
+                detail = "zmx.exe unavailable; pass -ZmxPath or build a native Windows binary"
+            }
             capabilities = $capabilities
         }
     }
@@ -915,14 +1078,14 @@ function Test-GenericProbes {
             "probe_cleanup"
         ))
     {
-        [void]($capabilities[$name] = $input[$name])
+        [void]($capabilities[$name] = $input.capabilities[$name])
     }
 
     $fixture = Test-ZmxFixture -Session "${SessionPrefix}-generic-high-output"
     Set-Capability -Capabilities $capabilities -Name "long_high_output" `
         -Status $fixture.status -Detail $fixture.detail
 
-    $cleanupStatuses = @($input.probe_cleanup.status)
+    $cleanupStatuses = @($input.capabilities["probe_cleanup"].status)
     if ($null -ne $fixture.cleanup) {
         $cleanupStatuses += if ($fixture.cleanup.success) { "pass" } else { "fail" }
     }
@@ -946,6 +1109,15 @@ function Test-GenericProbes {
     }
     return [ordered]@{
         status = $status
+        input_probe = [ordered]@{
+            status = $input.status
+            detail = $input.detail
+            capabilities = $input.capabilities
+        }
+        high_output_probe = [ordered]@{
+            status = $fixture.status
+            detail = $fixture.detail
+        }
         capabilities = $capabilities
     }
 }
@@ -1180,6 +1352,115 @@ function Test-Backend {
     return $row
 }
 
+function Invoke-FailureInjectionTests {
+    $tests = [ordered]@{}
+
+    function Invoke-Zmx {
+        param(
+            [string[]]$ArgumentList,
+            [string]$InputText,
+            [int]$Timeout = 10,
+            [hashtable]$Environment,
+            [switch]$FullOutput
+        )
+        [pscustomobject]@{
+            exit_code = 1
+            timed_out = $false
+            stdout = ""
+            stderr = "injected generic input launch failure"
+        }
+    }
+    function Wait-ZmxSession {
+        param([string]$Session, [int]$Timeout = 15)
+        return $false
+    }
+    function Wait-ZmxHistoryMarker {
+        param([string]$Session, [string]$Marker, [int]$Timeout = 10)
+        return $false
+    }
+    function Stop-ZmxSession {
+        param([string]$Session, [Nullable[int]]$ProcessId)
+        [pscustomobject]@{
+            success = $true
+            registration_removed = $true
+            process_absent = $true
+            registered = $false
+            detail = "injected cleanup succeeded"
+        }
+    }
+
+    $Script:ZmxSpec = [ordered]@{ file_path = "injected-zmx.exe" }
+    $input = Test-ZmxInputProbe -Session "injected-input-failure"
+    $inputPass = $input.status -eq "fail" -and
+        $input.capabilities["send_short"].status -eq "fail" -and
+        $input.capabilities["send_unicode"].status -eq "fail"
+    $tests.input_probe_launch_failure = [ordered]@{
+        pass = $inputPass
+        observed_status = $input.status
+        detail = $input.detail
+    }
+
+    $pwsh = Get-Command pwsh -ErrorAction Stop
+    $timeoutProcess = Start-LongProcess -FilePath $pwsh.Source `
+        -ArgumentList @("-NoProfile", "-Command", "Start-Sleep -Seconds 3")
+    $timeoutStarted = [DateTime]::UtcNow
+    $timeout = Complete-TimedOutProcess -Process $timeoutProcess -PostKillTimeout 100 `
+        -KillAction { throw "injected kill failure" }
+    $timeoutElapsed = ([DateTime]::UtcNow - $timeoutStarted).TotalSeconds
+    try {
+        if (-not $timeoutProcess.HasExited) {
+            $timeoutProcess.Kill($true)
+            [void]$timeoutProcess.WaitForExit(2000)
+        }
+    } catch {}
+    $timeoutProcess.Dispose()
+    $timeoutPass = $timeout.cleanup_failed -and
+        $timeoutElapsed -lt 3 -and
+        $timeout.detail -match "bounded"
+    $tests.timeout_kill_failure = [ordered]@{
+        pass = $timeoutPass
+        elapsed_seconds = [Math]::Round($timeoutElapsed, 3)
+        detail = $timeout.detail
+    }
+
+    $runtimePath = Join-Path $PSScriptRoot ".failure-injection-runtime-$PID"
+    New-Item -ItemType Directory -Force -Path (Join-Path $runtimePath "child") | Out-Null
+    $runtimeDocument = [ordered]@{
+        status = "pass"
+        summary = [ordered]@{
+            pass = 0
+            fail = 0
+            skip = 0
+        }
+    }
+    $runtimeFinal = Finalize-MatrixDocument -Document $runtimeDocument -RuntimePath $runtimePath `
+        -RemovalAction { throw "injected ZMX_DIR removal failure" }
+    try {
+        Remove-Item -LiteralPath $runtimePath -Recurse -Force -ErrorAction Stop
+    } catch {}
+    $runtimePass = -not $runtimeFinal.cleanup.success -and
+        $runtimeFinal.exit_code -eq 1 -and
+        $runtimeFinal.document.status -eq "fail" -and
+        $runtimeFinal.cleanup.detail -match "ZMX_DIR removal failed"
+    $tests.runtime_cleanup_failure = [ordered]@{
+        pass = $runtimePass
+        simulated_exit_code = $runtimeFinal.exit_code
+        detail = $runtimeFinal.cleanup.detail
+    }
+
+    $status = if (@($tests.Values | Where-Object { -not $_.pass }).Count -eq 0) {
+        "pass"
+    } else {
+        "fail"
+    }
+    [ordered]@{
+        schema = $Script:Schema
+        mode = "failure-injection"
+        status = $status
+        tests = $tests
+    }
+}
+
 function Write-JsonDocument {
     param([Parameter(Mandatory = $true)]$Document)
 
@@ -1226,11 +1507,20 @@ if ($SelfTest) {
                 "pending_progress_after_detach",
                 "vt_marker_bytes",
                 "registration_removal_after_kill",
-                "bomless_utf8_input"
+                "bomless_utf8_input",
+                "generic_input_probe_status",
+                "bounded_timeout_cleanup",
+                "runtime_cleanup_failure_propagation"
             )
             credential_policy = "No credentials or private prompts are supplied; sensitive environment variables are removed."
         })
     exit 0
+}
+
+if ($FailureInjection) {
+    $failureDocument = Invoke-FailureInjectionTests
+    Write-JsonDocument -Document $failureDocument
+    exit $(if ($failureDocument.status -eq "pass") { 0 } else { 1 })
 }
 
 $discovery = @(Get-BackendDiscovery)
@@ -1251,6 +1541,8 @@ $Script:ZmxEnvironment = @{
 }
 New-Item -ItemType Directory -Force -Path $Script:ZmxEnvironment.ZMX_DIR | Out-Null
 
+$document = $null
+$finalDocument = $null
 try {
     $genericProbes = Test-GenericProbes
     $backendRows = @()
@@ -1284,29 +1576,35 @@ try {
         skip = @($allCapabilities | Where-Object { $_.status -eq "skip" }).Count
     }
     $matrixStatus = if ($summary.fail -gt 0) { "fail" } else { "pass" }
-    Write-JsonDocument -Document ([ordered]@{
-            schema = $Script:Schema
-            mode = "matrix"
-            status = $matrixStatus
-            generated_at = [DateTime]::UtcNow.ToString("o")
-            host = [ordered]@{
-                os = "Windows"
-                powershell = $PSVersionTable.PSVersion.ToString()
-            }
-            zmx = [ordered]@{
-                available = ($null -ne $Script:ZmxSpec)
-                diagnostic = if ($null -ne $Script:ZmxSpec) { "native zmx.exe selected" } else { "zmx.exe unavailable; pass -ZmxPath or build with Zig 0.16" }
-            }
-            credential_policy = "No credentials or private prompts are supplied; sensitive environment variables are removed."
-            summary = $summary
-            generic_probes = $genericProbes
-            backends = $matrixRows
-        })
-    if ($summary.fail -gt 0) {
-        exit 1
+    $document = [ordered]@{
+        schema = $Script:Schema
+        mode = "matrix"
+        status = $matrixStatus
+        generated_at = [DateTime]::UtcNow.ToString("o")
+        host = [ordered]@{
+            os = "Windows"
+            powershell = $PSVersionTable.PSVersion.ToString()
+        }
+        zmx = [ordered]@{
+            available = ($null -ne $Script:ZmxSpec)
+            diagnostic = if ($null -ne $Script:ZmxSpec) { "native zmx.exe selected" } else { "zmx.exe unavailable; pass -ZmxPath or build with Zig 0.16" }
+        }
+        credential_policy = "No credentials or private prompts are supplied; sensitive environment variables are removed."
+        summary = $summary
+        generic_probes = $genericProbes
+        backends = $matrixRows
     }
 } finally {
-    if (Test-Path -LiteralPath $Script:ZmxEnvironment.ZMX_DIR) {
-        Remove-Item -LiteralPath $Script:ZmxEnvironment.ZMX_DIR -Recurse -Force -ErrorAction SilentlyContinue
+    if ($null -ne $document) {
+        $finalDocument = Finalize-MatrixDocument -Document $document `
+            -RuntimePath $Script:ZmxEnvironment.ZMX_DIR
+    } else {
+        [void](Remove-ZmxRuntimeDirectory -Path $Script:ZmxEnvironment.ZMX_DIR)
     }
 }
+
+if ($null -eq $document) {
+    throw "matrix document was not produced"
+}
+Write-JsonDocument -Document $finalDocument.document
+exit $finalDocument.exit_code
