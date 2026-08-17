@@ -444,6 +444,13 @@ pub fn socketDir(alloc: std.mem.Allocator) Error![]u8 {
 }
 
 pub fn logDir(alloc: std.mem.Allocator) Error![]u8 {
+    const configured = try configuredZmxDir(alloc);
+    defer if (configured) |path| alloc.free(path);
+    return logDirFor(alloc, configured);
+}
+
+fn logDirFor(alloc: std.mem.Allocator, configured: ?[]const u8) Error![]u8 {
+    if (configured) |path| return std.fmt.allocPrint(alloc, "{s}\\logs", .{path});
     const base = try filesystemBase(alloc);
     defer alloc.free(base);
     return std.fmt.allocPrint(alloc, "{s}\\zmx\\logs", .{base});
@@ -509,12 +516,32 @@ fn filesystemBase(alloc: std.mem.Allocator) Error![]u8 {
     return base;
 }
 
+fn configuredZmxDir(alloc: std.mem.Allocator) Error!?[]u8 {
+    const value = (std.process.Environ{ .block = .global }).getAlloc(
+        alloc,
+        "ZMX_DIR",
+    ) catch |err| switch (err) {
+        error.EnvironmentVariableMissing => return null,
+        else => return error.OutOfMemory,
+    };
+    if (value.len == 0 or std.mem.startsWith(u8, value, pipe_prefix)) {
+        alloc.free(value);
+        return null;
+    }
+    return value;
+}
+
 fn rendezvousBase(alloc: std.mem.Allocator) Error![]u8 {
+    const configured = try configuredZmxDir(alloc);
+    defer if (configured) |path| alloc.free(path);
+    return rendezvousBaseFor(alloc, configured);
+}
+
+fn rendezvousBaseFor(alloc: std.mem.Allocator, configured: ?[]const u8) Error![]u8 {
+    if (configured) |path| return std.fmt.allocPrint(alloc, "{s}\\ipc", .{path});
     const base = try filesystemBase(alloc);
     defer alloc.free(base);
-    return std.fmt.allocPrint(alloc, "{s}\\zmx\\ipc", .{base}) catch |err| switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-    };
+    return std.fmt.allocPrint(alloc, "{s}\\zmx\\ipc", .{base});
 }
 
 fn rendezvousDirectory(
@@ -538,11 +565,19 @@ fn ensureRendezvousDirectory(
     try validateSessionName(session_name);
     const sid = try currentUserSid(alloc);
     defer alloc.free(sid);
-    const root = try filesystemBase(alloc);
+    const configured = try configuredZmxDir(alloc);
+    defer if (configured) |path| alloc.free(path);
+    const root = if (configured) |path|
+        try alloc.dupe(u8, path)
+    else
+        try filesystemBase(alloc);
     defer alloc.free(root);
     const base = try rendezvousBase(alloc);
     defer alloc.free(base);
-    const zmx_dir = try std.fmt.allocPrint(alloc, "{s}\\zmx", .{root});
+    const zmx_dir = if (configured != null)
+        try alloc.dupe(u8, root)
+    else
+        try std.fmt.allocPrint(alloc, "{s}\\zmx", .{root});
     defer alloc.free(zmx_dir);
     const user_dir = try std.fmt.allocPrint(alloc, "{s}\\{s}", .{ base, sid });
     defer alloc.free(user_dir);
@@ -1046,6 +1081,24 @@ test "Windows fallback log paths are filesystem paths" {
     defer alloc.free(path);
     try std.testing.expect(!std.mem.startsWith(u8, path, pipe_prefix));
     try std.testing.expect(std.mem.indexOf(u8, path, "\\logs") != null);
+}
+
+test "Windows explicit ZMX_DIR isolates rendezvous and log roots" {
+    const alloc = std.testing.allocator;
+    const configured = "C:\\zmx-quickchat-isolated";
+    const rendezvous = try rendezvousBaseFor(alloc, configured);
+    defer alloc.free(rendezvous);
+    try std.testing.expectEqualStrings(
+        "C:\\zmx-quickchat-isolated\\ipc",
+        rendezvous,
+    );
+
+    const logs = try logDirFor(alloc, configured);
+    defer alloc.free(logs);
+    try std.testing.expectEqualStrings(
+        "C:\\zmx-quickchat-isolated\\logs",
+        logs,
+    );
 }
 
 test "Windows session lease excludes a second owner" {

@@ -412,6 +412,9 @@ Each session gets its own unix socket file. The default location depends on your
 1. `TMPDIR` => uses `{TMPDIR}/zmx-{uid}` (appends uid for multi-user safety)
 1. `/tmp` => uses `/tmp/zmx-{uid}` (default fallback, appends uid for multi-user safety)
 
+On Windows, sessions use named pipes. When `ZMX_DIR` is set, rendezvous and
+lease metadata is isolated under `ZMX_DIR\ipc` and logs under `ZMX_DIR\logs`.
+
 ## permissions
 
 You can configure the permissions for the socket directory and log files using the following environment variables:
