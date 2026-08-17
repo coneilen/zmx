@@ -61,6 +61,9 @@ extern "kernel32" fn CreateDirectoryW(
     path_name: windows.LPCWSTR,
     security_attributes: ?*windows.SECURITY_ATTRIBUTES,
 ) callconv(.winapi) c_int;
+extern "kernel32" fn GetFileAttributesW(
+    file_name: windows.LPCWSTR,
+) callconv(.winapi) windows.DWORD;
 extern "advapi32" fn SetFileSecurityW(
     file_name: windows.LPCWSTR,
     security_information: windows.DWORD,
@@ -124,6 +127,8 @@ const security_descriptor_dacl_protected: windows.WORD = 0x1000;
 const acl_information_basic: windows.DWORD = 2;
 const access_allowed_ace_type: u8 = 0;
 const file_all_access: windows.DWORD = 0x001f_01ff;
+const invalid_file_attributes: windows.DWORD = 0xffff_ffff;
+const file_attribute_reparse_point: windows.DWORD = 0x0000_0400;
 const system_sid = "S-1-5-18";
 /// Rendezvous records store the UTF-8 spelling of a pipe name. A valid
 /// endpoint is limited by UTF-16 units, and U+0800 is the worst-case BMP
@@ -229,6 +234,14 @@ fn utf16Path(alloc: std.mem.Allocator, path: []const u8) Error![:0]u16 {
     };
 }
 
+fn rejectReparsePoint(alloc: std.mem.Allocator, path: []const u8) Error!void {
+    const path_w = try utf16Path(alloc, path);
+    defer alloc.free(path_w);
+    const attributes = GetFileAttributesW(path_w.ptr);
+    if (attributes == invalid_file_attributes) return error.AccessDenied;
+    if ((attributes & file_attribute_reparse_point) != 0) return error.AccessDenied;
+}
+
 fn filesystemSddl(alloc: std.mem.Allocator) Error![:0]u16 {
     const sid = try currentUserSid(alloc);
     defer alloc.free(sid);
@@ -291,6 +304,7 @@ fn verifyFilesystemSecurity(
     alloc: std.mem.Allocator,
     path: []const u8,
 ) Error!void {
+    try rejectReparsePoint(alloc, path);
     const path_w = try utf16Path(alloc, path);
     defer alloc.free(path_w);
 
@@ -409,6 +423,7 @@ fn ensureSecureDirectory(
     if (CreateDirectoryW(path_w.ptr, &attributes) == 0) {
         if (windows.GetLastError() != .ALREADY_EXISTS) return error.AccessDenied;
     }
+    try rejectReparsePoint(alloc, path);
     return verifyFilesystemSecurity(alloc, path);
 }
 
@@ -425,6 +440,16 @@ pub fn ensureSecureDirectoryPath(
     path: []const u8,
 ) Error!void {
     _ = io;
+    const configured = try configuredZmxDir(lease_allocator);
+    defer if (configured) |root| lease_allocator.free(root);
+    if (configured) |root| {
+        const logs = try std.fmt.allocPrint(lease_allocator, "{s}\\logs", .{root});
+        defer lease_allocator.free(logs);
+        if (std.mem.eql(u8, path, logs)) {
+            try rejectReparsePoint(lease_allocator, root);
+            return ensureSecureDirectory(lease_allocator, path);
+        }
+    }
     const parent = std.fs.path.dirname(path) orelse return error.AccessDenied;
     try ensureSecureDirectory(lease_allocator, parent);
     try ensureSecureDirectory(lease_allocator, path);
@@ -437,9 +462,40 @@ pub fn socketDirForSid(alloc: std.mem.Allocator, sid: []const u8) Error![]u8 {
     return std.fmt.allocPrint(alloc, "{s}-{s}", .{ pipe_prefix, sid });
 }
 
+fn socketDirForConfiguredRoot(
+    alloc: std.mem.Allocator,
+    sid: []const u8,
+    root: []const u8,
+) Error![]u8 {
+    if (sid.len == 0 or std.mem.indexOfScalar(u8, sid, '\\') != null) {
+        return error.InvalidSessionName;
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(root);
+    hasher.final(&digest);
+    var identity: [16]u8 = undefined;
+    const digits = "0123456789abcdef";
+    for (0..8) |index| {
+        const byte = digest[index];
+        identity[index * 2] = digits[byte >> 4];
+        identity[index * 2 + 1] = digits[byte & 0x0f];
+    }
+    return std.fmt.allocPrint(
+        alloc,
+        "{s}-{s}-r{s}",
+        .{ pipe_prefix, sid, identity },
+    );
+}
+
 pub fn socketDir(alloc: std.mem.Allocator) Error![]u8 {
     const sid = try currentUserSid(alloc);
     defer alloc.free(sid);
+    const configured = try configuredZmxDir(alloc);
+    defer if (configured) |path| alloc.free(path);
+    if (configured) |root| {
+        return socketDirForConfiguredRoot(alloc, sid, root);
+    }
     return socketDirForSid(alloc, sid);
 }
 
@@ -561,18 +617,30 @@ fn ensureRendezvousDirectory(
     alloc: std.mem.Allocator,
     session_name: []const u8,
 ) Error!void {
+    const configured = try configuredZmxDir(alloc);
+    defer if (configured) |path| alloc.free(path);
+    return ensureRendezvousDirectoryFor(io, alloc, session_name, configured);
+}
+
+fn ensureRendezvousDirectoryFor(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    session_name: []const u8,
+    configured: ?[]const u8,
+) Error!void {
     _ = io;
     try validateSessionName(session_name);
     const sid = try currentUserSid(alloc);
     defer alloc.free(sid);
-    const configured = try configuredZmxDir(alloc);
-    defer if (configured) |path| alloc.free(path);
     const root = if (configured) |path|
         try alloc.dupe(u8, path)
     else
         try filesystemBase(alloc);
     defer alloc.free(root);
-    const base = try rendezvousBase(alloc);
+    const base = if (configured) |path|
+        try std.fmt.allocPrint(alloc, "{s}\\ipc", .{path})
+    else
+        try rendezvousBase(alloc);
     defer alloc.free(base);
     const zmx_dir = if (configured != null)
         try alloc.dupe(u8, root)
@@ -582,7 +650,14 @@ fn ensureRendezvousDirectory(
     const user_dir = try std.fmt.allocPrint(alloc, "{s}\\{s}", .{ base, sid });
     defer alloc.free(user_dir);
 
-    try ensureSecureDirectory(alloc, zmx_dir);
+    try rejectReparsePoint(alloc, root);
+    if (configured != null) {
+        // ZMX_DIR is an operator-owned root; do not rewrite or require its
+        // ACL. It must not be a reparse point before private children are used.
+        try rejectReparsePoint(alloc, zmx_dir);
+    } else {
+        try ensureSecureDirectory(alloc, zmx_dir);
+    }
     try ensureSecureDirectory(alloc, base);
     try ensureSecureDirectory(alloc, user_dir);
 }
@@ -877,9 +952,7 @@ pub fn nonceEndpointPath(
     session_name: []const u8,
 ) Error![]u8 {
     try validateSessionName(session_name);
-    const sid = try currentUserSid(alloc);
-    defer alloc.free(sid);
-    const directory = try socketDirForSid(alloc, sid);
+    const directory = try socketDir(alloc);
     defer alloc.free(directory);
     var nonce: [16]u8 = undefined;
     if (SystemFunction036(&nonce, @intCast(nonce.len)) == 0) {
@@ -995,6 +1068,41 @@ test "Windows pipe namespaces distinguish users with the same username" {
     try std.testing.expect(!std.mem.eql(u8, first, second));
 }
 
+test "Windows isolated roots use distinct endpoint namespaces without rendezvous" {
+    const alloc = std.testing.allocator;
+    const first = try socketDirForConfiguredRoot(
+        alloc,
+        "S-1-5-21-100",
+        "C:\\zmx-quickchat-a",
+    );
+    defer alloc.free(first);
+    const second = try socketDirForConfiguredRoot(
+        alloc,
+        "S-1-5-21-100",
+        "C:\\zmx-quickchat-b",
+    );
+    defer alloc.free(second);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+
+    const first_endpoint = try joinEndpointPath(alloc, first, "same", max_pipe_name_utf16);
+    defer alloc.free(first_endpoint);
+    const second_endpoint = try joinEndpointPath(alloc, second, "same", max_pipe_name_utf16);
+    defer alloc.free(second_endpoint);
+    try std.testing.expect(!std.mem.eql(u8, first_endpoint, second_endpoint));
+}
+
+test "Windows default root retains the legacy deterministic endpoint namespace" {
+    const alloc = std.testing.allocator;
+    const directory = try socketDirForSid(alloc, "S-1-5-21-100");
+    defer alloc.free(directory);
+    const endpoint = try joinEndpointPath(alloc, directory, "same", max_pipe_name_utf16);
+    defer alloc.free(endpoint);
+    try std.testing.expectEqualStrings(
+        "\\\\.\\pipe\\zmx-S-1-5-21-100\\same",
+        endpoint,
+    );
+}
+
 test "Windows session endpoints recover with a fresh nonce" {
     const alloc = std.testing.allocator;
     const first = try nonceEndpointPath(alloc, "nonce-recovery");
@@ -1098,6 +1206,34 @@ test "Windows explicit ZMX_DIR isolates rendezvous and log roots" {
     try std.testing.expectEqualStrings(
         "C:\\zmx-quickchat-isolated\\logs",
         logs,
+    );
+}
+
+test "Windows configured root may use inherited ACLs while children are secured" {
+    const alloc = std.testing.allocator;
+    const base = try filesystemBase(alloc);
+    defer alloc.free(base);
+    const root = try std.fmt.allocPrint(alloc, "{s}\\zmx-inherited-root", .{base});
+    defer alloc.free(root);
+    const sid = try currentUserSid(alloc);
+    defer alloc.free(sid);
+    const user_dir = try std.fmt.allocPrint(alloc, "{s}\\ipc\\{s}", .{ root, sid });
+    defer alloc.free(user_dir);
+    const ipc_dir = try std.fmt.allocPrint(alloc, "{s}\\ipc", .{root});
+    defer alloc.free(ipc_dir);
+    std.Io.Dir.deleteDirAbsolute(std.testing.io, user_dir) catch {};
+    std.Io.Dir.deleteDirAbsolute(std.testing.io, ipc_dir) catch {};
+    std.Io.Dir.deleteDirAbsolute(std.testing.io, root) catch {};
+    try std.Io.Dir.createDirAbsolute(std.testing.io, root, .default_dir);
+    defer std.Io.Dir.deleteDirAbsolute(std.testing.io, user_dir) catch {};
+    defer std.Io.Dir.deleteDirAbsolute(std.testing.io, ipc_dir) catch {};
+    defer std.Io.Dir.deleteDirAbsolute(std.testing.io, root) catch {};
+
+    try ensureRendezvousDirectoryFor(
+        std.testing.io,
+        alloc,
+        "inherited-acl",
+        root,
     );
 }
 
