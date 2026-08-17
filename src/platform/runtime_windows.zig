@@ -409,6 +409,20 @@ fn openIpcGuard(alloc: std.mem.Allocator) Error!RootGuard {
     return openSecuredChildGuard(alloc, path);
 }
 
+fn createSecuredChildBoundToRoot(
+    alloc: std.mem.Allocator,
+    root_guard: ?RootGuard,
+    path: []const u8,
+) Error!RootGuard {
+    if (root_guard) |guard| try rootIdentityMatches(alloc, guard.path, guard.identity);
+    try ensureSecureDirectory(alloc, path);
+    var child_guard = try openSecuredChildGuard(alloc, path);
+    errdefer child_guard.close();
+    if (root_guard) |guard| try rootIdentityMatches(alloc, guard.path, guard.identity);
+    try verifySecuredChildGuard(alloc, child_guard);
+    return child_guard;
+}
+
 fn ensureConfiguredRoot(alloc: std.mem.Allocator, path: []const u8) Error!void {
     const path_w = try utf16Path(alloc, path);
     defer alloc.free(path_w);
@@ -653,10 +667,17 @@ pub fn ensureSecureDirectoryPath(
         defer lease_allocator.free(logs);
         if (std.mem.eql(u8, path, logs)) {
             try ensureConfiguredRoot(lease_allocator, root);
-            try ensureSecureDirectory(lease_allocator, path);
-            var guard = try openSecuredChildGuard(lease_allocator, path);
+            var root_guard = try openRootGuard(lease_allocator, root);
+            defer root_guard.close();
+            var guard = try createSecuredChildBoundToRoot(
+                lease_allocator,
+                root_guard,
+                path,
+            );
             defer guard.close();
-            return verifySecuredChildGuard(lease_allocator, guard);
+            try verifySecuredChildGuard(lease_allocator, guard);
+            try rootIdentityMatches(lease_allocator, root, root_guard.identity);
+            return;
         }
     }
     const parent = std.fs.path.dirname(path) orelse return error.AccessDenied;
@@ -889,12 +910,10 @@ fn ensureRendezvousDirectoryFor(
     } else {
         try ensureSecureDirectory(alloc, zmx_dir);
     }
-    try ensureSecureDirectory(alloc, base);
-    var base_guard = try openSecuredChildGuard(alloc, base);
+    var base_guard = try createSecuredChildBoundToRoot(alloc, root_guard, base);
     defer base_guard.close();
     if (root_guard) |guard| try rootIdentityMatches(alloc, root, guard.identity);
-    try ensureSecureDirectory(alloc, user_dir);
-    var user_guard = try openSecuredChildGuard(alloc, user_dir);
+    var user_guard = try createSecuredChildBoundToRoot(alloc, root_guard, user_dir);
     defer user_guard.close();
     if (root_guard) |guard| try rootIdentityMatches(alloc, root, guard.identity);
     try verifySecuredChildGuard(alloc, base_guard);
@@ -1749,6 +1768,55 @@ test "Windows private child replacement fails without decoy writes" {
             error.FileNotFound,
             std.Io.Dir.openDirAbsolute(std.testing.io, decoy_user, .{}),
         );
+    }
+}
+
+test "Windows logs replacement race never writes into a valid decoy" {
+    const alloc = std.testing.allocator;
+    const base = try filesystemBase(alloc);
+    defer alloc.free(base);
+    const root_a = try std.fmt.allocPrint(alloc, "{s}\\zmx-logs-race-a", .{base});
+    defer alloc.free(root_a);
+    const root_b = try std.fmt.allocPrint(alloc, "{s}\\zmx-logs-race-b", .{base});
+    defer alloc.free(root_b);
+    const logs_a = try std.fmt.allocPrint(alloc, "{s}\\logs", .{root_a});
+    defer alloc.free(logs_a);
+    const logs_b = try std.fmt.allocPrint(alloc, "{s}\\logs", .{root_b});
+    defer alloc.free(logs_b);
+    std.Io.Dir.deleteDirAbsolute(std.testing.io, logs_a) catch {};
+    std.Io.Dir.deleteDirAbsolute(std.testing.io, logs_b) catch {};
+    std.Io.Dir.deleteDirAbsolute(std.testing.io, root_a) catch {};
+    std.Io.Dir.deleteDirAbsolute(std.testing.io, root_b) catch {};
+    try std.Io.Dir.createDirAbsolute(std.testing.io, root_a, .default_dir);
+    try std.Io.Dir.createDirAbsolute(std.testing.io, root_b, .default_dir);
+    try setOwnerToCurrent(alloc, root_a);
+    try setOwnerToCurrent(alloc, root_b);
+    defer std.Io.Dir.deleteDirAbsolute(std.testing.io, logs_a) catch {};
+    defer std.Io.Dir.deleteDirAbsolute(std.testing.io, logs_b) catch {};
+    defer std.Io.Dir.deleteDirAbsolute(std.testing.io, root_a) catch {};
+    defer std.Io.Dir.deleteDirAbsolute(std.testing.io, root_b) catch {};
+
+    var root_b_guard = try openRootGuard(alloc, root_b);
+    defer root_b_guard.close();
+    var logs_b_guard = try createSecuredChildBoundToRoot(alloc, root_b_guard, logs_b);
+    defer logs_b_guard.close();
+    var root_a_guard = try openRootGuard(alloc, root_a);
+    defer root_a_guard.close();
+
+    const logs_a_w = try utf16Path(alloc, logs_a);
+    defer alloc.free(logs_a_w);
+    const logs_b_w = try utf16Path(alloc, logs_b);
+    defer alloc.free(logs_b_w);
+    if (CreateSymbolicLinkW(
+        logs_a_w.ptr,
+        logs_b_w.ptr,
+        symbolic_link_flag_directory | symbolic_link_flag_allow_unprivileged_create,
+    ) != 0) {
+        try std.testing.expectError(
+            error.AccessDenied,
+            createSecuredChildBoundToRoot(alloc, root_a_guard, logs_a),
+        );
+        try verifySecuredChildGuard(alloc, logs_b_guard);
     }
 }
 
