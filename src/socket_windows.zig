@@ -161,6 +161,9 @@ pub fn printSessionNameTooLong(
     writer.interface.flush() catch {};
 }
 
-pub fn maxSessionNameLen(_: []const u8) ?usize {
-    return runtime_windows.max_pipe_name_utf16 - runtime_windows.pipe_prefix.len - 2;
+pub fn maxSessionNameLen(socket_dir: []const u8) ?usize {
+    return runtime_windows.maxSessionNameLen(
+        socket_dir,
+        runtime_windows.max_pipe_name_utf16,
+    );
 }
