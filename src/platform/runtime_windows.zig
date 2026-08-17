@@ -680,8 +680,8 @@ pub fn ensureSecureDirectoryPath(
             errdefer guard.close();
             try verifySecuredChildGuard(lease_allocator, guard);
             try rootIdentityMatches(lease_allocator, root, root_guard.identity);
-            if (retained_logs_guard) |old_guard| old_guard.close();
-            if (retained_logs_root_guard) |old_guard| old_guard.close();
+            if (retained_logs_guard) |*old_guard| old_guard.close();
+            if (retained_logs_root_guard) |*old_guard| old_guard.close();
             retained_logs_root_guard = root_guard;
             retained_logs_guard = guard;
             root_guard = undefined;
@@ -703,7 +703,8 @@ pub fn verifyConfiguredLogsPath(path: []const u8) Error!void {
     if (!std.mem.eql(u8, parent, expected)) return error.AccessDenied;
     const current = try rootIdentityFromHandle(lease_allocator, root_guard.handle);
     if (!std.meta.eql(current, root_guard.identity)) return error.AccessDenied;
-    try verifySecuredChildGuard(lease_allocator, logs_guard);
+    const logs_identity = try rootIdentityFromHandle(lease_allocator, logs_guard.handle);
+    if (!std.meta.eql(logs_identity, logs_guard.identity)) return error.AccessDenied;
 }
 
 pub fn socketDirForSid(alloc: std.mem.Allocator, sid: []const u8) Error![]u8 {
