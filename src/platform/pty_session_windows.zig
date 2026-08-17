@@ -182,6 +182,7 @@ const Client = struct {
     history_cursor: u64 = 0,
     thread: ?std.Thread = null,
     writer_thread: ?std.Thread = null,
+    disconnect_thread: ?std.Thread = null,
     data_event: ?windows.HANDLE = null,
     space_event: ?windows.HANDLE = null,
     broadcast_refs: std.atomic.Value(usize) = .init(0),
@@ -514,6 +515,12 @@ fn sessionMain(session: *Session) void {
                 break :blk null;
             };
         }
+        if (client.thread != null and client.writer_thread != null) {
+            client.disconnect_thread = std.Thread.spawn(.{}, disconnectWatchMain, .{client}) catch blk: {
+                client.eject();
+                break :blk null;
+            };
+        }
     }
 }
 
@@ -533,6 +540,7 @@ fn reapClients(session: *Session) void {
         const client = found orelse return;
         if (client.thread) |thread| thread.join();
         if (client.writer_thread) |thread| thread.join();
+        if (client.disconnect_thread) |thread| thread.join();
         if (client.space_event) |event| {
             _ = kernel32.CloseHandle(event);
             client.space_event = null;
@@ -565,6 +573,7 @@ fn destroySession(session: *Session) void {
     for (clients) |client| {
         if (client.thread) |thread| thread.join();
         if (client.writer_thread) |thread| thread.join();
+        if (client.disconnect_thread) |thread| thread.join();
         if (client.space_event) |event| {
             _ = kernel32.CloseHandle(event);
             client.space_event = null;
@@ -1443,6 +1452,7 @@ fn writerMain(client: *Client) void {
             client.unlockOutput();
             return;
         }
+
         if (client.output.items.len == 0) {
             client.unlockOutput();
             if (client.data_event) |event| {
@@ -1461,6 +1471,29 @@ fn writerMain(client: *Client) void {
             client.eject();
             return;
         };
+    }
+}
+
+fn disconnectWatchMain(client: *Client) void {
+    while (!client.closed.load(.acquire)) {
+        var available: windows.DWORD = 0;
+        if (@intFromEnum(kernel32.PeekNamedPipe(
+            @ptrFromInt(client.connection.handle),
+            null,
+            0,
+            null,
+            &available,
+            null,
+        )) == 0) {
+            switch (windows.GetLastError()) {
+                .BROKEN_PIPE, .NO_DATA, .PIPE_NOT_CONNECTED, .INVALID_HANDLE => {
+                    client.eject();
+                    return;
+                },
+                else => {},
+            }
+        }
+        kernel32.Sleep(50);
     }
 }
 
