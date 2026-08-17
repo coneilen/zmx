@@ -61,6 +61,11 @@ extern "kernel32" fn CreateDirectoryW(
     path_name: windows.LPCWSTR,
     security_attributes: ?*windows.SECURITY_ATTRIBUTES,
 ) callconv(.winapi) c_int;
+extern "kernel32" fn CreateSymbolicLinkW(
+    symlink_file_name: windows.LPCWSTR,
+    target_file_name: windows.LPCWSTR,
+    flags: windows.DWORD,
+) callconv(.winapi) c_int;
 extern "kernel32" fn GetFileAttributesW(
     file_name: windows.LPCWSTR,
 ) callconv(.winapi) windows.DWORD;
@@ -129,6 +134,8 @@ const access_allowed_ace_type: u8 = 0;
 const file_all_access: windows.DWORD = 0x001f_01ff;
 const invalid_file_attributes: windows.DWORD = 0xffff_ffff;
 const file_attribute_reparse_point: windows.DWORD = 0x0000_0400;
+const symbolic_link_flag_directory: windows.DWORD = 0x0000_0001;
+const symbolic_link_flag_allow_unprivileged_create: windows.DWORD = 0x0000_0002;
 const system_sid = "S-1-5-18";
 /// Rendezvous records store the UTF-8 spelling of a pipe name. A valid
 /// endpoint is limited by UTF-16 units, and U+0800 is the worst-case BMP
@@ -240,6 +247,19 @@ fn rejectReparsePoint(alloc: std.mem.Allocator, path: []const u8) Error!void {
     const attributes = GetFileAttributesW(path_w.ptr);
     if (attributes == invalid_file_attributes) return error.AccessDenied;
     if ((attributes & file_attribute_reparse_point) != 0) return error.AccessDenied;
+}
+
+fn ensureConfiguredRoot(alloc: std.mem.Allocator, path: []const u8) Error!void {
+    const path_w = try utf16Path(alloc, path);
+    defer alloc.free(path_w);
+    if (CreateDirectoryW(path_w.ptr, null) == 0 and
+        windows.GetLastError() != .ALREADY_EXISTS)
+    {
+        return error.AccessDenied;
+    }
+    // Check after CreateDirectoryW: an existing path, or a path replaced by a
+    // reparse point during startup, must never be used for private children.
+    try rejectReparsePoint(alloc, path);
 }
 
 fn filesystemSddl(alloc: std.mem.Allocator) Error![:0]u16 {
@@ -446,7 +466,7 @@ pub fn ensureSecureDirectoryPath(
         const logs = try std.fmt.allocPrint(lease_allocator, "{s}\\logs", .{root});
         defer lease_allocator.free(logs);
         if (std.mem.eql(u8, path, logs)) {
-            try rejectReparsePoint(lease_allocator, root);
+            try ensureConfiguredRoot(lease_allocator, root);
             return ensureSecureDirectory(lease_allocator, path);
         }
     }
@@ -650,16 +670,17 @@ fn ensureRendezvousDirectoryFor(
     const user_dir = try std.fmt.allocPrint(alloc, "{s}\\{s}", .{ base, sid });
     defer alloc.free(user_dir);
 
-    try rejectReparsePoint(alloc, root);
     if (configured != null) {
         // ZMX_DIR is an operator-owned root; do not rewrite or require its
         // ACL. It must not be a reparse point before private children are used.
-        try rejectReparsePoint(alloc, zmx_dir);
+        try ensureConfiguredRoot(alloc, zmx_dir);
     } else {
         try ensureSecureDirectory(alloc, zmx_dir);
     }
     try ensureSecureDirectory(alloc, base);
+    if (configured != null) try rejectReparsePoint(alloc, root);
     try ensureSecureDirectory(alloc, user_dir);
+    if (configured != null) try rejectReparsePoint(alloc, root);
 }
 
 fn rendezvousRecordPath(
@@ -1235,6 +1256,60 @@ test "Windows configured root may use inherited ACLs while children are secured"
         "inherited-acl",
         root,
     );
+}
+
+test "Windows missing configured root is created with inherited ACLs" {
+    const alloc = std.testing.allocator;
+    const base = try filesystemBase(alloc);
+    defer alloc.free(base);
+    const root = try std.fmt.allocPrint(alloc, "{s}\\zmx-missing-root", .{base});
+    defer alloc.free(root);
+    const sid = try currentUserSid(alloc);
+    defer alloc.free(sid);
+    const user_dir = try std.fmt.allocPrint(alloc, "{s}\\ipc\\{s}", .{ root, sid });
+    defer alloc.free(user_dir);
+    const ipc_dir = try std.fmt.allocPrint(alloc, "{s}\\ipc", .{root});
+    defer alloc.free(ipc_dir);
+
+    std.Io.Dir.deleteDirAbsolute(std.testing.io, user_dir) catch {};
+    std.Io.Dir.deleteDirAbsolute(std.testing.io, ipc_dir) catch {};
+    std.Io.Dir.deleteDirAbsolute(std.testing.io, root) catch {};
+    defer std.Io.Dir.deleteDirAbsolute(std.testing.io, user_dir) catch {};
+    defer std.Io.Dir.deleteDirAbsolute(std.testing.io, ipc_dir) catch {};
+    defer std.Io.Dir.deleteDirAbsolute(std.testing.io, root) catch {};
+
+    try ensureRendezvousDirectoryFor(
+        std.testing.io,
+        alloc,
+        "missing-root",
+        root,
+    );
+}
+
+test "Windows configured reparse root is rejected" {
+    const alloc = std.testing.allocator;
+    const base = try filesystemBase(alloc);
+    defer alloc.free(base);
+    const target = try std.fmt.allocPrint(alloc, "{s}\\zmx-reparse-target", .{base});
+    defer alloc.free(target);
+    const link = try std.fmt.allocPrint(alloc, "{s}\\zmx-reparse-link", .{base});
+    defer alloc.free(link);
+    std.Io.Dir.deleteDirAbsolute(std.testing.io, link) catch {};
+    std.Io.Dir.deleteDirAbsolute(std.testing.io, target) catch {};
+    try std.Io.Dir.createDirAbsolute(std.testing.io, target, .default_dir);
+    defer std.Io.Dir.deleteDirAbsolute(std.testing.io, link) catch {};
+    defer std.Io.Dir.deleteDirAbsolute(std.testing.io, target) catch {};
+
+    const link_w = try utf16Path(alloc, link);
+    defer alloc.free(link_w);
+    const target_w = try utf16Path(alloc, target);
+    defer alloc.free(target_w);
+    if (CreateSymbolicLinkW(
+        link_w.ptr,
+        target_w.ptr,
+        symbolic_link_flag_directory | symbolic_link_flag_allow_unprivileged_create,
+    ) == 0) return;
+    try std.testing.expectError(error.AccessDenied, ensureConfiguredRoot(alloc, link));
 }
 
 test "Windows session lease excludes a second owner" {
