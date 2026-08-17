@@ -313,6 +313,9 @@ const RootGuard = struct {
     }
 };
 
+var retained_logs_root_guard: ?RootGuard = null;
+var retained_logs_guard: ?RootGuard = null;
+
 fn rootIdentityFromHandle(
     alloc: std.mem.Allocator,
     handle: windows.HANDLE,
@@ -668,21 +671,39 @@ pub fn ensureSecureDirectoryPath(
         if (std.mem.eql(u8, path, logs)) {
             try ensureConfiguredRoot(lease_allocator, root);
             var root_guard = try openRootGuard(lease_allocator, root);
-            defer root_guard.close();
+            errdefer root_guard.close();
             var guard = try createSecuredChildBoundToRoot(
                 lease_allocator,
                 root_guard,
                 path,
             );
-            defer guard.close();
+            errdefer guard.close();
             try verifySecuredChildGuard(lease_allocator, guard);
             try rootIdentityMatches(lease_allocator, root, root_guard.identity);
+            if (retained_logs_guard) |old_guard| old_guard.close();
+            if (retained_logs_root_guard) |old_guard| old_guard.close();
+            retained_logs_root_guard = root_guard;
+            retained_logs_guard = guard;
+            root_guard = undefined;
+            guard = undefined;
             return;
         }
     }
     const parent = std.fs.path.dirname(path) orelse return error.AccessDenied;
     try ensureSecureDirectory(lease_allocator, parent);
     try ensureSecureDirectory(lease_allocator, path);
+}
+
+pub fn verifyConfiguredLogsPath(path: []const u8) Error!void {
+    const root_guard = retained_logs_root_guard orelse return;
+    const logs_guard = retained_logs_guard orelse return error.AccessDenied;
+    const expected = try std.fmt.allocPrint(lease_allocator, "{s}\\logs", .{root_guard.path});
+    defer lease_allocator.free(expected);
+    const parent = std.fs.path.dirname(path) orelse return error.AccessDenied;
+    if (!std.mem.eql(u8, parent, expected)) return error.AccessDenied;
+    const current = try rootIdentityFromHandle(lease_allocator, root_guard.handle);
+    if (!std.meta.eql(current, root_guard.identity)) return error.AccessDenied;
+    try verifySecuredChildGuard(lease_allocator, logs_guard);
 }
 
 pub fn socketDirForSid(alloc: std.mem.Allocator, sid: []const u8) Error![]u8 {

@@ -1,6 +1,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const cross = if (builtin.os.tag == .windows) struct {} else @import("cross.zig");
+const windows_runtime = if (builtin.os.tag == .windows) @import("platform/runtime_windows.zig") else struct {};
 
 pub var log_system = LogSystem{};
 
@@ -31,6 +32,7 @@ pub const LogSystem = struct {
         self.io = io;
         self.path = path;
         self.mode = mode;
+        if (builtin.os.tag == .windows) try windows_runtime.verifyConfiguredLogsPath(path);
 
         const file = std.Io.Dir.openFileAbsolute(self.io, path, .{ .mode = .read_write }) catch |err| switch (err) {
             error.FileNotFound => try std.Io.Dir.createFileAbsolute(
@@ -41,6 +43,7 @@ pub const LogSystem = struct {
             else => return err,
         };
         errdefer std.Io.File.close(file, self.io);
+        if (builtin.os.tag == .windows) try windows_runtime.verifyConfiguredLogsPath(path);
 
         // Use lseek(SEEK_END) instead of length() + seekTo() to avoid a
         // TOCTOU race: after fork() the parent may still write to the log
@@ -113,6 +116,7 @@ pub const LogSystem = struct {
     }
 
     fn wipe(self: *LogSystem) !void {
+        if (builtin.os.tag == .windows) try windows_runtime.verifyConfiguredLogsPath(self.path);
         if (self.file) |f| {
             std.Io.File.close(f, self.io);
             self.file = null;
@@ -127,6 +131,7 @@ pub const LogSystem = struct {
                 .permissions = self.mode,
             },
         );
+        if (builtin.os.tag == .windows) try windows_runtime.verifyConfiguredLogsPath(self.path);
         self.current_size = 0;
     }
 };
