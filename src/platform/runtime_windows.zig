@@ -304,9 +304,12 @@ const RootIdentity = struct {
 const RootGuard = struct {
     handle: windows.HANDLE,
     identity: RootIdentity,
+    path: []u8,
+    allocator: std.mem.Allocator,
 
     fn close(self: *RootGuard) void {
         windows.CloseHandle(self.handle);
+        self.allocator.free(self.path);
     }
 };
 
@@ -360,9 +363,13 @@ fn openRootGuard(alloc: std.mem.Allocator, path: []const u8) Error!RootGuard {
         null,
     ) orelse return error.AccessDenied;
     errdefer windows.CloseHandle(handle);
+    const path_copy = try alloc.dupe(u8, path);
+    errdefer alloc.free(path_copy);
     return .{
         .handle = handle,
         .identity = try rootIdentityFromHandle(alloc, handle),
+        .path = path_copy,
+        .allocator = alloc,
     };
 }
 
@@ -751,9 +758,7 @@ fn verifyConfiguredRootGuard(
     guard: ?RootGuard,
 ) Error!void {
     if (guard) |value| {
-        const configured = try configuredZmxDir(alloc) orelse return error.AccessDenied;
-        defer alloc.free(configured);
-        try rootIdentityMatches(alloc, configured, value.identity);
+        try rootIdentityMatches(alloc, value.path, value.identity);
     }
 }
 
