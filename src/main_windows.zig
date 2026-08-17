@@ -1062,6 +1062,15 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     var cfg = try Cfg.init(gpa, io);
     defer cfg.deinit(gpa);
+    const log_path = try std.fmt.allocPrint(gpa, "{s}\\zmx.log", .{cfg.log_dir});
+    defer gpa.free(log_path);
+    try log.log_system.init(
+        io,
+        log_path,
+        @enumFromInt(cfg.log_mode),
+    );
+    defer log.log_system.deinit();
+    std.log.debug("Windows zmx logger initialized at {s}", .{log_path});
 
     var args = try init.minimal.args.iterateAllocator(gpa);
     defer args.deinit();
