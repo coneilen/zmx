@@ -341,7 +341,9 @@ fn rootIdentityFromHandle(
     defer _ = LocalFree(descriptor);
     const owner_sid = try sidStringFromPointer(alloc, owner.?);
     defer alloc.free(owner_sid);
-    if (owner_sid.len == 0) return error.AccessDenied;
+    const current_sid = try currentUserSid(alloc);
+    defer alloc.free(current_sid);
+    if (!std.mem.eql(u8, owner_sid, current_sid)) return error.AccessDenied;
 
     return .{
         .volume_serial_number = information.volume_serial_number,
@@ -383,18 +385,61 @@ fn rootIdentityMatches(
     if (!std.meta.eql(guard.identity, expected)) return error.AccessDenied;
 }
 
+fn openSecuredChildGuard(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+) Error!RootGuard {
+    var guard = try openRootGuard(alloc, path);
+    errdefer guard.close();
+    try verifyFilesystemSecurity(alloc, path);
+    return guard;
+}
+
+fn verifySecuredChildGuard(
+    alloc: std.mem.Allocator,
+    guard: RootGuard,
+) Error!void {
+    try rootIdentityMatches(alloc, guard.path, guard.identity);
+    try verifyFilesystemSecurity(alloc, guard.path);
+}
+
 fn ensureConfiguredRoot(alloc: std.mem.Allocator, path: []const u8) Error!void {
     const path_w = try utf16Path(alloc, path);
     defer alloc.free(path_w);
-    if (CreateDirectoryW(path_w.ptr, null) == 0 and
-        windows.GetLastError() != .ALREADY_EXISTS)
-    {
-        return error.AccessDenied;
+    var created = true;
+    if (CreateDirectoryW(path_w.ptr, null) == 0) {
+        if (windows.GetLastError() != .ALREADY_EXISTS) return error.AccessDenied;
+        created = false;
+    }
+    if (created) {
+        try setOwnerToCurrent(alloc, path);
     }
     // Check after CreateDirectoryW: an existing path, or a path replaced by a
     // reparse point during startup, must never be used for private children.
     var guard = try openRootGuard(alloc, path);
     guard.close();
+}
+
+fn setOwnerToCurrent(alloc: std.mem.Allocator, path: []const u8) Error!void {
+    const sid = try currentUserSid(alloc);
+    defer alloc.free(sid);
+    const sddl = try std.fmt.allocPrint(alloc, "O:{s}G:SYD:", .{sid});
+    defer alloc.free(sddl);
+    const sddl_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, sddl) catch return error.AccessDenied;
+    defer alloc.free(sddl_w);
+    var descriptor: ?*anyopaque = null;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl_w.ptr,
+        security_descriptor_revision,
+        &descriptor,
+        null,
+    ) == 0) return error.AccessDenied;
+    defer _ = LocalFree(descriptor);
+    const path_w = try utf16Path(alloc, path);
+    defer alloc.free(path_w);
+    if (SetFileSecurityW(path_w.ptr, owner_security_information, descriptor.?) == 0) {
+        return error.AccessDenied;
+    }
 }
 
 fn filesystemSddl(alloc: std.mem.Allocator) Error![:0]u16 {
@@ -602,7 +647,10 @@ pub fn ensureSecureDirectoryPath(
         defer lease_allocator.free(logs);
         if (std.mem.eql(u8, path, logs)) {
             try ensureConfiguredRoot(lease_allocator, root);
-            return ensureSecureDirectory(lease_allocator, path);
+            try ensureSecureDirectory(lease_allocator, path);
+            var guard = try openSecuredChildGuard(lease_allocator, path);
+            defer guard.close();
+            return verifySecuredChildGuard(lease_allocator, guard);
         }
     }
     const parent = std.fs.path.dirname(path) orelse return error.AccessDenied;
@@ -836,9 +884,15 @@ fn ensureRendezvousDirectoryFor(
         try ensureSecureDirectory(alloc, zmx_dir);
     }
     try ensureSecureDirectory(alloc, base);
+    var base_guard = try openSecuredChildGuard(alloc, base);
+    defer base_guard.close();
     if (root_guard) |guard| try rootIdentityMatches(alloc, root, guard.identity);
     try ensureSecureDirectory(alloc, user_dir);
+    var user_guard = try openSecuredChildGuard(alloc, user_dir);
+    defer user_guard.close();
     if (root_guard) |guard| try rootIdentityMatches(alloc, root, guard.identity);
+    try verifySecuredChildGuard(alloc, base_guard);
+    try verifySecuredChildGuard(alloc, user_guard);
 }
 
 fn rendezvousRecordPath(
@@ -892,6 +946,10 @@ pub fn acquireSessionLease(
         else => return error.AccessDenied,
     };
     defer if (root_guard) |*guard| guard.close();
+    const child_path = rendezvousDirectory(lease_allocator, session_name) catch return error.AccessDenied;
+    defer lease_allocator.free(child_path);
+    var child_guard = openSecuredChildGuard(lease_allocator, child_path) catch return error.AccessDenied;
+    defer child_guard.close();
 
     var created = true;
     const file = std.Io.Dir.createFileAbsolute(io, path, .{
@@ -936,6 +994,10 @@ pub fn acquireSessionLease(
         file.close(io);
         return error.AccessDenied;
     };
+    verifySecuredChildGuard(lease_allocator, child_guard) catch {
+        file.close(io);
+        return error.AccessDenied;
+    };
 
     const lease = lease_allocator.create(SessionLease) catch {
         file.close(io);
@@ -964,6 +1026,10 @@ pub fn publishEndpoint(
     try ensureRendezvousDirectory(io, alloc, session_name);
     var root_guard = try openConfiguredRootGuard(alloc);
     defer if (root_guard) |*guard| guard.close();
+    const child_path = try rendezvousDirectory(alloc, session_name);
+    defer alloc.free(child_path);
+    var child_guard = try openSecuredChildGuard(alloc, child_path);
+    defer child_guard.close();
     var record = std.Io.Dir.createFileAbsolute(io, record_path, .{
         .read = true,
         .exclusive = true,
@@ -985,6 +1051,7 @@ pub fn publishEndpoint(
     };
     record.writeStreamingAll(io, endpoint) catch return error.AccessDenied;
     try verifyConfiguredRootGuard(alloc, root_guard);
+    try verifySecuredChildGuard(alloc, child_guard);
     keep_record = true;
 }
 
@@ -1001,11 +1068,16 @@ pub fn replaceEndpoint(
     defer alloc.free(record_path);
     var root_guard = try openConfiguredRootGuard(alloc);
     defer if (root_guard) |*guard| guard.close();
+    const child_path = try rendezvousDirectory(alloc, session_name);
+    defer alloc.free(child_path);
+    var child_guard = try openSecuredChildGuard(alloc, child_path);
+    defer child_guard.close();
     std.Io.Dir.deleteFileAbsolute(io, record_path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return error.AccessDenied,
     };
     try verifyConfiguredRootGuard(alloc, root_guard);
+    try verifySecuredChildGuard(alloc, child_guard);
     return publishEndpoint(io, alloc, session_name, endpoint);
 }
 
@@ -1018,8 +1090,13 @@ pub fn cleanupRendezvous(
     defer alloc.free(record_path);
     var root_guard = openConfiguredRootGuard(alloc) catch return;
     defer if (root_guard) |*guard| guard.close();
+    const child_path = rendezvousDirectory(alloc, session_name) catch return;
+    defer alloc.free(child_path);
+    var child_guard = openSecuredChildGuard(alloc, child_path) catch return;
+    defer child_guard.close();
     std.Io.Dir.deleteFileAbsolute(io, record_path) catch {};
     verifyConfiguredRootGuard(alloc, root_guard) catch {};
+    verifySecuredChildGuard(alloc, child_guard) catch {};
 }
 
 /// Remove a rendezvous record only when it still names the endpoint owned by
@@ -1039,8 +1116,13 @@ pub fn cleanupRendezvousIfOwned(
     defer alloc.free(record_path);
     var root_guard = openConfiguredRootGuard(alloc) catch return;
     defer if (root_guard) |*guard| guard.close();
+    const child_path = rendezvousDirectory(alloc, session_name) catch return;
+    defer alloc.free(child_path);
+    var child_guard = openSecuredChildGuard(alloc, child_path) catch return;
+    defer child_guard.close();
     std.Io.Dir.deleteFileAbsolute(io, record_path) catch {};
     verifyConfiguredRootGuard(alloc, root_guard) catch {};
+    verifySecuredChildGuard(alloc, child_guard) catch {};
 }
 
 pub fn hasRendezvous(
@@ -1051,6 +1133,10 @@ pub fn hasRendezvous(
     try ensureRendezvousDirectory(io, alloc, session_name);
     var root_guard = try openConfiguredRootGuard(alloc);
     defer if (root_guard) |*guard| guard.close();
+    const child_path = try rendezvousDirectory(alloc, session_name);
+    defer alloc.free(child_path);
+    var child_guard = try openSecuredChildGuard(alloc, child_path);
+    defer child_guard.close();
     const record_path = try rendezvousRecordPath(alloc, session_name);
     defer alloc.free(record_path);
     var record = std.Io.Dir.openFileAbsolute(io, record_path, .{ .mode = .read_only }) catch |err| switch (err) {
@@ -1060,6 +1146,7 @@ pub fn hasRendezvous(
     record.close(io);
     try verifyFilesystemSecurity(alloc, record_path);
     try verifyConfiguredRootGuard(alloc, root_guard);
+    try verifySecuredChildGuard(alloc, child_guard);
     return true;
 }
 
@@ -1079,6 +1166,10 @@ pub fn listSessionNames(
     try ensureRendezvousDirectory(io, alloc, "list");
     var root_guard = try openConfiguredRootGuard(alloc);
     defer if (root_guard) |*guard| guard.close();
+    const child_path = try rendezvousDirectory(alloc, "list");
+    defer alloc.free(child_path);
+    var child_guard = try openSecuredChildGuard(alloc, child_path);
+    defer child_guard.close();
     const directory = try rendezvousDirectory(alloc, "list");
     defer alloc.free(directory);
     var dir = std.Io.Dir.openDirAbsolute(io, directory, .{ .iterate = true }) catch |err| switch (err) {
@@ -1109,6 +1200,7 @@ pub fn listSessionNames(
         };
     }
     try verifyConfiguredRootGuard(alloc, root_guard);
+    try verifySecuredChildGuard(alloc, child_guard);
     return result;
 }
 
@@ -1124,6 +1216,10 @@ pub fn resolveEndpointPath(
     try ensureRendezvousDirectory(io, alloc, session_name);
     var root_guard = try openConfiguredRootGuard(alloc);
     defer if (root_guard) |*guard| guard.close();
+    const child_path = try rendezvousDirectory(alloc, session_name);
+    defer alloc.free(child_path);
+    var child_guard = try openSecuredChildGuard(alloc, child_path);
+    defer child_guard.close();
     const record_path = rendezvousRecordPath(alloc, session_name) catch {
         try verifyConfiguredRootGuard(alloc, root_guard);
         return endpointPath(alloc, session_name);
@@ -1162,6 +1258,7 @@ pub fn resolveEndpointPath(
     defer alloc.free(endpoint_w);
     if (endpoint_w.len >= max_pipe_name_utf16) return error.InvalidRecord;
     try verifyConfiguredRootGuard(alloc, root_guard);
+    try verifySecuredChildGuard(alloc, child_guard);
     return alloc.dupe(u8, endpoint);
 }
 
@@ -1443,6 +1540,7 @@ test "Windows configured root may use inherited ACLs while children are secured"
     std.Io.Dir.deleteDirAbsolute(std.testing.io, ipc_dir) catch {};
     std.Io.Dir.deleteDirAbsolute(std.testing.io, root) catch {};
     try std.Io.Dir.createDirAbsolute(std.testing.io, root, .default_dir);
+    try setOwnerToCurrent(alloc, root);
     defer std.Io.Dir.deleteDirAbsolute(std.testing.io, user_dir) catch {};
     defer std.Io.Dir.deleteDirAbsolute(std.testing.io, ipc_dir) catch {};
     defer std.Io.Dir.deleteDirAbsolute(std.testing.io, root) catch {};
@@ -1459,7 +1557,9 @@ test "Windows missing configured root is created with inherited ACLs" {
     const alloc = std.testing.allocator;
     const base = try filesystemBase(alloc);
     defer alloc.free(base);
-    const root = try std.fmt.allocPrint(alloc, "{s}\\zmx-missing-root", .{base});
+    const parent = try std.fmt.allocPrint(alloc, "{s}\\zmx-missing-parent", .{base});
+    defer alloc.free(parent);
+    const root = try std.fmt.allocPrint(alloc, "{s}\\child", .{parent});
     defer alloc.free(root);
     const sid = try currentUserSid(alloc);
     defer alloc.free(sid);
@@ -1471,9 +1571,13 @@ test "Windows missing configured root is created with inherited ACLs" {
     std.Io.Dir.deleteDirAbsolute(std.testing.io, user_dir) catch {};
     std.Io.Dir.deleteDirAbsolute(std.testing.io, ipc_dir) catch {};
     std.Io.Dir.deleteDirAbsolute(std.testing.io, root) catch {};
+    std.Io.Dir.deleteDirAbsolute(std.testing.io, parent) catch {};
+    try std.Io.Dir.createDirAbsolute(std.testing.io, parent, .default_dir);
+    try setOwnerToCurrent(alloc, parent);
     defer std.Io.Dir.deleteDirAbsolute(std.testing.io, user_dir) catch {};
     defer std.Io.Dir.deleteDirAbsolute(std.testing.io, ipc_dir) catch {};
     defer std.Io.Dir.deleteDirAbsolute(std.testing.io, root) catch {};
+    defer std.Io.Dir.deleteDirAbsolute(std.testing.io, parent) catch {};
 
     try ensureRendezvousDirectoryFor(
         std.testing.io,
@@ -1548,6 +1652,58 @@ test "Windows replacement race never writes private children into a decoy root" 
         try std.testing.expectError(
             error.FileNotFound,
             std.Io.Dir.openDirAbsolute(std.testing.io, decoy_ipc, .{}),
+        );
+    }
+}
+
+test "Windows private child replacement fails without decoy writes" {
+    const alloc = std.testing.allocator;
+    const base = try filesystemBase(alloc);
+    defer alloc.free(base);
+    const root = try std.fmt.allocPrint(alloc, "{s}\\zmx-child-race", .{base});
+    defer alloc.free(root);
+    const decoy = try std.fmt.allocPrint(alloc, "{s}\\zmx-child-decoy", .{base});
+    defer alloc.free(decoy);
+    const ipc = try std.fmt.allocPrint(alloc, "{s}\\ipc", .{root});
+    defer alloc.free(ipc);
+    const sid = try currentUserSid(alloc);
+    defer alloc.free(sid);
+    const user = try std.fmt.allocPrint(alloc, "{s}\\{s}", .{ ipc, sid });
+    defer alloc.free(user);
+    const logs = try std.fmt.allocPrint(alloc, "{s}\\logs", .{root});
+    defer alloc.free(logs);
+    const decoy_user = try std.fmt.allocPrint(alloc, "{s}\\{s}", .{ decoy, sid });
+    defer alloc.free(decoy_user);
+    std.Io.Dir.deleteDirAbsolute(std.testing.io, user) catch {};
+    std.Io.Dir.deleteDirAbsolute(std.testing.io, ipc) catch {};
+    std.Io.Dir.deleteDirAbsolute(std.testing.io, logs) catch {};
+    std.Io.Dir.deleteDirAbsolute(std.testing.io, decoy) catch {};
+    std.Io.Dir.deleteDirAbsolute(std.testing.io, root) catch {};
+    try std.Io.Dir.createDirAbsolute(std.testing.io, root, .default_dir);
+    try setOwnerToCurrent(alloc, root);
+    try std.Io.Dir.createDirAbsolute(std.testing.io, decoy, .default_dir);
+    defer std.Io.Dir.deleteDirAbsolute(std.testing.io, root) catch {};
+    defer std.Io.Dir.deleteDirAbsolute(std.testing.io, decoy) catch {};
+
+    try ensureRendezvousDirectoryFor(std.testing.io, alloc, "child-race", root);
+    std.Io.Dir.deleteDirAbsolute(std.testing.io, user) catch {};
+    std.Io.Dir.deleteDirAbsolute(std.testing.io, ipc) catch {};
+    const ipc_w = try utf16Path(alloc, ipc);
+    defer alloc.free(ipc_w);
+    const decoy_w = try utf16Path(alloc, decoy);
+    defer alloc.free(decoy_w);
+    if (CreateSymbolicLinkW(
+        ipc_w.ptr,
+        decoy_w.ptr,
+        symbolic_link_flag_directory | symbolic_link_flag_allow_unprivileged_create,
+    ) != 0) {
+        try std.testing.expectError(
+            error.AccessDenied,
+            ensureRendezvousDirectoryFor(std.testing.io, alloc, "child-race", root),
+        );
+        try std.testing.expectError(
+            error.FileNotFound,
+            std.Io.Dir.openDirAbsolute(std.testing.io, decoy_user, .{}),
         );
     }
 }
