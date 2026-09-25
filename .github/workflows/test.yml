@@ -47,7 +47,7 @@ jobs:
           $env:ZMX_DIR = Join-Path ([IO.Path]::GetTempPath()) ("zx" + [guid]::NewGuid().ToString('N').Substring(0,8))
           New-Item -ItemType Directory -Path $env:ZMX_DIR | Out-Null
           $env:ZMX_SESSION_PREFIX = 'ci-'
-          $target = if ($IsWindows) { @('-Dtarget=x86_64-windows-gnu') } else { @() }
+          [string[]]$target = if ($IsWindows) { @('-Dtarget=x86_64-windows-gnu') } else { @() }
           zig build @target
           if ($LASTEXITCODE -ne 0) { throw 'Native build failed' }
           zig build test @target --summary all
@@ -74,6 +74,9 @@ jobs:
         run: |
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             export PATH="$(brew --prefix coreutils)/libexec/gnubin:$PATH"
+            if ! command -v timeout >/dev/null 2>&1; then
+              brew install coreutils
+            fi
           fi
           command -v timeout
           .bats/bin/bats test
