@@ -47,6 +47,14 @@ record before releasing the session lease, while replacement records are
 preserved by an ownership comparison. Lease files remain at one stable path
 and only their exclusive byte-range lock is released, preventing a
 release/reacquire race from splitting ownership across file identities.
+Readiness clients may connect and close before ConPTY starts accepting.
+`ERROR_NO_DATA`/`ERROR_BROKEN_PIPE` from that accept is a transient peer
+disconnect, not a reason to destroy the session. Once the operation settles,
+the listener disconnects and rearms the same pipe instance. Timeout/cancellation
+recovery creates the next instance before closing the previous one, preserving
+connect-before-accept behavior without briefly removing the endpoint. Shutdown
+remains serialized with recovery, and recovery failures propagate to the
+caller. An idle retry blocks in the next overlapped accept.
 `ERROR_SEM_TIMEOUT` and `ERROR_PIPE_BUSY` from a named-pipe probe mean that
 the endpoint is live or busy and must never trigger stale-record deletion.
 `events_windows.zig` waits on overlapped completion events plus a manual-reset

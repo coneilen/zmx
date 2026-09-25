@@ -90,6 +90,34 @@ Be sure to add `~/.local/bin` to your `PATH`:
 zig build -Doptimize=ReleaseSafe --prefix ~/.local
 ```
 
+## testing
+
+Build and run native unit tests with Zig 0.16.0:
+
+```sh
+zig build
+zig build test
+```
+
+On Windows, the startup regressions exercise a real named-pipe disconnect
+before ConPTY creation, listener recovery, and subsequent session requests:
+
+```powershell
+zig build -Dtarget=x86_64-windows-gnu
+zig build test -Dtarget=x86_64-windows-gnu "-Dtest-filter=Windows startup"
+pwsh -NoProfile -File .\test\windows-startup.ps1
+```
+
+The PowerShell test runs three real default `cmd.exe` sessions, verifies shell
+state and backend identity across detach/reattach, and bounds all descendants
+with an owned Windows job. It uses isolated short temporary roots and no
+visible windows. Logs and process-ownership evidence stay in a temporary results
+directory; `-ArtifactsDirectory <path>` selects another local location.
+Detach is checked by process exit; captured stdio is drained after daemon
+shutdown because a daemon can retain inherited stream handles.
+On Linux/macOS, `bats test` runs the existing session tests (requires `timeout`,
+provided by GNU coreutils on macOS).
+
 ## usage
 
 > [!IMPORTANT]

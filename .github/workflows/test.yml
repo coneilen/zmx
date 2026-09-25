@@ -1,0 +1,77 @@
+name: Native tests
+
+on:
+  pull_request:
+    branches: [graphcode-quickchat-hang]
+  push:
+    branches: [graphcode-quickchat-hang]
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install verified Zig 0.16.0
+        shell: pwsh
+        run: |
+          $platform = if ($IsWindows) { 'x86_64-windows' } elseif ($IsLinux) { 'x86_64-linux' } elseif ($env:RUNNER_ARCH -eq 'ARM64') { 'aarch64-macos' } else { 'x86_64-macos' }
+          $hashes = @{
+            'x86_64-windows' = '68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e'
+            'x86_64-linux' = '70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00'
+            'aarch64-macos' = 'b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489'
+            'x86_64-macos' = '0387557ed1877bc6a2e1802c8391953baddba76081876301c522f52977b52ba7'
+          }
+          $extension = if ($IsWindows) { 'zip' } else { 'tar.xz' }
+          $name = "zig-$platform-0.16.0"
+          $archive = Join-Path $env:RUNNER_TEMP "$name.$extension"
+          Invoke-WebRequest "https://ziglang.org/download/0.16.0/$name.$extension" -OutFile $archive
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash -ine $hashes[$platform]) { throw 'Zig archive hash mismatch' }
+          tar -xf $archive -C $env:RUNNER_TEMP
+          if ($LASTEXITCODE -ne 0) { throw 'Zig extraction failed' }
+          (Join-Path $env:RUNNER_TEMP $name) | Out-File -FilePath $env:GITHUB_PATH -Append
+      - name: Build and native unit tests
+        shell: pwsh
+        run: |
+          $env:ZMX_DIR = Join-Path ([IO.Path]::GetTempPath()) ("zx" + [guid]::NewGuid().ToString('N').Substring(0,8))
+          New-Item -ItemType Directory -Path $env:ZMX_DIR | Out-Null
+          $env:ZMX_SESSION_PREFIX = 'ci-'
+          $target = if ($IsWindows) { @('-Dtarget=x86_64-windows-gnu') } else { @() }
+          zig build @target
+          if ($LASTEXITCODE -ne 0) { throw 'Native build failed' }
+          zig build test @target --summary all
+          if ($LASTEXITCODE -ne 0) { throw 'Native tests failed' }
+          zig fmt --check build.zig src/platform/local_ipc_windows.zig src/platform/pty_session_windows.zig
+          if ($LASTEXITCODE -ne 0) { throw 'Formatting check failed' }
+      - name: Real Windows startup and state continuity
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./test/windows-startup.ps1
+      - name: Get existing BATS framework
+        if: runner.os != 'Windows'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: bats-core/bats-core
+          ref: 3bca150ec86275d6d9d5a4fd7d48ab8b6c6f3d87 # v1.13.0
+          path: .bats
+          persist-credentials: false
+      - name: Existing POSIX session tests
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            export PATH="$(brew --prefix coreutils)/libexec/gnubin:$PATH"
+          fi
+          command -v timeout
+          .bats/bin/bats test
