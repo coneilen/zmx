@@ -67,6 +67,7 @@ pub fn build(b: *std.Build) void {
     // Test
     {
         const test_step = b.step("test", "Run unit tests");
+        const test_filters = b.option([]const []const u8, "test-filter", "Only run tests matching these names") orelse &.{};
         const test_module = b.addModule("test", .{
             .root_source_file = b.path("src/test.zig"),
             .target = target,
@@ -76,6 +77,7 @@ pub fn build(b: *std.Build) void {
         test_module.addImport("ghostty-vt", dep.module("ghostty-vt"));
         const exe_unit_tests = b.addTest(.{
             .root_module = test_module,
+            .filters = test_filters,
             // .use_llvm = true,
             // .use_lld = !is_macos,
         });

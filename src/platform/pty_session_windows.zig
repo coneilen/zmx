@@ -451,9 +451,10 @@ fn sessionMain(session: *Session) void {
             @import("events_windows.zig").Deadline.afterMs(250),
             null,
         ) catch |err| switch (err) {
-            error.Timeout => continue,
+            error.Timeout, error.BrokenPipe, error.ConnectionResetByPeer => continue,
             error.AlreadyClosed => break,
             else => {
+                std.log.err("session accept failed: {s}", .{@errorName(err)});
                 session.alive.store(false, .release);
                 break;
             },
@@ -2065,6 +2066,68 @@ fn cwdMutationWorker(probe: *CwdMutationProbe) void {
 }
 
 fn testConnectionClose(_: local_ipc.Handle) void {}
+
+test "Windows startup probe disconnect before ConPTY creation preserves a working session" {
+    const native = struct {
+        extern "kernel32" fn OpenProcess(access: windows.DWORD, inherit: c_int, pid: windows.DWORD) callconv(.winapi) ?windows.HANDLE;
+        extern "kernel32" fn TerminateProcess(process: windows.HANDLE, code: windows.UINT) callconv(.winapi) c_int;
+    };
+    const alloc = std.testing.allocator;
+    const name = "zmx-startup-conpty";
+    var server = try local_ipc_windows.listenSession(std.testing.io, alloc, name, .{});
+    defer server.close();
+    const endpoint = try runtime_windows.resolveEndpointPath(std.testing.io, alloc, name);
+    defer alloc.free(endpoint);
+    var probe = try local_ipc_windows.connect(alloc, .{ .name = endpoint });
+    probe.close();
+
+    const session = try createSession(.{
+        .io = std.testing.io,
+        .alloc = alloc,
+        .session_name = name,
+        .shell = "cmd.exe",
+    }, server);
+    var running = false;
+    defer if (!running) {
+        session.runtime.signal(session.process, .kill) catch unreachable;
+        destroySession(session);
+    };
+    const backend_pid: windows.DWORD = @intCast(session.process);
+    const backend = native.OpenProcess(0x0010_0001, 0, backend_pid) orelse return error.OpenProcessFailed;
+    defer windows.CloseHandle(backend);
+    const thread = try std.Thread.spawn(.{}, sessionMain, .{session});
+    running = true;
+    defer {
+        // The retained process handle cannot target a recycled PID, even on RED.
+        if (kernel32.WaitForSingleObject(backend, 0) == 0x102) {
+            std.debug.assert(native.TerminateProcess(backend, 137) != 0);
+        }
+        server.close();
+        thread.join();
+    }
+
+    const deadline = session_windows.Deadline.afterMs(5000);
+    var connection = try local_ipc_windows.connectWithDeadline(alloc, .{ .name = endpoint }, deadline, null);
+    defer connection.close();
+    try wire.writeFrame(connection, .Info, "");
+    var info_frame = try session_windows.readFrameWithDeadline(alloc, connection, deadline, null);
+    defer info_frame.deinit(alloc);
+    try std.testing.expectEqual(wire.Tag.Info, info_frame.header.tag);
+    try std.testing.expectEqual(@sizeOf(wire.Info), info_frame.payload.len);
+    const info = std.mem.bytesToValue(wire.Info, info_frame.payload);
+    try std.testing.expectEqual(backend_pid, @as(windows.DWORD, @intCast(info.pid)));
+    try std.testing.expectEqual(@as(windows.DWORD, 0x102), kernel32.WaitForSingleObject(backend, 0));
+
+    try wire.writeFrame(connection, .LabelSet, "startup=survived");
+    var ack = try session_windows.readFrameWithDeadline(alloc, connection, deadline, null);
+    defer ack.deinit(alloc);
+    try std.testing.expectEqual(wire.Tag.Ack, ack.header.tag);
+    try wire.writeFrame(connection, .LabelGet, "");
+    var labels = try session_windows.readFrameWithDeadline(alloc, connection, deadline, null);
+    defer labels.deinit(alloc);
+    try std.testing.expectEqual(wire.Tag.LabelData, labels.header.tag);
+    try std.testing.expectEqualStrings("startup=survived", labels.payload);
+}
 
 test "Windows PTY session provider exposes the frozen provider shape" {
     const value = provider();

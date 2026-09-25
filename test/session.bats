@@ -31,6 +31,8 @@ load test_helper
 @test "run: sends command to existing session" {
   "$ZMX" run test-send -d echo first
   wait_for_session test-send
+  run timeout 5 "$ZMX" wait test-send
+  [ "$status" -eq 0 ]
 
   run "$ZMX" run test-send -d echo second
   [ "$status" -eq 0 ]

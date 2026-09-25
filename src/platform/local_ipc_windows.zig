@@ -30,6 +30,7 @@ const generic_read: windows.DWORD = 0x8000_0000;
 const generic_write: windows.DWORD = 0x4000_0000;
 const open_existing: windows.DWORD = 3;
 const infinite: windows.DWORD = 0xffff_ffff;
+var test_pipe_creations = if (builtin.is_test) std.atomic.Value(usize).init(0) else {};
 
 fn winBool(comptime T: type, value: bool) T {
     return switch (@typeInfo(T)) {
@@ -249,6 +250,7 @@ fn createPipe(
     if (pipe == windows.INVALID_HANDLE_VALUE) {
         return mapLastError(windows.GetLastError());
     }
+    if (builtin.is_test) _ = test_pipe_creations.fetchAdd(1, .monotonic);
     return pipe;
 }
 
@@ -676,12 +678,13 @@ fn acceptWithDeadline(
         switch (windows.GetLastError()) {
             .PIPE_CONNECTED => {},
             .IO_PENDING => awaitCompletion(pipe, &overlapped, event, deadline, cancellation) catch |err| {
-                resetPipe(state, pipe);
+                try resetPipe(state, pipe, err);
                 return err;
             },
             else => |err| {
-                resetPipe(state, pipe);
-                return mapLastError(err);
+                const accept_error = mapLastError(err);
+                try resetPipe(state, pipe, accept_error);
+                return accept_error;
             },
         }
     }
@@ -732,28 +735,26 @@ fn finishAccept(state: *ServerState) void {
     state.unlock();
 }
 
-fn resetPipe(state: *ServerState, pipe: windows.HANDLE) void {
+fn resetPipe(state: *ServerState, pipe: windows.HANDLE, accept_error: Error) Error!void {
     state.lock();
-    const replace = !state.closed and state.pipe == pipe;
-    // Once shutdown has claimed this handle, the close path is its sole
-    // owner. In particular, a cancelled accept must not close a handle that
-    // closeServerThunk will close after the in-flight barrier.
-    const close_owns_pipe = state.closed and state.closing_pipe == pipe;
-    if (replace) state.pipe = null;
-    state.unlock();
-    if (close_owns_pipe) return;
-    _ = DisconnectNamedPipe(pipe);
-    windows.CloseHandle(pipe);
-    if (!replace) return;
-    const replacement = createPipe(state.allocator, state.name, state.policy, false) catch null;
-    if (replacement) |new_pipe| {
-        state.lock();
-        if (state.closed or state.pipe != null) {
-            state.unlock();
-            windows.CloseHandle(new_pipe);
-        } else {
-            state.pipe = new_pipe;
-            state.unlock();
+    defer state.unlock();
+    if (state.closed or state.pipe != pipe) return error.AlreadyClosed;
+    if (accept_error != error.BrokenPipe and accept_error != error.ConnectionResetByPeer) {
+        // A cancelled/timed-out accept must also allow connect-before-accept.
+        // Publish its replacement before closing the last existing instance.
+        const replacement = try createPipe(state.allocator, state.name, state.policy, false);
+        state.pipe = replacement;
+        _ = DisconnectNamedPipe(pipe);
+        windows.CloseHandle(pipe);
+        return;
+    }
+    // The accept has completed (including cancellation). Reuse its instance:
+    // closing the last pipe would briefly unpublish an otherwise live endpoint.
+    // Keep shutdown serialized with disconnect; it remains the handle owner.
+    if (DisconnectNamedPipe(pipe) == 0) {
+        switch (windows.GetLastError()) {
+            .PIPE_NOT_CONNECTED => {},
+            else => |err| return mapLastError(err),
         }
     }
 }
@@ -981,6 +982,80 @@ test "Windows IPC keeps endpoint validation separate from wire framing" {
     const endpoint = local_ipc.Endpoint{ .name = "session-\u{1F600}" };
     try runtime_windows.validateSessionName(endpoint.name);
     try std.testing.expect(endpoint.name.len > 0);
+}
+
+test "Windows startup probe disconnect reports NO_DATA and preserves the listener instance" {
+    const alloc = std.testing.allocator;
+    const endpoint = local_ipc.Endpoint{ .name = "zmx-startup-disconnect" };
+    var server = try listen(alloc, endpoint, .{});
+    defer server.close();
+    var probe = try connect(alloc, endpoint);
+    probe.close();
+
+    const state: *ServerState = @ptrFromInt(server.handle);
+    const event = try completionEvent();
+    defer windows.CloseHandle(event);
+    var overlapped = std.mem.zeroes(OVERLAPPED);
+    overlapped.hEvent = event;
+    try std.testing.expectEqual(@as(c_int, 0), ConnectNamedPipe(state.pipe.?, &overlapped));
+    try std.testing.expectEqual(windows.Win32Error.NO_DATA, windows.GetLastError());
+
+    const creations = test_pipe_creations.load(.monotonic);
+    try std.testing.expectError(
+        error.BrokenPipe,
+        acceptServerWithDeadline(server, events_windows.Deadline.afterMs(1000), null),
+    );
+    // Handle values can be recycled: count native creations, not numeric handles.
+    try std.testing.expectEqual(creations, test_pipe_creations.load(.monotonic));
+
+    var accept_result: Error!local_ipc.Connection = error.Unexpected;
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(listener: local_ipc.Server, result: *Error!local_ipc.Connection) void {
+            result.* = acceptServerWithDeadline(listener, events_windows.Deadline.afterMs(1000), null);
+        }
+    }.run, .{ server, &accept_result });
+    var client = connect(alloc, endpoint) catch |err| {
+        thread.join();
+        if (accept_result) |accepted| accepted.close() else |_| {}
+        return err;
+    };
+    defer client.close();
+    thread.join();
+    var accepted = try accept_result;
+    defer accepted.close();
+    try writeAll(client, "ready", events_windows.Deadline.afterMs(1000), null);
+    var received: [5]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 5), try read(accepted, &received));
+    try std.testing.expectEqualStrings("ready", &received);
+}
+
+test "Windows startup recovery waits when idle and surfaces replacement allocation failure" {
+    const alloc = std.testing.allocator;
+    const endpoint = local_ipc.Endpoint{ .name = "zmx-startup-recovery" };
+    var server = try listen(alloc, endpoint, .{});
+    defer server.close();
+    var probe = try connect(alloc, endpoint);
+    probe.close();
+    try std.testing.expectError(
+        error.BrokenPipe,
+        acceptServerWithDeadline(server, events_windows.Deadline.afterMs(1000), null),
+    );
+    const started = std.Io.Timestamp.now(std.testing.io, .awake);
+    try std.testing.expectError(
+        error.Timeout,
+        acceptServerWithDeadline(server, events_windows.Deadline.afterMs(40), null),
+    );
+    const elapsed = started.durationTo(std.Io.Timestamp.now(std.testing.io, .awake));
+    try std.testing.expect(elapsed.toMilliseconds() >= 30);
+
+    const state: *ServerState = @ptrFromInt(server.handle);
+    const original_allocator = state.allocator;
+    state.allocator = std.testing.failing_allocator;
+    defer state.allocator = original_allocator;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        acceptServerWithDeadline(server, events_windows.Deadline.afterMs(1), null),
+    );
 }
 
 test "Windows named pipes support multiple clients and partial writes" {
