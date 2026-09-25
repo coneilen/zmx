@@ -105,6 +105,7 @@ before ConPTY creation, listener recovery, and subsequent session requests:
 ```powershell
 zig build -Dtarget=x86_64-windows-gnu
 zig build test -Dtarget=x86_64-windows-gnu "-Dtest-filter=Windows startup"
+pwsh -NoProfile -File .\test\windows-startup.ps1 -SelfTest
 pwsh -NoProfile -File .\test\windows-startup.ps1
 ```
 
@@ -113,6 +114,8 @@ state and backend identity across detach/reattach, and bounds all descendants
 with an owned Windows job. It uses isolated short temporary roots and no
 visible windows. Logs and process-ownership evidence stay in a temporary results
 directory; `-ArtifactsDirectory <path>` selects another local location.
+`-SelfTest` checks strict readiness-record parsing and cleanup failures using
+held native process/job handles, including the kill-on-close fallback.
 Detach is checked by process exit; captured stdio is drained after daemon
 shutdown because a daemon can retain inherited stream handles.
 On Linux/macOS, `bats test` runs the existing session tests (requires `timeout`,
