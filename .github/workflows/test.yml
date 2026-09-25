@@ -45,7 +45,8 @@ jobs:
         shell: pwsh
         run: |
           $env:ZMX_DIR = Join-Path ([IO.Path]::GetTempPath()) ("zx" + [guid]::NewGuid().ToString('N').Substring(0,8))
-          New-Item -ItemType Directory -Path $env:ZMX_DIR | Out-Null
+          if (Test-Path -LiteralPath $env:ZMX_DIR) { throw 'Runtime directory collision' }
+          if (-not $IsWindows) { New-Item -ItemType Directory -Path $env:ZMX_DIR | Out-Null }
           $env:ZMX_SESSION_PREFIX = 'ci-'
           [string[]]$target = if ($IsWindows) { @('-Dtarget=x86_64-windows-gnu') } else { @() }
           zig build @target

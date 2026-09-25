@@ -391,7 +391,8 @@ if ($SelfTest) {
 $token = [guid]::NewGuid().ToString('N')
 $runtime = Join-Path ([IO.Path]::GetTempPath()) "zx$($token.Substring(0,8))"
 Require (-not (Test-Path -LiteralPath $runtime)) "Runtime collision: $runtime"
-$null = New-Item -ItemType Directory -Path $runtime
+# Let the provider create its root with the current token SID as owner.
+# An elevated runner's generic directory creation can select Administrators.
 if (-not $ArtifactsDirectory) {
     $ArtifactsDirectory = Join-Path ([IO.Path]::GetTempPath()) "zmx-startup-results-$token"
 }
