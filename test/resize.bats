@@ -102,6 +102,15 @@ assert_geometry() {
   [[ "$output" == *"no such session"* ]]
 }
 
+@test "resize: reports a missing session before any socket directory exists" {
+  # A socket directory is only created once a session is made. Reaching a
+  # session through a directory that was never created is still just a missing
+  # session, and must say so rather than surfacing a raw filesystem error.
+  run env ZMX_DIR="$BATS_TEST_TMPDIR/never-created" "$ZMX" resize test-resize-missing 100x30
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"no such session"* ]]
+}
+
 @test "attach --size: declares geometry for a client with no terminal" {
   # A pipe for stdin and stdout, exactly like the GraphCode terminal surface:
   # the client has no tty to measure and stays attached while the pane lives.

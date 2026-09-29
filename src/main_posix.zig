@@ -1172,6 +1172,41 @@ fn printSizeError(io: std.Io, text: []const u8) noreturn {
     std.process.exit(1);
 }
 
+/// Reports a session that cannot be reached on stderr and exits non-zero.
+fn printNoSuchSession(io: std.Io, session_name: []const u8) noreturn {
+    var buf: [256]u8 = undefined;
+    var w = std.Io.File.stderr().writer(io, &buf);
+    w.interface.print("error: no such session \"{s}\"\n", .{session_name}) catch {};
+    w.interface.flush() catch {};
+    std.process.exit(1);
+}
+
+/// Whether a session's socket is present and is actually a socket.
+///
+/// Any failure to answer that question means the session cannot be reached:
+/// the socket directory may not exist yet (the normal state before the first
+/// session), the entry may be absent, or it may not be a socket at all. All of
+/// those are reported as "not present" so the verdict is identical on every
+/// platform, and the underlying reason is logged rather than discarded.
+fn sessionSocketPresent(io: std.Io, cfg: *Cfg, session_name: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{}) catch |err| {
+        std.log.info(
+            "socket dir unavailable dir={s} err={s}",
+            .{ cfg.socket_dir, @errorName(err) },
+        );
+        return false;
+    };
+    defer dir.close(io);
+
+    return socket.sessionExists(io, dir, session_name) catch |err| {
+        std.log.info(
+            "session socket unreadable session={s} err={s}",
+            .{ session_name, @errorName(err) },
+        );
+        return false;
+    };
+}
+
 /// Sets a session's geometry from a one-shot control client.  Uses `SetSize`
 /// rather than `Resize` because this client never takes leadership, so a
 /// leader-gated `Resize` would be silently dropped.
@@ -1193,19 +1228,25 @@ fn resizeSession(
     };
     defer alloc.free(socket_path);
 
-    // Resolve existence explicitly: a resize that cannot reach its session must
-    // fail loudly, never report success because a connect error was swallowed.
-    var dir = try std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{});
-    defer dir.close(io);
-    if (!try socket.sessionExists(io, dir, session_name)) {
-        var buf: [256]u8 = undefined;
-        var w = std.Io.File.stderr().writer(io, &buf);
-        w.interface.print("error: no such session \"{s}\"\n", .{session_name}) catch {};
-        w.interface.flush() catch {};
-        std.process.exit(1);
-    }
+    // A resize that cannot reach its session must fail loudly, and must fail
+    // the same way on every platform, so the reachability verdict never
+    // depends on which error a given libc returns for an absent path.
+    if (!sessionSocketPresent(io, cfg, session_name)) printNoSuchSession(io, session_name);
 
     _ = ipc.roundTripForTag(alloc, socket_path, .SetSize, std.mem.asBytes(&size), .Ack) catch |err| {
+        // A socket that refuses connections is a dead session wearing a stale
+        // socket file, which is indistinguishable to the caller from one that
+        // was never there.  Report it identically instead of leaking the
+        // transport error, and clear the stale entry as other commands do.
+        if (err == error.ConnectionRefused) {
+            if (std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{})) |d| {
+                var dir = d;
+                defer dir.close(io);
+                socket.cleanupStaleSocket(io, dir, session_name);
+            } else |_| {}
+            printNoSuchSession(io, session_name);
+        }
+
         var buf: [256]u8 = undefined;
         var w = std.Io.File.stderr().writer(io, &buf);
         w.interface.print(
