@@ -31,45 +31,45 @@ assert_geometry() {
 }
 
 @test "resize: sets session geometry from a non-attached client" {
-  "$ZMX" run test-resize -d echo ready
-  wait_for_session test-resize
+  "$ZMX" run rsz -d echo ready
+  wait_for_session rsz
 
-  run "$ZMX" resize test-resize 100x30
+  run "$ZMX" resize rsz 100x30
   [ "$status" -eq 0 ]
 
-  assert_geometry test-resize "30 100"
+  assert_geometry rsz "30 100"
 }
 
 @test "resize: accepts separate cols and rows arguments" {
-  "$ZMX" run test-resize-pair -d echo ready
-  wait_for_session test-resize-pair
+  "$ZMX" run rsz-pair -d echo ready
+  wait_for_session rsz-pair
 
-  run "$ZMX" resize test-resize-pair 90 20
+  run "$ZMX" resize rsz-pair 90 20
   [ "$status" -eq 0 ]
 
-  assert_geometry test-resize-pair "20 90"
+  assert_geometry rsz-pair "20 90"
 }
 
 @test "resize: applies again so geometry tracks repeated pane changes" {
-  "$ZMX" run test-resize-twice -d echo ready
-  wait_for_session test-resize-twice
+  "$ZMX" run rsz-twice -d echo ready
+  wait_for_session rsz-twice
 
-  "$ZMX" resize test-resize-twice 100x30
-  assert_geometry test-resize-twice "30 100"
+  "$ZMX" resize rsz-twice 100x30
+  assert_geometry rsz-twice "30 100"
 
-  "$ZMX" resize test-resize-twice 81x21
-  assert_geometry test-resize-twice "21 81"
+  "$ZMX" resize rsz-twice 81x21
+  assert_geometry rsz-twice "21 81"
 }
 
 @test "resize: types nothing into the session" {
-  "$ZMX" run test-resize-quiet -d echo zmx-quiet-marker
-  wait_for_session test-resize-quiet
+  "$ZMX" run rsz-quiet -d echo zmx-quiet-marker
+  wait_for_session rsz-quiet
   sleep 0.5
-  before="$("$ZMX" history test-resize-quiet)"
+  before="$("$ZMX" history rsz-quiet)"
 
-  "$ZMX" resize test-resize-quiet 100x30
+  "$ZMX" resize rsz-quiet 100x30
   sleep 0.5
-  after="$("$ZMX" history test-resize-quiet)"
+  after="$("$ZMX" history rsz-quiet)"
 
   # A geometry frame is not an input frame: no spec text can reach the shell.
   [[ "$after" != *"100x30"* ]]
@@ -79,25 +79,26 @@ assert_geometry() {
 }
 
 @test "resize: rejects degenerate and malformed geometry" {
-  "$ZMX" run test-resize-bad -d echo ready
-  wait_for_session test-resize-bad
+  "$ZMX" run rsz-bad -d echo ready
+  wait_for_session rsz-bad
 
-  run "$ZMX" resize test-resize-bad 0x30
+  run "$ZMX" resize rsz-bad 0x30
   [ "$status" -ne 0 ]
   [[ "$output" == *"invalid size"* ]]
 
-  run "$ZMX" resize test-resize-bad 100x0
+  run "$ZMX" resize rsz-bad 100x0
   [ "$status" -ne 0 ]
 
-  run "$ZMX" resize test-resize-bad nonsense
+  run "$ZMX" resize rsz-bad nonsense
   [ "$status" -ne 0 ]
 
-  run "$ZMX" resize test-resize-bad
+  run "$ZMX" resize rsz-bad
   [ "$status" -ne 0 ]
 }
 
 @test "resize: fails for a session that does not exist" {
-  run "$ZMX" resize test-resize-missing 100x30
+  assert_name_fits rsz-gone
+  run "$ZMX" resize rsz-gone 100x30
   [ "$status" -ne 0 ]
   assert_output_contains "no such session"
 }
@@ -106,7 +107,7 @@ assert_geometry() {
   # A socket directory is only created once a session is made. Reaching a
   # session through a directory that was never created is still just a missing
   # session, and must say so rather than surfacing a raw filesystem error.
-  run env ZMX_DIR="$BATS_TEST_TMPDIR/never-created" "$ZMX" resize test-resize-missing 100x30
+  run env ZMX_DIR="$BATS_TEST_TMPDIR/never-created" "$ZMX" resize rsz-gone 100x30
   [ "$status" -ne 0 ]
   assert_output_contains "no such session"
 }
@@ -117,7 +118,7 @@ assert_geometry() {
   # they agree, so the verdict names its own origin in the log. Asserting it
   # here keeps a passing run informative instead of merely silent, and tells
   # us which path a given platform actually took.
-  run "$ZMX" resize test-resize-missing 100x30
+  run "$ZMX" resize rsz-gone 100x30
   [ "$status" -ne 0 ]
   assert_output_contains "no such session"
 
@@ -134,17 +135,17 @@ assert_geometry() {
   sleep 60 >"$fifo" &
   holder_pid=$!
 
-  "$ZMX" attach test-attach-size --size 100x30 <"$fifo" >/dev/null 2>&1 &
+  "$ZMX" attach att-size --size 100x30 <"$fifo" >/dev/null 2>&1 &
   attach_pid=$!
-  wait_for_session test-attach-size
+  wait_for_session att-size
 
-  assert_geometry test-attach-size "30 100"
+  assert_geometry att-size "30 100"
 
   # The control plane still owns geometry while that client is attached.
-  "$ZMX" resize test-attach-size 81x21
-  assert_geometry test-attach-size "21 81"
+  "$ZMX" resize att-size 81x21
+  assert_geometry att-size "21 81"
 
-  "$ZMX" kill --force test-attach-size || true
+  "$ZMX" kill --force att-size || true
   kill "$holder_pid" 2>/dev/null || true
   wait "$attach_pid" 2>/dev/null || true
 }
@@ -152,17 +153,17 @@ assert_geometry() {
 @test "attach --size: declaration survives a client whose stdin is already EOF" {
   # A one-shot client may exit immediately; its declared geometry must still
   # have reached the daemon rather than being lost in an unflushed buffer.
-  "$ZMX" attach test-attach-eof --size 100x30 </dev/null >/dev/null 2>&1 || true
-  wait_for_session test-attach-eof
+  "$ZMX" attach att-eof --size 100x30 </dev/null >/dev/null 2>&1 || true
+  wait_for_session att-eof
 
-  assert_geometry test-attach-eof "30 100"
+  assert_geometry att-eof "30 100"
 }
 
 @test "attach --size: rejects a malformed spec without creating a session" {
-  run "$ZMX" attach test-attach-bad --size 0x30
+  run "$ZMX" attach att-bad --size 0x30
   [ "$status" -ne 0 ]
   [[ "$output" == *"invalid size"* ]]
 
   run "$ZMX" list --short
-  [[ "$output" != *"test-attach-bad"* ]]
+  [[ "$output" != *"att-bad"* ]]
 }
