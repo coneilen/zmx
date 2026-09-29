@@ -42,7 +42,16 @@ pub fn feedsPtyInput(tag: ipc.Tag) bool {
 /// between partial writes.  Used to deliver the `Init` frame before the poll
 /// loop can exit, so a client whose stdin is already at EOF still declares its
 /// geometry.
+///
+/// A socket that polls as errored or hung up without becoming writable never
+/// will become writable, so it is terminal rather than retried: re-polling it
+/// returns immediately and would spin.  Progress-free iterations are capped as
+/// well, so even a spuriously writable socket cannot loop unbounded.
 fn flushSocketBuffer(gpa: std.mem.Allocator, fd: i32, buf: *std.ArrayList(u8)) !void {
+    const broken = lib_posix.POLL.ERR | lib_posix.POLL.HUP | lib_posix.POLL.NVAL;
+    const max_stalled_waits = 16;
+    var stalled: usize = 0;
+
     while (buf.items.len > 0) {
         const n = lib_posix.write(fd, buf.items) catch |err| switch (err) {
             error.WouldBlock => 0,
@@ -50,10 +59,18 @@ fn flushSocketBuffer(gpa: std.mem.Allocator, fd: i32, buf: *std.ArrayList(u8)) !
         };
         if (n > 0) {
             buf.replaceRange(gpa, 0, n, &.{}) catch unreachable;
+            stalled = 0;
             continue;
         }
+
+        stalled += 1;
+        if (stalled > max_stalled_waits) return error.Timeout;
+
         var wait = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.OUT, .revents = 0 }};
         if (try events_posix.poll(&wait, 1000) == 0) return error.Timeout;
+        if (wait[0].revents & lib_posix.POLL.OUT == 0 and wait[0].revents & broken != 0) {
+            return error.BrokenPipe;
+        }
     }
 }
 
