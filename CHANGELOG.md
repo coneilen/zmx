@@ -6,12 +6,14 @@ Use spec: https://common-changelog.org/
 
 ### Added
 
+- `zmx attach --size <cols>x<rows>` declares a client's geometry, and `zmx resize <name> <cols>x<rows>` (also `<cols> <rows>`) sets a running session's geometry from a one-shot client. Both are for embedders that run `zmx attach` as a pipe child and have no terminal to measure. They resize the PTY and the daemon's terminal without sending any input, and use a new `SetSize` control frame that is not gated on input leadership, so a client that owns pane geometry need not own the session. Unknown tags are still ignored by older daemons, so the wire stays backward compatible.
 - We now track cwd changes via OSC7
 - Replay window title on attach
 - `ZMX_NO_DETACH_KEY` env var to disable `ctrl+\` keybinding
 
 ### Fixed
 
+- `zmx resize` on Windows was a silent no-op: it sent a leader-gated `Resize`, which the daemon dropped because a one-shot client never becomes leader. It now sends the leaderless `SetSize` control frame and reports failures.
 - Clear screen when switching sessions to prevent term state corruption
 - Stray NUL byte in the OSC 7 sequence replayed on attach
 - The OSC 7 cwd is now decoded before the chdir, so a new session can start in a directory whose name needed percent-encoding

@@ -17,3 +17,4 @@ prior_art/
 result
 result-*
 .direnv/
+.zig-cache-zmxresize/

@@ -32,7 +32,7 @@ const bash_completions =
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
     \\
-    \\  local commands="attach run send print write detach list kill history get set clear wait tail completions version help"
+    \\  local commands="attach run send print write detach resize list kill history get set clear wait tail completions version help"
     \\
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=($(compgen -W "$commands" -- "$cur"))
@@ -40,7 +40,7 @@ const bash_completions =
     \\  fi
     \\
     \\  case "$prev" in
-    \\    attach|run|send|print|write|kill|history|get|set|clear|wait|tail)
+    \\    attach|run|send|print|write|kill|history|get|set|clear|wait|tail|resize)
     \\      local sessions=$(zmx list --short 2>/dev/null | tr '\n' ' ')
     \\      COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
     \\      ;;
@@ -80,6 +80,7 @@ const zsh_completions =
     \\        'print:Inject text into session display'
     \\        'write:Write stdin to file_path through the session'
     \\        'detach:Detach all clients from current session'
+    \\        'resize:Set session geometry without attaching'
     \\        'list:List active sessions'
     \\        'kill:Kill a session'
     \\        'history:Output session scrollback'
@@ -96,7 +97,7 @@ const zsh_completions =
     \\      ;;
     \\    args)
     \\      case $words[2] in
-    \\        attach|a|kill|k|run|r|send|s|print|p|write|wr|history|get|g|set|clear|hi|wait|w|tail|t)
+    \\        attach|a|kill|k|run|r|send|s|print|p|write|wr|history|get|g|set|clear|hi|wait|w|tail|t|resize)
     \\          _zmx_sessions
     \\          ;;
     \\        completions|c)
@@ -141,6 +142,7 @@ const fish_completions =
     \\complete -c zmx -n "__fish_is_nth_token 1" -a print -d 'Inject text into session display'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a write -d 'Write stdin to file_path through the session'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a detach -d 'Detach all clients (ctrl+\ for current client)'
+    \\complete -c zmx -n "__fish_is_nth_token 1" -a resize -d 'Set session geometry without attaching'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a list -d 'List active sessions'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a kill -d 'Kill session and all attached clients'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a history -d 'Output session scrollback'
@@ -154,7 +156,7 @@ const fish_completions =
     \\complete -c zmx -n "__fish_is_nth_token 1" -a help -d 'Show help message'
     \\
     \\# Complete session names and shells
-    \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from a attach r run s send p print wr write hi history g get se set cl clear" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
+    \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from a attach r run s send p print wr write hi history g get se set cl clear resize" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
     \\complete -c zmx -n "not __fish_is_nth_token 1; and __fish_seen_subcommand_from k kill w wait t tail" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
     \\
     \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from c completions" -a 'bash zsh fish nu' -d Shell
@@ -211,6 +213,7 @@ const nu_completions =
     \\]
     \\
     \\export extern "zmx detach" []
+    \\export extern "zmx resize" [name: string@"nu-complete zmx sessions", ...size: string]
     \\export extern "zmx list" [--short]
     \\export extern "zmx history" [name: string@"nu-complete zmx sessions", --vt, --html]
     \\export extern "zmx wait" [...sessions: string@"nu-complete zmx sessions"]

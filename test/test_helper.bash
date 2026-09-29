@@ -68,3 +68,44 @@ wait_for_cwd() {
   echo "Timed out waiting for cwd '$pattern' in session '$name'" >&2
   return 1
 }
+
+# Helper: assert run output contains a substring, reporting what was actually
+# produced when it does not. A bare [[ $output == *...* ]] reports only the
+# failing line, which makes a platform-specific difference impossible to
+# diagnose from CI logs alone.
+assert_output_contains() {
+  local needle="$1"
+  if [[ "$output" != *"$needle"* ]]; then
+    {
+      echo "expected output to contain: $needle"
+      echo "actual status: $status"
+      echo "actual output: [$output]"
+    } >&2
+    return 1
+  fi
+}
+
+# Helper: the longest session name that fits the current socket directory.
+#
+# The budget is sockaddr_un.sun_path minus the socket directory, and sun_path
+# is 108 bytes on Linux but 104 on macOS, where TMPDIR is also far longer
+# (/var/folders/...). A name that fits a Linux runner can therefore overflow a
+# macOS one and fail as NameTooLong long before reaching the behaviour a test
+# means to exercise. Ask the binary rather than hardcoding either platform.
+session_name_budget() {
+  local probe
+  probe="$("$ZMX" resize "$(printf 'n%.0s' {1..80})" 1x1 2>&1 || true)"
+  sed -n 's/.*max \([0-9][0-9]*\) .*/\1/p' <<<"$probe"
+}
+
+# Helper: fail with an explanation if a fixture name cannot fit the budget,
+# so an overflow is reported as the fixture defect it is instead of surfacing
+# as an unrelated assertion failure.
+assert_name_fits() {
+  local name="$1" budget
+  budget="$(session_name_budget)"
+  if [[ -n "$budget" ]] && (( ${#name} > budget )); then
+    echo "fixture session name '$name' is ${#name} bytes, over the ${budget}-byte budget for $ZMX_DIR" >&2
+    return 1
+  fi
+}

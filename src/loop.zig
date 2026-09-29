@@ -18,9 +18,69 @@ const pty = @import("platform/pty.zig");
 const pty_runtime = @import("platform/pty_runtime.zig");
 const platform_resize = @import("platform/resize.zig");
 
+/// Geometry carried by a frame, or null when the frame must not resize the
+/// session.  `Init`/`Resize` stay leader-gated; `SetSize` is the control plane
+/// for clients that own pane geometry without owning input.
+pub fn geometryFromFrame(tag: ipc.Tag, payload: []const u8, is_leader: bool) ?ipc.Resize {
+    return switch (tag) {
+        .Init, .Resize => if (is_leader) platform_resize.fromPayload(payload) else null,
+        .SetSize => platform_resize.fromPayload(payload),
+        else => null,
+    };
+}
+
+/// Frames whose payload is forwarded verbatim into the PTY.  Geometry frames
+/// must never be in this set or a resize would be typed into the shell.
+pub fn feedsPtyInput(tag: ipc.Tag) bool {
+    return switch (tag) {
+        .Input, .Send, .Run, .Write => true,
+        else => false,
+    };
+}
+
+/// Writes every buffered byte to a non-blocking socket, waiting for writability
+/// between partial writes.  Used to deliver the `Init` frame before the poll
+/// loop can exit, so a client whose stdin is already at EOF still declares its
+/// geometry.
+///
+/// A socket that polls as errored or hung up without becoming writable never
+/// will become writable, so it is terminal rather than retried: re-polling it
+/// returns immediately and would spin.  Progress-free iterations are capped as
+/// well, so even a spuriously writable socket cannot loop unbounded.
+fn flushSocketBuffer(gpa: std.mem.Allocator, fd: i32, buf: *std.ArrayList(u8)) !void {
+    const broken = lib_posix.POLL.ERR | lib_posix.POLL.HUP | lib_posix.POLL.NVAL;
+    const max_stalled_waits = 16;
+    var stalled: usize = 0;
+
+    while (buf.items.len > 0) {
+        const n = lib_posix.write(fd, buf.items) catch |err| switch (err) {
+            error.WouldBlock => 0,
+            else => return err,
+        };
+        if (n > 0) {
+            buf.replaceRange(gpa, 0, n, &.{}) catch unreachable;
+            stalled = 0;
+            continue;
+        }
+
+        stalled += 1;
+        if (stalled > max_stalled_waits) return error.Timeout;
+
+        var wait = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.OUT, .revents = 0 }};
+        if (try events_posix.poll(&wait, 1000) == 0) return error.Timeout;
+        if (wait[0].revents & lib_posix.POLL.OUT == 0 and wait[0].revents & broken != 0) {
+            return error.BrokenPipe;
+        }
+    }
+}
+
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
-pub fn clientLoop(client_sock_fd: i32) !ClientResult {
+///
+/// `explicit_size` declares the client's geometry when it cannot measure a
+/// terminal (a pipe child has no tty to probe).  When set it also pins the
+/// reported geometry, so a stale tty measurement cannot clobber it.
+pub fn clientLoop(client_sock_fd: i32, explicit_size: ?ipc.Resize) !ClientResult {
     std.log.info("client loop fd={d}", .{client_sock_fd});
     const gpa: std.mem.Allocator = blk: {
         if (builtin.mode == .Debug) {
@@ -47,8 +107,15 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
     defer sock_write_buf.deinit(gpa);
 
     // Send init message with terminal size (buffered)
-    const size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
+    const size = explicit_size orelse ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
     try ipc.appendMessage(gpa, &sock_write_buf, .Init, std.mem.asBytes(&size));
+
+    // A declared geometry is the whole point of a `--size` client, and such a
+    // client may have no stdin to wait on.  Deliver `Init` up front so the
+    // declaration cannot be lost to an immediate EOF exit.
+    if (explicit_size != null) {
+        try flushSocketBuffer(gpa, client_sock_fd, &sock_write_buf);
+    }
 
     var poll_fds = try std.ArrayList(lib_posix.pollfd).initCapacity(gpa, 4);
     defer poll_fds.deinit(gpa);
@@ -104,8 +171,12 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
-            const next_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
-            try ipc.appendMessage(gpa, &sock_write_buf, .Resize, std.mem.asBytes(&next_size));
+            // A declared geometry is owned by the caller; a SIGWINCH
+            // measurement must not overwrite it.
+            if (explicit_size == null) {
+                const next_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
+                try ipc.appendMessage(gpa, &sock_write_buf, .Resize, std.mem.asBytes(&next_size));
+            }
         }
 
         // Handle stdin -> socket (Input)
@@ -160,7 +231,8 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
                     .Resize => {
                         // daemon is asking for the client's window size usually in response
                         // to this client being set as leader.
-                        const next_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
+                        const next_size = explicit_size orelse
+                            ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
                         try ipc.appendMessage(
                             gpa,
                             &sock_write_buf,
@@ -463,6 +535,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .Init => try daemon.handleInit(gpa, client, pty_fd, &term, msg.payload),
                         .Switch => try daemon.handleSwitch(gpa, msg.payload),
                         .Resize => try daemon.handleResize(gpa, client, pty_fd, &term, msg.payload),
+                        .SetSize => try daemon.handleSetSize(gpa, client, pty_fd, &term, msg.payload),
                         .Detach => {
                             daemon.handleDetach(gpa, client, i);
                             break :clients_loop;
@@ -1088,27 +1161,20 @@ pub const Daemon = struct {
         }
 
         // only resize if leader
-        if (self.leader_client_fd == client.socket_fd) {
-            const resize = std.mem.bytesToValue(ipc.Resize, payload);
-            pty_posix.resizeMaster(pty_fd, resize);
-            // Disable prompt_redraw before resize. The daemon's internal terminal
-            // would otherwise clear prompt lines expecting the shell to redraw them,
-            // but the shell's redraw goes to the PTY (forwarded to clients), not to
-            // this daemon terminal. The clearing corrupts the daemon's snapshot state.
-            const saved_prompt_redraw = term.flags.shell_redraws_prompt;
-            term.flags.shell_redraws_prompt = .false;
-            defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
-            const opts = ghostty_vt.Terminal.Resize{
-                .cols = resize.cols,
-                .rows = resize.rows,
-            };
-            try term.resize(gpa, opts);
+        const is_leader = self.leader_client_fd == client.socket_fd;
+        if (geometryFromFrame(.Init, payload, is_leader)) |size| {
+            // applyResize disables prompt_redraw first. The daemon's internal
+            // terminal would otherwise clear prompt lines expecting the shell to
+            // redraw them, but the shell's redraw goes to the PTY (forwarded to
+            // clients), not to this daemon terminal. The clearing corrupts the
+            // daemon's snapshot state.
+            try self.applyResize(gpa, pty_fd, term, size);
 
             // Mark that we've had a client init, so subsequent clients get terminal state
             self.has_had_client = true;
             self.has_terminal_client = true;
 
-            std.log.debug("init resize rows={d} cols={d}", .{ resize.rows, resize.cols });
+            std.log.debug("init resize rows={d} cols={d}", .{ size.rows, size.cols });
         }
     }
 
@@ -1125,20 +1191,46 @@ pub const Daemon = struct {
             try self.setLeader(gpa, client);
         }
         // only leader can resize
-        if (self.leader_client_fd != client.socket_fd) return;
+        const is_leader = self.leader_client_fd == client.socket_fd;
+        const resize = geometryFromFrame(.Resize, payload, is_leader) orelse return;
+        self.applyResize(gpa, pty_fd, term, resize) catch |err| return err;
+        std.log.debug("resize rows={d} cols={d}", .{ resize.rows, resize.cols });
+    }
 
-        const resize = std.mem.bytesToValue(ipc.Resize, payload);
-        pty_posix.resizeMaster(pty_fd, resize);
+    /// Control-plane geometry from a client that does not own input.  Unlike
+    /// `Resize` this is not leader-gated, so a non-interactive attach client
+    /// (no tty to measure) can own pane geometry without owning the session.
+    pub fn handleSetSize(
+        self: *Daemon,
+        gpa: std.mem.Allocator,
+        client: *Client,
+        pty_fd: i32,
+        term: *ghostty_vt.Terminal,
+        payload: []const u8,
+    ) !void {
+        const resize = geometryFromFrame(.SetSize, payload, false) orelse return;
+        try self.applyResize(gpa, pty_fd, term, resize);
+        std.log.debug("set size rows={d} cols={d}", .{ resize.rows, resize.cols });
+        try ipc.appendMessage(gpa, &client.write_buf, .Ack, "");
+        client.has_pending_output = true;
+    }
+
+    fn applyResize(
+        _: *Daemon,
+        gpa: std.mem.Allocator,
+        pty_fd: i32,
+        term: *ghostty_vt.Terminal,
+        size: ipc.Resize,
+    ) !void {
+        pty_posix.resizeMaster(pty_fd, size);
         // Disable prompt_redraw before resize (same rationale as handleInit).
         const saved_prompt_redraw = term.flags.shell_redraws_prompt;
         term.flags.shell_redraws_prompt = .false;
         defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
-        const opts = ghostty_vt.Terminal.Resize{
-            .cols = resize.cols,
-            .rows = resize.rows,
-        };
-        try term.resize(gpa, opts);
-        std.log.debug("resize rows={d} cols={d}", .{ resize.rows, resize.cols });
+        try term.resize(gpa, .{
+            .cols = size.cols,
+            .rows = size.rows,
+        });
     }
 
     pub fn handleDetach(self: *Daemon, gpa: std.mem.Allocator, client: *Client, i: usize) void {
@@ -2951,4 +3043,38 @@ test "split long Kitty release stays suppressed after capture limit" {
 
     try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
     try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+}
+
+test "geometry frames are leader gated except the SetSize control plane" {
+    const size = ipc.Resize{ .cols = 120, .rows = 40 };
+    const payload = std.mem.asBytes(&size);
+
+    // Interactive frames keep their existing leadership gate.
+    try std.testing.expectEqual(size, geometryFromFrame(.Resize, payload, true).?);
+    try std.testing.expectEqual(size, geometryFromFrame(.Init, payload, true).?);
+    try std.testing.expectEqual(@as(?ipc.Resize, null), geometryFromFrame(.Resize, payload, false));
+    try std.testing.expectEqual(@as(?ipc.Resize, null), geometryFromFrame(.Init, payload, false));
+
+    // SetSize is owned by the pane, not the input leader.
+    try std.testing.expectEqual(size, geometryFromFrame(.SetSize, payload, false).?);
+    try std.testing.expectEqual(size, geometryFromFrame(.SetSize, payload, true).?);
+
+    // Malformed or degenerate frames never resize.
+    try std.testing.expectEqual(@as(?ipc.Resize, null), geometryFromFrame(.SetSize, payload[0..7], false));
+    const degenerate = ipc.Resize{ .cols = 0, .rows = 40 };
+    try std.testing.expectEqual(
+        @as(?ipc.Resize, null),
+        geometryFromFrame(.SetSize, std.mem.asBytes(&degenerate), false),
+    );
+
+    // Non-geometry frames are not a resize channel.
+    try std.testing.expectEqual(@as(?ipc.Resize, null), geometryFromFrame(.Input, payload, true));
+}
+
+test "geometry frames are never fed to the pty as input" {
+    try std.testing.expect(feedsPtyInput(.Input));
+    try std.testing.expect(feedsPtyInput(.Send));
+    try std.testing.expect(!feedsPtyInput(.SetSize));
+    try std.testing.expect(!feedsPtyInput(.Resize));
+    try std.testing.expect(!feedsPtyInput(.Init));
 }

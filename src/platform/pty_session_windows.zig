@@ -1030,6 +1030,50 @@ fn resizePtyIfLeader(
     );
 }
 
+/// Applies control-plane geometry.  This takes the same lock order as a leader
+/// resize but does not require leadership, because the client that owns pane
+/// geometry is not necessarily the client that owns input.
+fn resizePtyControl(session: *Session, size: resize.Size) void {
+    session.lockPty();
+    session.lock();
+    resizePtyLocked(session, size);
+    session.unlock();
+    session.unlockPty();
+}
+
+/// Geometry carried by a frame, or null when the frame must not resize the
+/// session.  `Init`/`Resize` remain leader-gated; `SetSize` is the control
+/// plane for clients that never take leadership.
+fn geometryFromFrame(tag: wire.Tag, payload: []const u8, is_leader: bool) ?resize.Size {
+    return switch (tag) {
+        .Init, .Resize => if (is_leader) resize.fromPayload(payload) else null,
+        .SetSize => resize.fromPayload(payload),
+        else => null,
+    };
+}
+
+/// Frames whose payload is forwarded verbatim into the PTY.  Geometry frames
+/// must never be in this set or a resize would be typed into the shell.
+fn feedsPtyInput(tag: wire.Tag) bool {
+    return switch (tag) {
+        .Input, .Send => true,
+        else => false,
+    };
+}
+
+/// Geometry an attach client reports for itself.  An explicit size wins over a
+/// console probe so a pipe child (no console) can still declare its grid.
+fn attachReportSize(explicit: ?resize.Size, console: ?resize.Size) ?resize.Size {
+    return explicit orelse console;
+}
+
+/// The console poll only runs when this client's geometry is measured rather
+/// than declared; otherwise a console measurement could clobber the geometry
+/// its owner set explicitly.
+fn consoleMonitorEnabled(console_output: bool, explicit: ?resize.Size) bool {
+    return console_output and explicit == null;
+}
+
 fn asciiStartsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
     if (value.len < prefix.len) return false;
     for (value[0..prefix.len], prefix) |left, right| {
@@ -1367,12 +1411,15 @@ fn clientMain(client: *Client) void {
                 broadcast(session, .Output, frame.payload);
             },
             .Resize => {
-                if (frame.payload.len == @sizeOf(wire.Resize)) {
-                    const size = std.mem.bytesToValue(wire.Resize, frame.payload);
-                    const snapshot = leaderSnapshot(session, client);
-                    if (snapshot.is_leader) {
-                        _ = resizePtyIfLeader(session, client, snapshot.generation, size);
-                    }
+                const snapshot = leaderSnapshot(session, client);
+                if (geometryFromFrame(.Resize, frame.payload, snapshot.is_leader)) |size| {
+                    _ = resizePtyIfLeader(session, client, snapshot.generation, size);
+                }
+            },
+            .SetSize => {
+                if (geometryFromFrame(.SetSize, frame.payload, false)) |size| {
+                    resizePtyControl(session, size);
+                    client.enqueue(.Ack, "") catch {};
                 }
             },
             .Init => {
@@ -1382,10 +1429,9 @@ fn clientMain(client: *Client) void {
                     if (session.task_complete.load(.acquire)) {
                         if (!client.closed.load(.acquire)) sendTaskComplete(client);
                     }
-                } else if (frame.payload.len == @sizeOf(wire.Resize)) {
-                    const size = std.mem.bytesToValue(wire.Resize, frame.payload);
+                } else {
                     const snapshot = leaderSnapshot(session, client);
-                    if (snapshot.is_leader) {
+                    if (geometryFromFrame(.Init, frame.payload, snapshot.is_leader)) |size| {
                         _ = resizePtyIfLeader(session, client, snapshot.generation, size);
                     }
                 }
@@ -1831,7 +1877,7 @@ fn attachLoopResult(spec: session_windows.AttachSpec, connection: local_ipc.Conn
         _ = kernel32.SetConsoleOutputCP(restore_cp);
         original_output_cp = null;
     };
-    if (currentConsoleSize()) |size| {
+    if (attachReportSize(spec.size, currentConsoleSize())) |size| {
         try writeWireFrame(&wire_lock, connection, .Resize, std.mem.asBytes(&size));
     }
     var input = AttachInput{
@@ -1848,9 +1894,9 @@ fn attachLoopResult(spec: session_windows.AttachSpec, connection: local_ipc.Conn
         .connection = connection,
         .stop = &stop,
         .wire_lock = &wire_lock,
-        .enabled = console_output,
+        .enabled = consoleMonitorEnabled(console_output, spec.size),
     };
-    const resize_thread = if (console_output)
+    const resize_thread = if (resize_monitor.enabled)
         std.Thread.spawn(.{}, resizeMonitorMain, .{&resize_monitor}) catch null
     else
         null;
@@ -1891,7 +1937,7 @@ fn attachLoopResult(spec: session_windows.AttachSpec, connection: local_ipc.Conn
             },
             .Resize => {
                 if (frame.payload.len == 0) {
-                    if (currentConsoleSize()) |size| {
+                    if (attachReportSize(spec.size, currentConsoleSize())) |size| {
                         try writeWireFrame(&wire_lock, connection, .Resize, std.mem.asBytes(&size));
                     }
                 }
@@ -2453,4 +2499,63 @@ test "Windows detach-all ejects every client when staging allocation fails" {
         try std.testing.expect(client.connection_closed.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), client.broadcast_refs.load(.acquire));
     }
+}
+
+test "Windows SetSize applies geometry from a client that is not the leader" {
+    const size = resize.Size{ .cols = 100, .rows = 30 };
+    const payload = std.mem.asBytes(&size);
+
+    // A GraphCode-style control client owns pane geometry without owning input,
+    // so it never becomes the leader and must still be able to resize.
+    try std.testing.expectEqual(size, geometryFromFrame(.SetSize, payload, false).?);
+    try std.testing.expectEqual(size, geometryFromFrame(.SetSize, payload, true).?);
+}
+
+test "Windows Resize and Init geometry stay leader-gated" {
+    const size = resize.Size{ .cols = 100, .rows = 30 };
+    const payload = std.mem.asBytes(&size);
+
+    try std.testing.expectEqual(size, geometryFromFrame(.Resize, payload, true).?);
+    try std.testing.expectEqual(size, geometryFromFrame(.Init, payload, true).?);
+    try std.testing.expectEqual(@as(?resize.Size, null), geometryFromFrame(.Resize, payload, false));
+    try std.testing.expectEqual(@as(?resize.Size, null), geometryFromFrame(.Init, payload, false));
+}
+
+test "Windows geometry frames are rejected when framing is wrong" {
+    const size = resize.Size{ .cols = 100, .rows = 30 };
+    const short = std.mem.asBytes(&size)[0..7];
+    try std.testing.expectEqual(@as(?resize.Size, null), geometryFromFrame(.SetSize, short, false));
+    try std.testing.expectEqual(@as(?resize.Size, null), geometryFromFrame(.SetSize, "", false));
+    const degenerate = resize.Size{ .cols = 0, .rows = 30 };
+    try std.testing.expectEqual(
+        @as(?resize.Size, null),
+        geometryFromFrame(.SetSize, std.mem.asBytes(&degenerate), false),
+    );
+}
+
+test "Windows geometry frames never reach the PTY input path" {
+    // A resize must never be typed into the shell: only Input and Send carry
+    // bytes to the PTY, and geometry tags must stay out of that set.
+    try std.testing.expect(feedsPtyInput(.Input));
+    try std.testing.expect(feedsPtyInput(.Send));
+    try std.testing.expect(!feedsPtyInput(.SetSize));
+    try std.testing.expect(!feedsPtyInput(.Resize));
+    try std.testing.expect(!feedsPtyInput(.Init));
+}
+
+test "Windows attach reports an explicit size when no console is available" {
+    const explicit = resize.Size{ .cols = 120, .rows = 40 };
+    const console = resize.Size{ .cols = 80, .rows = 24 };
+
+    // Pipe child: no console geometry exists, so only the explicit size works.
+    try std.testing.expectEqual(explicit, attachReportSize(explicit, null).?);
+    try std.testing.expectEqual(@as(?resize.Size, null), attachReportSize(null, null));
+
+    // An explicit size wins over a console probe and pins the monitor off, so a
+    // stale console measurement cannot clobber the caller-owned geometry.
+    try std.testing.expectEqual(explicit, attachReportSize(explicit, console).?);
+    try std.testing.expectEqual(console, attachReportSize(null, console).?);
+    try std.testing.expect(!consoleMonitorEnabled(true, explicit));
+    try std.testing.expect(consoleMonitorEnabled(true, null));
+    try std.testing.expect(!consoleMonitorEnabled(false, null));
 }
