@@ -1253,24 +1253,30 @@ fn resizeSession(
     if (!present) printNoSuchSession(io, session_name);
 
     _ = ipc.roundTripForTag(alloc, socket_path, .SetSize, std.mem.asBytes(&size), .Ack) catch |err| {
-        // A socket that refuses connections is a dead session wearing a stale
-        // socket file, which is indistinguishable to the caller from one that
-        // was never there.  Report it identically instead of leaking the
-        // transport error, and clear the stale entry as other commands do.
-        if (err == error.ConnectionRefused) {
-            if (std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{})) |d| {
-                var dir = d;
-                defer dir.close(io);
-                socket.cleanupStaleSocket(io, dir, session_name);
-            } else |dir_err| {
-                // Cleanup is best effort; the session is still unreachable and
-                // that verdict stands, but do not discard why it could not run.
-                std.log.warn(
-                    "stale socket cleanup skipped dir={s} err={s}",
-                    .{ cfg.socket_dir, @errorName(dir_err) },
-                );
-            }
-            printNoSuchSession(io, session_name);
+        // A socket that cannot be connected to is a dead or absent session:
+        // either a stale socket file left by a dead daemon, or a path nothing
+        // is listening on. Platforms disagree about which error that is —
+        // `labelGet` already has to treat `Unexpected` the same way — so map
+        // the whole family to one verdict rather than leaking the transport
+        // error, and clear a stale entry as other commands do.
+        switch (err) {
+            error.ConnectionRefused, error.Unexpected => {
+                if (std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{})) |d| {
+                    var dir = d;
+                    defer dir.close(io);
+                    socket.cleanupStaleSocket(io, dir, session_name);
+                } else |dir_err| {
+                    // Cleanup is best effort; the session is still unreachable
+                    // and that verdict stands, but do not discard why it could
+                    // not run.
+                    std.log.warn(
+                        "stale socket cleanup skipped dir={s} err={s}",
+                        .{ cfg.socket_dir, @errorName(dir_err) },
+                    );
+                }
+                printNoSuchSession(io, session_name);
+            },
+            else => {},
         }
 
         var buf: [256]u8 = undefined;

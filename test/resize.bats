@@ -99,7 +99,7 @@ assert_geometry() {
 @test "resize: fails for a session that does not exist" {
   run "$ZMX" resize test-resize-missing 100x30
   [ "$status" -ne 0 ]
-  [[ "$output" == *"no such session"* ]]
+  assert_output_contains "no such session"
 }
 
 @test "resize: reports a missing session before any socket directory exists" {
@@ -108,7 +108,7 @@ assert_geometry() {
   # session, and must say so rather than surfacing a raw filesystem error.
   run env ZMX_DIR="$BATS_TEST_TMPDIR/never-created" "$ZMX" resize test-resize-missing 100x30
   [ "$status" -ne 0 ]
-  [[ "$output" == *"no such session"* ]]
+  assert_output_contains "no such session"
 }
 
 @test "attach --size: declares geometry for a client with no terminal" {

@@ -68,3 +68,19 @@ wait_for_cwd() {
   echo "Timed out waiting for cwd '$pattern' in session '$name'" >&2
   return 1
 }
+
+# Helper: assert run output contains a substring, reporting what was actually
+# produced when it does not. A bare [[ $output == *...* ]] reports only the
+# failing line, which makes a platform-specific difference impossible to
+# diagnose from CI logs alone.
+assert_output_contains() {
+  local needle="$1"
+  if [[ "$output" != *"$needle"* ]]; then
+    {
+      echo "expected output to contain: $needle"
+      echo "actual status: $status"
+      echo "actual output: [$output]"
+    } >&2
+    return 1
+  fi
+}
