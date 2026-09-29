@@ -120,4 +120,5 @@ test "Windows session wire preserves all frozen tags and shapes" {
     try std.testing.expectEqual(@as(usize, 552), @sizeOf(Info));
     try std.testing.expectEqual(@as(u8, 0), @intFromEnum(Tag.Input));
     try std.testing.expectEqual(@as(u8, 18), @intFromEnum(Tag.Send));
+    try std.testing.expectEqual(@as(u8, 19), @intFromEnum(Tag.SetSize));
 }

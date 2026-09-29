@@ -2454,3 +2454,62 @@ test "Windows detach-all ejects every client when staging allocation fails" {
         try std.testing.expectEqual(@as(usize, 0), client.broadcast_refs.load(.acquire));
     }
 }
+
+test "Windows SetSize applies geometry from a client that is not the leader" {
+    const size = resize.Size{ .cols = 100, .rows = 30 };
+    const payload = std.mem.asBytes(&size);
+
+    // A GraphCode-style control client owns pane geometry without owning input,
+    // so it never becomes the leader and must still be able to resize.
+    try std.testing.expectEqual(size, geometryFromFrame(.SetSize, payload, false).?);
+    try std.testing.expectEqual(size, geometryFromFrame(.SetSize, payload, true).?);
+}
+
+test "Windows Resize and Init geometry stay leader-gated" {
+    const size = resize.Size{ .cols = 100, .rows = 30 };
+    const payload = std.mem.asBytes(&size);
+
+    try std.testing.expectEqual(size, geometryFromFrame(.Resize, payload, true).?);
+    try std.testing.expectEqual(size, geometryFromFrame(.Init, payload, true).?);
+    try std.testing.expectEqual(@as(?resize.Size, null), geometryFromFrame(.Resize, payload, false));
+    try std.testing.expectEqual(@as(?resize.Size, null), geometryFromFrame(.Init, payload, false));
+}
+
+test "Windows geometry frames are rejected when framing is wrong" {
+    const size = resize.Size{ .cols = 100, .rows = 30 };
+    const short = std.mem.asBytes(&size)[0..7];
+    try std.testing.expectEqual(@as(?resize.Size, null), geometryFromFrame(.SetSize, short, false));
+    try std.testing.expectEqual(@as(?resize.Size, null), geometryFromFrame(.SetSize, "", false));
+    const degenerate = resize.Size{ .cols = 0, .rows = 30 };
+    try std.testing.expectEqual(
+        @as(?resize.Size, null),
+        geometryFromFrame(.SetSize, std.mem.asBytes(&degenerate), false),
+    );
+}
+
+test "Windows geometry frames never reach the PTY input path" {
+    // A resize must never be typed into the shell: only Input and Send carry
+    // bytes to the PTY, and geometry tags must stay out of that set.
+    try std.testing.expect(feedsPtyInput(.Input));
+    try std.testing.expect(feedsPtyInput(.Send));
+    try std.testing.expect(!feedsPtyInput(.SetSize));
+    try std.testing.expect(!feedsPtyInput(.Resize));
+    try std.testing.expect(!feedsPtyInput(.Init));
+}
+
+test "Windows attach reports an explicit size when no console is available" {
+    const explicit = resize.Size{ .cols = 120, .rows = 40 };
+    const console = resize.Size{ .cols = 80, .rows = 24 };
+
+    // Pipe child: no console geometry exists, so only the explicit size works.
+    try std.testing.expectEqual(explicit, attachReportSize(explicit, null).?);
+    try std.testing.expectEqual(@as(?resize.Size, null), attachReportSize(null, null));
+
+    // An explicit size wins over a console probe and pins the monitor off, so a
+    // stale console measurement cannot clobber the caller-owned geometry.
+    try std.testing.expectEqual(explicit, attachReportSize(explicit, console).?);
+    try std.testing.expectEqual(console, attachReportSize(null, console).?);
+    try std.testing.expect(!consoleMonitorEnabled(true, explicit));
+    try std.testing.expect(consoleMonitorEnabled(true, null));
+    try std.testing.expect(!consoleMonitorEnabled(false, null));
+}
