@@ -1185,10 +1185,25 @@ fn resizeSession(
     std.log.info("resize session={s} cols={d} rows={d}", .{ session_name, size.cols, size.rows });
 
     const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
-        error.NameTooLong => return socket.printSessionNameTooLong(io, session_name, cfg.socket_dir),
+        error.NameTooLong => {
+            socket.printSessionNameTooLong(io, session_name, cfg.socket_dir);
+            std.process.exit(1);
+        },
         error.OutOfMemory => return err,
     };
     defer alloc.free(socket_path);
+
+    // Resolve existence explicitly: a resize that cannot reach its session must
+    // fail loudly, never report success because a connect error was swallowed.
+    var dir = try std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{});
+    defer dir.close(io);
+    if (!try socket.sessionExists(io, dir, session_name)) {
+        var buf: [256]u8 = undefined;
+        var w = std.Io.File.stderr().writer(io, &buf);
+        w.interface.print("error: no such session \"{s}\"\n", .{session_name}) catch {};
+        w.interface.flush() catch {};
+        std.process.exit(1);
+    }
 
     _ = ipc.roundTripForTag(alloc, socket_path, .SetSize, std.mem.asBytes(&size), .Ack) catch |err| {
         var buf: [256]u8 = undefined;

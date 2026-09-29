@@ -38,6 +38,25 @@ pub fn feedsPtyInput(tag: ipc.Tag) bool {
     };
 }
 
+/// Writes every buffered byte to a non-blocking socket, waiting for writability
+/// between partial writes.  Used to deliver the `Init` frame before the poll
+/// loop can exit, so a client whose stdin is already at EOF still declares its
+/// geometry.
+fn flushSocketBuffer(gpa: std.mem.Allocator, fd: i32, buf: *std.ArrayList(u8)) !void {
+    while (buf.items.len > 0) {
+        const n = lib_posix.write(fd, buf.items) catch |err| switch (err) {
+            error.WouldBlock => 0,
+            else => return err,
+        };
+        if (n > 0) {
+            buf.replaceRange(gpa, 0, n, &.{}) catch unreachable;
+            continue;
+        }
+        var wait = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.OUT, .revents = 0 }};
+        if (try events_posix.poll(&wait, 1000) == 0) return error.Timeout;
+    }
+}
+
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
 ///
@@ -73,6 +92,13 @@ pub fn clientLoop(client_sock_fd: i32, explicit_size: ?ipc.Resize) !ClientResult
     // Send init message with terminal size (buffered)
     const size = explicit_size orelse ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
     try ipc.appendMessage(gpa, &sock_write_buf, .Init, std.mem.asBytes(&size));
+
+    // A declared geometry is the whole point of a `--size` client, and such a
+    // client may have no stdin to wait on.  Deliver `Init` up front so the
+    // declaration cannot be lost to an immediate EOF exit.
+    if (explicit_size != null) {
+        try flushSocketBuffer(gpa, client_sock_fd, &sock_write_buf);
+    }
 
     var poll_fds = try std.ArrayList(lib_posix.pollfd).initCapacity(gpa, 4);
     defer poll_fds.deinit(gpa);

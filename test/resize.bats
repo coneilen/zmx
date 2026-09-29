@@ -10,9 +10,14 @@ load test_helper
 
 # Run `stty size` inside the session and wait for the session's own scrollback
 # to report the expected "<rows> <cols>" line.
+#
+# The probe uses `send`, not `run`: a `run` client measures its own terminal and
+# sends a `Resize` frame, claiming vacant leadership and overwriting the
+# geometry under test with its fallback (24x120 when it has no tty). `send` is
+# pure input, so it observes geometry without changing it.
 assert_geometry() {
   local name="$1" expected="$2" i=0
-  "$ZMX" run "$name" -d stty size
+  printf 'stty size\r' | "$ZMX" send "$name" >/dev/null
   while (( i < 50 )); do
     if "$ZMX" history "$name" | grep -qE "(^|[^0-9])${expected}([^0-9]|$)"; then
       return 0
@@ -94,12 +99,18 @@ assert_geometry() {
 @test "resize: fails for a session that does not exist" {
   run "$ZMX" resize test-resize-missing 100x30
   [ "$status" -ne 0 ]
+  [[ "$output" == *"no such session"* ]]
 }
 
 @test "attach --size: declares geometry for a client with no terminal" {
-  # Pipe stdin/stdout so the client has no tty to measure, exactly like the
-  # GraphCode terminal surface.
-  "$ZMX" attach test-attach-size --size 100x30 </dev/null >/dev/null 2>&1 &
+  # A pipe for stdin and stdout, exactly like the GraphCode terminal surface:
+  # the client has no tty to measure and stays attached while the pane lives.
+  fifo="$BATS_TEST_TMPDIR/attach-stdin"
+  mkfifo "$fifo"
+  sleep 60 >"$fifo" &
+  holder_pid=$!
+
+  "$ZMX" attach test-attach-size --size 100x30 <"$fifo" >/dev/null 2>&1 &
   attach_pid=$!
   wait_for_session test-attach-size
 
@@ -110,7 +121,17 @@ assert_geometry() {
   assert_geometry test-attach-size "21 81"
 
   "$ZMX" kill --force test-attach-size || true
+  kill "$holder_pid" 2>/dev/null || true
   wait "$attach_pid" 2>/dev/null || true
+}
+
+@test "attach --size: declaration survives a client whose stdin is already EOF" {
+  # A one-shot client may exit immediately; its declared geometry must still
+  # have reached the daemon rather than being lost in an unflushed buffer.
+  "$ZMX" attach test-attach-eof --size 100x30 </dev/null >/dev/null 2>&1 || true
+  wait_for_session test-attach-eof
+
+  assert_geometry test-attach-eof "30 100"
 }
 
 @test "attach --size: rejects a malformed spec without creating a session" {

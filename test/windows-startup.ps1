@@ -532,4 +532,4 @@ if ($exitCode -ne 0) {
     Get-Content -LiteralPath (Join-Path $ArtifactsDirectory 'stderr.log')
     throw "Startup integration exited $exitCode; evidence: $ArtifactsDirectory"
 }
-Write-Output "PASS: three real cmd/ConPTY attach, state, detach and reattach scenarios; zero owned survivors. Evidence: $ArtifactsDirectory"
+Write-Output "PASS: four real cmd/ConPTY scenarios (attach, state, detach and reattach, pipe-child resize); zero owned survivors. Evidence: $ArtifactsDirectory"
