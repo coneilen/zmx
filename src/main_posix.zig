@@ -1181,29 +1181,44 @@ fn printNoSuchSession(io: std.Io, session_name: []const u8) noreturn {
     std.process.exit(1);
 }
 
+/// Reports a session whose reachability could not be determined, preserving the
+/// underlying cause, and exits non-zero.
+fn printSessionUnreachable(io: std.Io, session_name: []const u8, err: anyerror) noreturn {
+    var buf: [256]u8 = undefined;
+    var w = std.Io.File.stderr().writer(io, &buf);
+    w.interface.print(
+        "error: could not reach session \"{s}\": {s}\n",
+        .{ session_name, @errorName(err) },
+    ) catch {};
+    w.interface.flush() catch {};
+    std.process.exit(1);
+}
+
 /// Whether a session's socket is present and is actually a socket.
 ///
-/// Any failure to answer that question means the session cannot be reached:
-/// the socket directory may not exist yet (the normal state before the first
-/// session), the entry may be absent, or it may not be a socket at all. All of
-/// those are reported as "not present" so the verdict is identical on every
-/// platform, and the underlying reason is logged rather than discarded.
-fn sessionSocketPresent(io: std.Io, cfg: *Cfg, session_name: []const u8) bool {
-    var dir = std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{}) catch |err| {
-        std.log.info(
-            "socket dir unavailable dir={s} err={s}",
-            .{ cfg.socket_dir, @errorName(err) },
-        );
-        return false;
+/// Only genuine absence answers `false`: the socket directory not existing yet
+/// (the normal state before the first session), the entry not existing, or a
+/// path component that is not a directory, all of which mean no session can be
+/// there.  An entry that exists but is not a socket is likewise not a session.
+///
+/// Every other failure — permissions, fd exhaustion, I/O faults — is a real
+/// fault that must not masquerade as a missing session, so it is returned to
+/// the caller and reported with its cause intact.
+fn sessionSocketPresent(io: std.Io, cfg: *Cfg, session_name: []const u8) !bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => {
+            std.log.info("socket dir absent dir={s}", .{cfg.socket_dir});
+            return false;
+        },
+        else => return err,
     };
     defer dir.close(io);
 
-    return socket.sessionExists(io, dir, session_name) catch |err| {
-        std.log.info(
-            "session socket unreadable session={s} err={s}",
-            .{ session_name, @errorName(err) },
-        );
-        return false;
+    return socket.sessionExists(io, dir, session_name) catch |err| switch (err) {
+        // The name exists but is not a socket, so nothing here is a session.
+        error.FileNotUnixSocket => false,
+        error.NotDir => false,
+        else => return err,
     };
 }
 
@@ -1229,9 +1244,13 @@ fn resizeSession(
     defer alloc.free(socket_path);
 
     // A resize that cannot reach its session must fail loudly, and must fail
-    // the same way on every platform, so the reachability verdict never
-    // depends on which error a given libc returns for an absent path.
-    if (!sessionSocketPresent(io, cfg, session_name)) printNoSuchSession(io, session_name);
+    // the same way on every platform, so an absent session never depends on
+    // which error a given libc returns for a missing path.  A fault that is
+    // not absence keeps its own diagnosis.
+    const present = sessionSocketPresent(io, cfg, session_name) catch |err| {
+        printSessionUnreachable(io, session_name, err);
+    };
+    if (!present) printNoSuchSession(io, session_name);
 
     _ = ipc.roundTripForTag(alloc, socket_path, .SetSize, std.mem.asBytes(&size), .Ack) catch |err| {
         // A socket that refuses connections is a dead session wearing a stale
@@ -1243,7 +1262,14 @@ fn resizeSession(
                 var dir = d;
                 defer dir.close(io);
                 socket.cleanupStaleSocket(io, dir, session_name);
-            } else |_| {}
+            } else |dir_err| {
+                // Cleanup is best effort; the session is still unreachable and
+                // that verdict stands, but do not discard why it could not run.
+                std.log.warn(
+                    "stale socket cleanup skipped dir={s} err={s}",
+                    .{ cfg.socket_dir, @errorName(dir_err) },
+                );
+            }
             printNoSuchSession(io, session_name);
         }
 
