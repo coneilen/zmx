@@ -111,6 +111,21 @@ assert_geometry() {
   assert_output_contains "no such session"
 }
 
+@test "resize: records which check produced the missing-session verdict" {
+  # An absent socket and a socket nobody is listening on are reported to the
+  # user identically, on purpose. That makes the two indistinguishable once
+  # they agree, so the verdict names its own origin in the log. Asserting it
+  # here keeps a passing run informative instead of merely silent, and tells
+  # us which path a given platform actually took.
+  run "$ZMX" resize test-resize-missing 100x30
+  [ "$status" -ne 0 ]
+  assert_output_contains "no such session"
+
+  local log="$ZMX_DIR/logs/zmx.log"
+  [ -f "$log" ]
+  grep -q "no such session verdict path=precheck" "$log"
+}
+
 @test "attach --size: declares geometry for a client with no terminal" {
   # A pipe for stdin and stdout, exactly like the GraphCode terminal surface:
   # the client has no tty to measure and stays attached while the pane lives.

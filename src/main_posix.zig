@@ -1172,8 +1172,25 @@ fn printSizeError(io: std.Io, text: []const u8) noreturn {
     std.process.exit(1);
 }
 
+/// Which check concluded that a session could not be reached.
+///
+/// Both conclusions are reported to the user identically, because the
+/// distinction is not the user's problem.  It is recorded in the log so a
+/// passing run still says which path produced the verdict, rather than the
+/// two becoming indistinguishable once they agree.
+const NoSuchSessionPath = enum {
+    /// The socket was found to be absent before any connection was attempted.
+    precheck,
+    /// The socket existed but nothing was listening on it.
+    transport,
+};
+
 /// Reports a session that cannot be reached on stderr and exits non-zero.
-fn printNoSuchSession(io: std.Io, session_name: []const u8) noreturn {
+fn printNoSuchSession(io: std.Io, session_name: []const u8, path: NoSuchSessionPath) noreturn {
+    std.log.info(
+        "no such session verdict path={s} session={s}",
+        .{ @tagName(path), session_name },
+    );
     var buf: [256]u8 = undefined;
     var w = std.Io.File.stderr().writer(io, &buf);
     w.interface.print("error: no such session \"{s}\"\n", .{session_name}) catch {};
@@ -1250,7 +1267,7 @@ fn resizeSession(
     const present = sessionSocketPresent(io, cfg, session_name) catch |err| {
         printSessionUnreachable(io, session_name, err);
     };
-    if (!present) printNoSuchSession(io, session_name);
+    if (!present) printNoSuchSession(io, session_name, .precheck);
 
     _ = ipc.roundTripForTag(alloc, socket_path, .SetSize, std.mem.asBytes(&size), .Ack) catch |err| {
         // A socket that cannot be connected to is a dead or absent session:
@@ -1274,7 +1291,7 @@ fn resizeSession(
                         .{ cfg.socket_dir, @errorName(dir_err) },
                     );
                 }
-                printNoSuchSession(io, session_name);
+                printNoSuchSession(io, session_name, .transport);
             },
             else => {},
         }
