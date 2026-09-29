@@ -22,6 +22,7 @@ pub const Tag = enum(u8) {
     LabelClear = 16,
     LabelData = 17,
     Send = 18,
+    SetSize = 19,
     _,
 };
 
@@ -110,7 +111,9 @@ pub fn readFrame(
 comptime {
     if (@sizeOf(Header) != 8) @compileError("Windows session header must stay eight bytes");
     if (@sizeOf(Info) != 552) @compileError("Windows session Info layout changed");
-    if (@intFromEnum(Tag.Output) != 1 or @intFromEnum(Tag.Send) != 18) {
+    if (@intFromEnum(Tag.Output) != 1 or @intFromEnum(Tag.Send) != 18 or
+        @intFromEnum(Tag.SetSize) != 19)
+    {
         @compileError("Windows session tags must match src/ipc.zig");
     }
 }

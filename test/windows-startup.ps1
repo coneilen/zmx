@@ -107,6 +107,24 @@ if ($WorkerToken) {
         throw "Shell did not produce expanded state: $Expected"
     }
 
+    function Read-ConsoleGeometry([string] $Raw, $Attach, [string] $Tag) {
+        # cmd's `mode con` reports the ConPTY's own dimensions, so it observes
+        # the geometry the daemon actually applied to the pseudoconsole.
+        $Attach.Process.StandardInput.Write("mode con`r")
+        $Attach.Process.StandardInput.Write("echo zmx-geometry-$Tag-end`r")
+        $Attach.Process.StandardInput.Flush()
+        Wait-State $Raw $Attach "zmx-geometry-$Tag-end"
+        $history = (Invoke-Zmx @('history', $Raw)).Stdout
+        $lines = [regex]::Matches($history, '(?im)^\s*Lines:\s*(\d+)')
+        $columns = [regex]::Matches($history, '(?im)^\s*Columns:\s*(\d+)')
+        if ($lines.Count -eq 0 -or $columns.Count -eq 0) { return $false }
+        $script:LastGeometry = [pscustomobject]@{
+            Lines = [int]$lines[$lines.Count - 1].Groups[1].Value
+            Columns = [int]$columns[$columns.Count - 1].Groups[1].Value
+        }
+        return $true
+    }
+
     try {
         foreach ($index in 0..2) {
             $raw = [guid]::NewGuid().ToString()
@@ -171,6 +189,48 @@ if ($WorkerToken) {
                 if ($daemon) { $daemon.Dispose() }
                 # The outer job owns every remaining child, including late daemon children.
             }
+        }
+
+        # Pane-geometry parity: a pipe child has no console to measure, so it
+        # declares geometry with --size and updates it with `resize`. Neither
+        # path may type anything into the shell.
+        $raw = [guid]::NewGuid().ToString()
+        $attach = Start-Zmx @('attach', $raw, '--size', '120x40')
+        $backend = $null
+        try {
+            $backendId = Read-Info $raw $attach
+            $backend = [Diagnostics.Process]::GetProcessById($backendId)
+            Require (Read-ConsoleGeometry $raw $attach 'declared') 'Declared geometry probe failed.'
+            $declared = $script:LastGeometry
+            Require ($declared.Columns -eq 120 -and $declared.Lines -eq 40) "Attach --size was not applied: $($declared.Columns)x$($declared.Lines)"
+
+            $beforeResize = (Invoke-Zmx @('history', $raw)).Stdout
+            $null = Invoke-Zmx @('resize', $raw, '100x30')
+            Start-Sleep -Milliseconds 200
+            $afterResize = (Invoke-Zmx @('history', $raw)).Stdout
+            $delta = $afterResize.Substring([Math]::Min($beforeResize.Length, $afterResize.Length))
+            Require (-not ($delta -match '100x30|resize|SetSize')) "Resize leaked input into the session: $delta"
+            Require (-not $attach.Process.HasExited) 'Resize ended the attach client.'
+
+            Require (Read-ConsoleGeometry $raw $attach 'resized') 'Resized geometry probe failed.'
+            $resized = $script:LastGeometry
+            Require ($resized.Columns -eq 100 -and $resized.Lines -eq 30) "resize was not applied: $($resized.Columns)x$($resized.Lines)"
+
+            $bad = Invoke-Zmx @('resize', $raw, '0x30') $true
+            Require ($bad.ExitCode -ne 0) 'Degenerate geometry was accepted.'
+
+            $null = Invoke-Zmx @('detach', $raw)
+            $null = Finish-Zmx $attach $false
+            $null = Invoke-Zmx @('kill', $raw)
+            Require ($backend.WaitForExit(5000)) 'Backend survived resize-session kill.'
+            $sessions.Add([pscustomobject]@{
+                Raw = $raw; Qualified = "$env:ZMX_SESSION_PREFIX$raw"; BackendPid = $backendId
+                BackendCreatedUtc = $backend.StartTime.ToUniversalTime(); DaemonPid = 0
+                StatePreserved = $true; DeclaredGeometry = '120x40'; ResizedGeometry = '100x30'
+            })
+        } finally {
+            $attach.Process.Dispose()
+            if ($backend) { $backend.Dispose() }
         }
         $passed = $true
     } finally {

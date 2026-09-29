@@ -24,7 +24,9 @@ pub const std_options: std.Options = .{
 
 comptime {
     if (@sizeOf(WireHeader) != 8) @compileError("Windows IPC header must match ipc.Header");
-    if (@intFromEnum(WireTag.Output) != 1 or @intFromEnum(WireTag.Send) != 18) {
+    if (@intFromEnum(WireTag.Output) != 1 or @intFromEnum(WireTag.Send) != 18 or
+        @intFromEnum(WireTag.SetSize) != 19)
+    {
         @compileError("Windows IPC tags must match ipc.Tag");
     }
 }
@@ -244,6 +246,7 @@ fn sendPayload(
         .Info => WireTag.Info,
         .LabelGet => WireTag.LabelData,
         .LabelSet, .LabelClear, .Write => WireTag.Ack,
+        .SetSize => WireTag.Ack,
         else => null,
     };
     if (expected) |response_tag| {
@@ -527,6 +530,7 @@ fn printHelp(io: std.Io) !void {
         \\Commands:
         \\  run, r       Run a task (use -d/--detach to detach)
         \\  attach, a    Attach to a session, creating it if needed
+        \\               (--size <cols>x<rows> declares geometry without a console)
         \\  tail, t      Follow session output
         \\  send, s      Send input to the PTY
         \\  print, p     Broadcast output to attached clients and history
@@ -535,7 +539,7 @@ fn printHelp(io: std.Io) !void {
         \\  kill, k      Kill one or more sessions (--force accepted)
         \\  detach, d   Detach all clients
         \\  wait, w      Wait for task completion
-        \\  resize       Resize a session
+        \\  resize       Resize a session (<cols> <rows> or <cols>x<rows>)
         \\  history      Show session history (--vt or --html)
         \\  get, set     Read or set labels
         \\  unset        Remove labels
@@ -893,7 +897,7 @@ fn runForegroundSession(
     session_name: []const u8,
     command: ?[]const []const u8,
 ) !void {
-    try spawnDetached(io, program, alloc, session_name, command);
+    try spawnDetached(io, program, alloc, session_name, command, null);
     const exit_code = try attachTaskSession(io, alloc, session_name);
     if (exit_code != 0) std.process.exit(exit_code);
 }
@@ -951,6 +955,7 @@ fn spawnDetached(
     alloc: std.mem.Allocator,
     session_name: []const u8,
     command: ?[]const []const u8,
+    explicit_size: ?resize.Size,
 ) !void {
     if (runtime_windows.hasRendezvous(io, alloc, session_name) catch false) {
         if (runtime_windows.resolveEndpointPath(io, alloc, session_name)) |endpoint| {
@@ -974,7 +979,7 @@ fn spawnDetached(
     try argv.append(alloc, session_name);
     var initial_size_arg: ?[]u8 = null;
     defer if (initial_size_arg) |value| alloc.free(value);
-    if (pty_session_windows.currentConsoleSize()) |size| {
+    if (explicit_size orelse pty_session_windows.currentConsoleSize()) |size| {
         initial_size_arg = try std.fmt.allocPrint(
             alloc,
             "--zmx-initial-size={d}x{d}",
@@ -1025,12 +1030,14 @@ fn attachSession(
     io: std.Io,
     alloc: std.mem.Allocator,
     session_name: []const u8,
+    size: ?resize.Size,
 ) !void {
     return session_windows.attach(
         .{
             .io = io,
             .alloc = alloc,
             .session_name = session_name,
+            .size = size,
         },
         pty_session_windows.provider(),
     );
@@ -1150,7 +1157,7 @@ pub fn main(init: std.process.Init) !void {
         }
         const command_slice: ?[]const []const u8 =
             if (command_args.items.len == 0) null else command_args.items;
-        if (detached) return spawnDetached(io, program, gpa, session_name, command_slice);
+        if (detached) return spawnDetached(io, program, gpa, session_name, command_slice, null);
         return runForegroundSession(io, gpa, program, session_name, command_slice);
     }
 
@@ -1165,7 +1172,16 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(session_name);
         var command_args: std.ArrayList([]const u8) = .empty;
         defer command_args.deinit(gpa);
-        while (args.next()) |part| try command_args.append(gpa, part);
+        var attach_size: ?resize.Size = null;
+        while (args.next()) |part| {
+            if (std.mem.startsWith(u8, part, "--size=")) {
+                attach_size = try resize.parseSpec(part["--size=".len..]);
+            } else if (std.mem.eql(u8, part, "--size")) {
+                attach_size = try resize.parseSpec(args.next() orelse return error.InvalidSize);
+            } else {
+                try command_args.append(gpa, part);
+            }
+        }
         if (command_args.items.len > 0 and
             std.mem.eql(u8, command_args.items[0], "cmd/pwsh"))
         {
@@ -1178,12 +1194,13 @@ pub fn main(init: std.process.Init) !void {
                 gpa,
                 session_name,
                 if (command_args.items.len == 0) null else command_args.items,
+                attach_size,
             ) catch |err| switch (err) {
                 error.SessionAlreadyExists => {},
                 else => return err,
             };
         }
-        return attachSession(io, gpa, session_name);
+        return attachSession(io, gpa, session_name, attach_size);
     }
 
     if (std.mem.eql(u8, command, "tail") or std.mem.eql(u8, command, "t")) {
@@ -1231,13 +1248,18 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, command, "resize")) {
         const session_name = try socket.resolveSessionOrEnv(gpa, io, args.next());
         defer gpa.free(session_name);
-        const cols_text = args.next() orelse return error.InvalidSize;
-        const rows_text = args.next() orelse return error.InvalidSize;
-        const size = wire.Resize{
-            .cols = try std.fmt.parseInt(u16, cols_text, 10),
-            .rows = try std.fmt.parseInt(u16, rows_text, 10),
-        };
-        return sendPayload(io, gpa, &cfg, session_name, .Resize, std.mem.asBytes(&size));
+        const first = args.next() orelse return error.InvalidSize;
+        const size = if (args.next()) |rows_text| blk: {
+            const parsed = resize.Size{
+                .cols = std.fmt.parseInt(u16, first, 10) catch return error.InvalidSize,
+                .rows = std.fmt.parseInt(u16, rows_text, 10) catch return error.InvalidSize,
+            };
+            if (!resize.isUsable(parsed)) return error.InvalidSize;
+            break :blk parsed;
+        } else try resize.parseSpec(first);
+        // SetSize, not Resize: this is a one-shot control client that never
+        // takes leadership, so a leader-gated Resize would be dropped.
+        return sendPayload(io, gpa, &cfg, session_name, .SetSize, std.mem.asBytes(&size));
     }
 
     if (std.mem.eql(u8, command, "kill") or std.mem.eql(u8, command, "k")) {

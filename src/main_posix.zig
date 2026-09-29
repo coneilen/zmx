@@ -2,6 +2,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const ghostty_vt = @import("ghostty-vt");
 const ipc = @import("ipc.zig");
+const platform_resize = @import("platform/resize.zig");
 const log = @import("log.zig");
 const completions = @import("completions.zig");
 const util = @import("util.zig");
@@ -127,7 +128,21 @@ pub fn main(init: std.process.Init) !void {
 
         var command_args: std.ArrayList([]const u8) = .empty;
         defer command_args.deinit(gpa);
+        var attach_size: ?ipc.Resize = null;
         while (args.next()) |arg| {
+            // Flags are only recognised before the command, so a command's own
+            // `--size` argument is still forwarded verbatim.
+            if (command_args.items.len == 0) {
+                if (std.mem.eql(u8, arg, "--size")) {
+                    const spec = args.next() orelse return printSizeError(io, "");
+                    attach_size = platform_resize.parseSpec(spec) catch return printSizeError(io, spec);
+                    continue;
+                } else if (std.mem.startsWith(u8, arg, "--size=")) {
+                    const spec = arg["--size=".len..];
+                    attach_size = platform_resize.parseSpec(spec) catch return printSizeError(io, spec);
+                    continue;
+                }
+            }
             try command_args.append(gpa, arg);
         }
 
@@ -151,7 +166,23 @@ pub fn main(init: std.process.Init) !void {
         daemon.setCwd(cwd);
         daemon.shell = shell_env;
         std.log.info("socket path={s}", .{daemon.socket_path});
-        return attach(gpa, io, &daemon);
+        return attach(gpa, io, &daemon, attach_size);
+    } else if (std.mem.eql(u8, cmd, "resize")) {
+        const session_name = args.next() orelse "";
+        if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
+            return help(io);
+        }
+        const first = args.next() orelse return printSizeError(io, "");
+        const size = blk: {
+            if (args.next()) |second| {
+                break :blk platform_resize.parsePair(first, second) catch return printSizeError(io, first);
+            }
+            break :blk platform_resize.parseSpec(first) catch return printSizeError(io, first);
+        };
+
+        const sesh = try socket.getSeshName(gpa, session_name);
+        defer gpa.free(sesh);
+        return resizeSession(gpa, io, &cfg, sesh, size);
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "r")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -412,7 +443,9 @@ fn help(io: std.Io) !void {
         \\Usage: zmx <command> [args...]
         \\
         \\Commands:
-        \\  [a]ttach <name> [command...]             Attach to session, creating if needed
+        \\  [a]ttach <name> [--size <cols>x<rows>] [command...]
+        \\                                           Attach to session, creating if needed
+        \\  resize <name> <cols>x<rows>              Set session geometry without attaching
         \\  [r]un <name> [-d] [command...]           Send command without attaching
         \\  [s]end <name> <text...>                  Send raw input to session PTY
         \\  [p]rint <name> <text...>                 Inject text into session display
@@ -437,6 +470,17 @@ fn help(io: std.Io) !void {
         \\  Examples:
         \\    zmx attach dev
         \\    zmx attach dev vim
+        \\
+        \\Size:
+        \\  Clients without a terminal (a pipe child, for example) cannot measure
+        \\  their geometry. `--size` declares it instead, and pins it so no stale
+        \\  measurement overrides it. `resize` updates a running session from a
+        \\  one-shot client; it never takes input leadership and sends no input.
+        \\
+        \\  Examples:
+        \\    zmx attach dev --size 120x40
+        \\    zmx resize dev 100x30
+        \\    zmx resize dev 100 30
         \\
         \\History:
         \\  This should generally be used with `tail` to print the last lines
@@ -1116,6 +1160,48 @@ fn labelSet(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []con
     };
 }
 
+/// Reports an unusable `--size`/`resize` argument on stderr and exits non-zero.
+fn printSizeError(io: std.Io, text: []const u8) noreturn {
+    var buf: [256]u8 = undefined;
+    var w = std.Io.File.stderr().writer(io, &buf);
+    w.interface.print(
+        "error: invalid size \"{s}\": expected <cols>x<rows> with non-zero dimensions\n",
+        .{text},
+    ) catch {};
+    w.interface.flush() catch {};
+    std.process.exit(1);
+}
+
+/// Sets a session's geometry from a one-shot control client.  Uses `SetSize`
+/// rather than `Resize` because this client never takes leadership, so a
+/// leader-gated `Resize` would be silently dropped.
+fn resizeSession(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    cfg: *Cfg,
+    session_name: []const u8,
+    size: ipc.Resize,
+) !void {
+    std.log.info("resize session={s} cols={d} rows={d}", .{ session_name, size.cols, size.rows });
+
+    const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
+        error.NameTooLong => return socket.printSessionNameTooLong(io, session_name, cfg.socket_dir),
+        error.OutOfMemory => return err,
+    };
+    defer alloc.free(socket_path);
+
+    _ = ipc.roundTripForTag(alloc, socket_path, .SetSize, std.mem.asBytes(&size), .Ack) catch |err| {
+        var buf: [256]u8 = undefined;
+        var w = std.Io.File.stderr().writer(io, &buf);
+        w.interface.print(
+            "error: could not resize session \"{s}\": {s}\n",
+            .{ session_name, @errorName(err) },
+        ) catch {};
+        w.interface.flush() catch {};
+        std.process.exit(1);
+    };
+}
+
 fn labelClear(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8) !void {
     std.log.info("label clear session={s}", .{session_name});
 
@@ -1288,7 +1374,7 @@ fn switchSesh(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, current_sesh:
     };
 }
 
-fn attach(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon) !void {
+fn attach(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, explicit_size: ?ipc.Resize) !void {
     const sesh = socket.getSeshNameFromEnv();
     if (sesh.len > 0) {
         return switchSesh(gpa, io, daemon, sesh);
@@ -1345,7 +1431,7 @@ fn attach(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon) !void {
     const clear_seq = "\x1b[2J\x1b[H";
     _ = try lib_posix.write(lib_posix.STDOUT_FILENO, clear_seq);
 
-    const looper = try loop.clientLoop(client_sock);
+    const looper = try loop.clientLoop(client_sock, explicit_size);
     switch (looper.kind) {
         .detach => return,
         .switch_session => {
@@ -1374,7 +1460,7 @@ fn attach(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon) !void {
                 std.log.info("switching to new session cwd={s}", .{switch_cwd});
                 target_daemon.setCwd(switch_cwd);
                 target_daemon.shell = daemon.shell;
-                return attach(gpa, io, &target_daemon);
+                return attach(gpa, io, &target_daemon, null);
             }
         },
     }

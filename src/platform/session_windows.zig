@@ -48,6 +48,9 @@ pub const AttachSpec = struct {
     io: std.Io,
     alloc: std.mem.Allocator,
     session_name: []const u8,
+    /// Geometry declared by the caller when the attach client has no console
+    /// to measure (for example a pipe child driven by an embedding UI).
+    size: ?resize.Size = null,
 };
 
 pub const DispatchResult = enum {
