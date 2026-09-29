@@ -768,6 +768,33 @@ pub fn acceptServerWithDeadline(
     return acceptWithDeadline(state, deadline, cancellation);
 }
 
+/// Cancel an overlapped operation that outlived its deadline and report what
+/// actually happened.
+///
+/// `CancelIoEx` cannot cancel an operation the kernel has already completed,
+/// so a wait that expires and a completion that lands in the same instant
+/// both leave the operation finished. Reporting the expiry unconditionally
+/// discards a live result: for `ConnectNamedPipe` it throws away a client
+/// that is already connected, and the accept loop then tears the instance
+/// down underneath it, so that client's command is silently lost. Ask the
+/// kernel for the real outcome and only report `expired` when the operation
+/// was genuinely aborted.
+fn resolveCancelledCompletion(
+    pipe: windows.HANDLE,
+    overlapped: *OVERLAPPED,
+    event: windows.HANDLE,
+    expired: Error,
+) Error!void {
+    _ = CancelIoEx(pipe, overlapped);
+    _ = WaitForSingleObject(event, infinite);
+    var transferred: windows.DWORD = 0;
+    if (GetOverlappedResult(pipe, overlapped, &transferred, 1) != 0) return;
+    return switch (windows.GetLastError()) {
+        .OPERATION_ABORTED => expired,
+        else => |err| mapLastError(err),
+    };
+}
+
 fn awaitCompletion(
     pipe: windows.HANDLE,
     overlapped: *OVERLAPPED,
@@ -777,9 +804,7 @@ fn awaitCompletion(
 ) Error!void {
     const timeout = if (deadline) |value| value.remainingMs() orelse 0 else infinite;
     if (timeout == 0 and deadline != null) {
-        _ = CancelIoEx(pipe, overlapped);
-        _ = WaitForSingleObject(event, infinite);
-        return error.Timeout;
+        return resolveCancelledCompletion(pipe, overlapped, event, error.Timeout);
     }
 
     var handles: [2]windows.HANDLE = undefined;
@@ -797,19 +822,13 @@ fn awaitCompletion(
         0,
     );
     if (result == 0x102) {
-        _ = CancelIoEx(pipe, overlapped);
-        _ = WaitForSingleObject(event, infinite);
-        return error.Timeout;
+        return resolveCancelledCompletion(pipe, overlapped, event, error.Timeout);
     }
     if (result == 0x80) {
-        _ = CancelIoEx(pipe, overlapped);
-        _ = WaitForSingleObject(event, infinite);
-        return error.Cancelled;
+        return resolveCancelledCompletion(pipe, overlapped, event, error.Cancelled);
     }
     if (result == 1 and count == 2) {
-        _ = CancelIoEx(pipe, overlapped);
-        _ = WaitForSingleObject(event, infinite);
-        return error.Cancelled;
+        return resolveCancelledCompletion(pipe, overlapped, event, error.Cancelled);
     }
 
     var transferred: windows.DWORD = 0;
@@ -1027,6 +1046,44 @@ test "Windows startup probe disconnect reports NO_DATA and preserves the listene
     var received: [5]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 5), try read(accepted, &received));
     try std.testing.expectEqualStrings("ready", &received);
+}
+
+test "Windows accept keeps a client that connects as the deadline expires" {
+    const alloc = std.testing.allocator;
+    const endpoint = local_ipc.Endpoint{ .name = "zmx-accept-deadline-race" };
+    var server = try listen(alloc, endpoint, .{});
+    defer server.close();
+    const state: *ServerState = @ptrFromInt(server.handle);
+    const pipe = state.pipe.?;
+
+    const event = try completionEvent();
+    defer windows.CloseHandle(event);
+    var overlapped = std.mem.zeroes(OVERLAPPED);
+    overlapped.hEvent = event;
+
+    try std.testing.expectEqual(@as(c_int, 0), ConnectNamedPipe(pipe, &overlapped));
+    try std.testing.expectEqual(windows.Win32Error.IO_PENDING, windows.GetLastError());
+
+    // The client lands before the expired deadline is observed. This is the
+    // race the session accept loop runs into every time its slice elapses:
+    // `CancelIoEx` cannot undo a connection the kernel already made, so
+    // reporting `Timeout` here would strand a client whose command is then
+    // never read.
+    var client = try connect(alloc, endpoint);
+    defer client.close();
+
+    try awaitCompletion(pipe, &overlapped, event, events_windows.Deadline.afterMs(0), null);
+
+    const accepted = local_ipc.Connection{
+        .handle = handleValue(pipe),
+        .close_fn = closeHandle,
+        .read_fn = readHandle,
+        .write_fn = writeHandle,
+    };
+    try writeAll(client, "kept", events_windows.Deadline.afterMs(1000), null);
+    var received: [4]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 4), try read(accepted, &received));
+    try std.testing.expectEqualStrings("kept", &received);
 }
 
 test "Windows startup recovery waits when idle and surfaces replacement allocation failure" {
